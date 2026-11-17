@@ -231,7 +231,7 @@ impl Workspace {
         };
         self.git_busy = true;
         self.git_running = Some(match &operation {
-            Operation::Commit(_) | Operation::CommitTracked(_) => GitRunning::Commit,
+            Operation::Commit(_) => GitRunning::Commit,
             Operation::Push => GitRunning::Push,
             Operation::UndoCommit => GitRunning::Undo,
             _ => GitRunning::Other,
@@ -240,7 +240,7 @@ impl Workspace {
         self.git_errors.remove(&folder);
         cx.notify();
         let committed = match &operation {
-            Operation::Commit(message) | Operation::CommitTracked(message) => Some(message.clone()),
+            Operation::Commit(message) => Some(message.clone()),
             _ => None,
         };
         let undone = matches!(operation, Operation::UndoCommit)
@@ -522,12 +522,19 @@ impl Workspace {
         page = page.child(div().id("git-changes-list").flex_1().min_h_0().overflow_y_scroll().child(list));
 
         let staged = snapshot.entries.iter().filter(|e| e.staged()).count();
-        let tracked = snapshot.entries.iter().any(|e| !e.untracked() && !e.conflict());
         let message = !self.commit_message.read(cx).value().trim().is_empty();
         let conflicted = snapshot.entries.iter().any(|e| e.conflict());
-        // As in Zed: with nothing staged, commit every tracked change.
-        let all_tracked = staged == 0;
-        let can_commit = !self.git_busy && message && !conflicted && (staged > 0 || tracked);
+        // Only what is staged is committed; nothing is staged on the way.
+        let can_commit = !self.git_busy && message && !conflicted && staged > 0;
+        let commit_tip: SharedString = if conflicted {
+            "Resolve conflicts before committing".into()
+        } else if staged == 0 {
+            "Nothing staged. Tick the files to commit".into()
+        } else if !message {
+            "Enter a commit message".into()
+        } else {
+            format!("Commit {staged} staged file{}", if staged == 1 { "" } else { "s" }).into()
+        };
         let height = self.settings.commit_box_height;
         let running = self.git_running;
         let pushable = !self.git_busy && snapshot.can_push();
@@ -613,17 +620,13 @@ impl Workspace {
                             .when(pushable, |s| s.on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::Push, cx)))),
                     )
                     .child(
-                        label(
-                            colors,
-                            if all_tracked {
-                                String::new()
-                            } else {
-                                format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })
-                            },
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .truncate(),
+                        row()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(5.))
+                            .when(staged > 0, |s| {
+                                s.child(label(colors, format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })).truncate())
+                            }),
                     )
                     .child(
                         bar_button(
@@ -633,11 +636,11 @@ impl Workspace {
                             if running == Some(GitRunning::Commit) { "Committing…" } else { "Commit" },
                             can_commit,
                         )
+                        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(commit_tip.clone()).build(window, cx))
                         .when(can_commit, |s| {
-                            s.on_click(cx.listener(move |s, _, _, cx| {
+                            s.on_click(cx.listener(|s, _, _, cx| {
                                 let message = s.commit_message.read(cx).value().to_string();
-                                let operation = if all_tracked { Operation::CommitTracked(message) } else { Operation::Commit(message) };
-                                s.git_operation(operation, cx);
+                                s.git_operation(Operation::Commit(message), cx);
                             }))
                         }),
                     ),

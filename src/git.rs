@@ -113,8 +113,6 @@ pub enum Operation {
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
     Commit(String),
-    /// Commit every change to tracked files, staged or not, as `git commit -a` does.
-    CommitTracked(String),
     /// Push the branch, setting its upstream on the first remote if it has none.
     Push,
     /// Undo the last commit, keeping its changes staged.
@@ -343,14 +341,11 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
             }
             checked(cmd.args(paths).output())?;
         }
-        Operation::Commit(message) | Operation::CommitTracked(message) if message.trim().is_empty() => {
+        Operation::Commit(message) if message.trim().is_empty() => {
             return Err("Enter a commit message.".into());
         }
         Operation::Commit(message) => {
             checked(command(root).arg("commit").arg("-m").arg(OsString::from(message)).output())?;
-        }
-        Operation::CommitTracked(message) => {
-            checked(command(root).arg("commit").arg("-a").arg("-m").arg(OsString::from(message)).output())?;
         }
         Operation::Push => {
             // Never wait on a credential prompt nobody can see.
@@ -525,19 +520,6 @@ mod tests {
         assert_eq!(snapshot(&r.0).unwrap().branch.as_bytes(), short.trim_ascii());
         let s = snapshot(&r.0).unwrap();
         assert!(s.git_dir.ends_with(".git"));
-    }
-    #[test]
-    fn commit_tracked_leaves_untracked_files() {
-        let r = Repo::new();
-        r.write("a", "base\n");
-        r.stage("a");
-        r.commit();
-        r.write("a", "edited\n");
-        r.write("new", "x\n");
-        operate(&r.0, Operation::CommitTracked("tracked".into())).unwrap();
-        let s = snapshot(&r.0).unwrap();
-        assert_eq!(s.entries.len(), 1);
-        assert!(s.entries[0].untracked());
     }
     #[test]
     fn undo_commit_keeps_changes_staged() {

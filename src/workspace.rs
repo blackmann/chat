@@ -131,6 +131,9 @@ const MAX_FILE: u64 = 2 * 1024 * 1024;
 
 pub struct Workspace {
     focus: FocusHandle,
+    /// Whether the window has focus: a thread that finishes while it doesn't
+    /// hasn't been seen, even if it's the one showing.
+    window_active: bool,
     settings: Settings,
     projects: Vec<Project>,
     project: usize,
@@ -384,6 +387,7 @@ impl Workspace {
             sideways: Rc::default(),
             drop_slot: None,
             commit_height_unsaved: false,
+            window_active: window.is_window_active(),
             _quit: None,
         };
         // Whatever hasn't been written yet is written on the way out.
@@ -409,6 +413,16 @@ impl Workspace {
             workspace.select_thread(0, cx);
         }
         workspace.start_git_watch(window, cx);
+        cx.observe_window_activation(window, |s, window, cx| {
+            s.window_active = window.is_window_active();
+            // Coming back to the window is seeing the thread on show.
+            if s.window_active && let Some(t) = s.current_thread_mut() && t.unread {
+                t.unread = false;
+                s.save_soon(cx);
+                cx.notify();
+            }
+        })
+        .detach();
         workspace.observe_command_draft(cx);
         workspace.observe_mention_draft(cx);
         workspace.composer.update(cx, |s, cx| s.focus(window, cx));
@@ -507,6 +521,9 @@ impl Workspace {
         self.active = 0;
         self.follow = true;
         self.transcript.scroll_to_bottom();
+        if let Some(t) = self.current_thread_mut() {
+            t.unread = false;
+        }
         if let Some(t) = self.current_thread() {
             let id = t.id;
             if t.session.is_none() && t.problem.is_none() {
@@ -757,13 +774,19 @@ impl Workspace {
         }
     }
     fn on_event(&mut self, id: usize, event: Event, cx: &mut Context<Self>) {
+        let seen = self.window_active && self.current_thread().is_some_and(|t| t.id == id);
         let current = self.current_thread().is_some_and(|t| t.id == id);
         let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == id) else {
             return;
         };
         // A connection that fails before it opens usually means the agent isn't installed or signed in.
         let failed_to_open = matches!(&event, Event::Closed(Some(_))) && !thread.ready;
+        let was_busy = thread.state.busy();
         thread.apply(event);
+        // A turn that finishes out of sight waits to be read.
+        if was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed) && !seen {
+            thread.unread = true;
+        }
         if failed_to_open && let Some(problem) = &mut thread.problem {
             let name = self.settings.agents.get(thread.agent).map_or("the agent", |a| a.name.as_str());
             problem.push_str(&format!("\nCheck that {name} is installed and signed in, then send your message again."));

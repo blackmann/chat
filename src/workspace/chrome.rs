@@ -28,7 +28,7 @@ pub fn agent_glyph(spec: Option<&crate::settings::AgentSpec>) -> Icon {
 }
 
 /// A thread's state as a small leading mark.
-fn state_mark(colors: Palette, state: ThreadState) -> AnyElement {
+fn state_mark(colors: Palette, state: ThreadState, unread: bool) -> AnyElement {
     match state {
         ThreadState::Running => spinner(colors).into_any_element(),
         ThreadState::Waiting => icon(Glyph::CircleDot).size(px(13.)).text_color(rgb(colors.blue)).into_any_element(),
@@ -37,10 +37,13 @@ fn state_mark(colors: Palette, state: ThreadState) -> AnyElement {
             .flex()
             .items_center()
             .justify_center()
-            .child(div().size(px(6.)).rounded_full().bg(rgb(colors.quiet)))
+            .child(div().size(px(6.)).rounded_full().bg(rgb(if unread { colors.blue } else { colors.quiet })))
             .into_any_element(),
         ThreadState::Idle => icon(Glyph::CircleDashed).size(px(13.)).text_color(rgb(colors.quiet)).into_any_element(),
-        ThreadState::Failed => icon(IconName::TriangleAlert).size(px(13.)).text_color(rgb(colors.red)).into_any_element(),
+        ThreadState::Failed => icon(IconName::TriangleAlert)
+            .size(px(13.))
+            .text_color(rgb(if unread { colors.red } else { colors.quiet }))
+            .into_any_element(),
     }
 }
 
@@ -367,7 +370,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |s| s.bg(rgb(colors.selected)))
                     .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
-                    .child(row().w(px(14.)).flex_shrink_0().justify_center().child(state_mark(colors, t.state)))
+                    .child(row().w(px(14.)).flex_shrink_0().justify_center().child(state_mark(colors, t.state, t.unread)))
                     .child(one_line(t.title.clone(), 18.).flex_1().min_w_0())
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                     .on_click(cx.listener(move |s, _, _, cx| s.select_thread(i, cx))),
