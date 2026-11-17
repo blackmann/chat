@@ -304,7 +304,7 @@ impl Workspace {
         )
     }
 
-    fn composer_view(&self, colors: Palette, thread: &Thread, cx: &mut Context<Self>) -> Div {
+    fn composer_view(&self, colors: Palette, thread: &Thread, window: &Window, cx: &mut Context<Self>) -> Div {
         let empty = self.composer.read(cx).value().trim().is_empty();
         let busy = thread.state.busy();
         // The composer sits low in the window, so its menus open upward.
@@ -370,7 +370,7 @@ impl Workspace {
             .child(if busy { icon(Glyph::Stop).size(px(12.)) } else { icon(IconName::ArrowUp) })
             .tooltip(move |w, cx| Tooltip::new(if busy { "Stop · esc" } else { "Send · ⌘ ↵" }).build(w, cx))
             .on_click(cx.listener(move |s, _, w, cx| if busy { s.stop(cx) } else { s.submit(&Submit, w, cx) }));
-        col()
+        let composer = col()
             .rounded(px(10.))
             .border_1()
             .border_color(rgb(colors.border))
@@ -390,7 +390,8 @@ impl Workspace {
                     .children(model)
                     .children(effort)
                     .child(send),
-            )
+            );
+        self.with_command_menu(composer, colors, window, cx)
     }
 
     pub(super) fn chat_view(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -492,7 +493,7 @@ impl Workspace {
             .child(div().flex_1().min_h_0().child(transcript))
             .child(
                 row().flex_shrink_0().justify_center().px_5().pb_4().child(
-                    div().w_full().max_w(px(COLUMN - 40.)).child(self.composer_view(colors, thread, cx)),
+                    div().w_full().max_w(px(COLUMN - 40.)).child(self.composer_view(colors, thread, window, cx)),
                 ),
             )
             .into_any_element()

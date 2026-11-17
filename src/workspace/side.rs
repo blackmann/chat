@@ -13,9 +13,8 @@ fn side_glyph(side: Side) -> Icon {
     }
 }
 
-/// Files and commands listed before the rest are summed up as "N more".
+/// Files listed before the rest are summed up as "N more".
 const FILES_SHOWN: usize = 12;
-const COMMANDS_SHOWN: usize = 12;
 
 /// "$0.42", or the amount and currency code for anything but dollars.
 fn money(amount: f64, currency: &str) -> String {
@@ -46,18 +45,6 @@ fn item(colors: Palette, lead: impl IntoElement, name: &str, note: impl IntoElem
                 .min_w_0(),
         )
         .child(note)
-}
-
-/// A label and its value on one line, for the session's facts.
-fn fact(colors: Palette, name: impl Into<SharedString>, value: impl Into<SharedString>) -> Div {
-    row()
-        .h(px(24.))
-        .px_3()
-        .gap_3()
-        .text_size(px(12.5))
-        .child(div().flex_shrink_0().text_color(rgb(colors.muted)).child(name.into()))
-        .child(div().flex_1())
-        .child(div().min_w_0().truncate().child(value.into()))
 }
 
 impl Workspace {
@@ -102,7 +89,7 @@ impl Workspace {
                             .when_some(thread.cost.as_ref(), |s, (amount, currency)| s.child(money(*amount, currency))),
                     )
             }
-            _ => col().child(label(colors, "Context use shows here once the agent reports it.").line_height(relative(1.45))),
+            _ => col(),
         };
         let mut plan = col();
         for (step, text) in &thread.plan {
@@ -172,43 +159,18 @@ impl Workspace {
                     .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::File(path.clone()), cx))),
             );
         }
-        if found.is_empty() {
-            instructions = instructions.child(
-                label(colors, "No AGENTS.md or CLAUDE.md here or in your home folder.").px_3().py_1().line_height(relative(1.45)),
-            );
-        }
-
-        let mut commands = col();
-        for (name, description) in thread.commands.iter().take(COMMANDS_SHOWN) {
-            commands = commands.child(
-                row().h(px(26.)).px_3().gap_2().child(
-                    line_with_detail(format!("/{name}"), Some((description.clone().into(), rgb(colors.quiet).into())), 18.)
-                        .flex_1()
-                        .min_w_0(),
-                ),
-            );
-        }
-        if thread.commands.len() > COMMANDS_SHOWN {
-            commands = commands.child(label(colors, format!("{} more", thread.commands.len() - COMMANDS_SHOWN)).px_3().py_1());
-        }
-
-        let mut session = col().child(fact(colors, "Agent", self.agent_name(thread).to_string()));
-        for setting in &thread.settings {
-            session = session.child(fact(colors, setting.name.clone(), setting.current_name().to_string()));
-        }
-        session = session.child(fact(colors, "Folder", project.path.as_deref().map_or("Scratch".to_string(), tilde)));
         col()
             .pb_3()
-            .child(col().px_3().pt_3().pb_2().child(meter))
-            .when(!thread.plan.is_empty(), |s| s.child(section(colors, "Plan", None)).child(plan))
-            .when(!files.is_empty(), |s| s.child(section(colors, "Files", Some(files.len()))).child(file_rows))
-            .child(section(colors, "Instructions", (!found.is_empty()).then_some(found.len())))
-            .child(instructions)
-            .child(section(colors, "Session", None))
-            .child(session)
-            .when(!thread.commands.is_empty(), |s| {
-                s.child(section(colors, "Commands", Some(thread.commands.len()))).child(commands)
+            .when(thread.usage.is_some_and(|(_, size)| size > 0), |s| {
+                s.child(col().px_3().pt_3().pb_2().child(meter))
             })
+            .when(!thread.plan.is_empty(), |s| {
+                let total = thread.plan.len();
+                let done = thread.plan.iter().filter(|(step, _)| *step == Step::Done).count();
+                s.child(section(colors, format!("Plan · {done} of {total} done"), None)).child(plan)
+            })
+            .when(!files.is_empty(), |s| s.child(section(colors, "Files", Some(files.len()))).child(file_rows))
+            .when(!found.is_empty(), |s| s.child(section(colors, "Instructions", Some(found.len()))).child(instructions))
     }
 
     fn changes_page(&self, cx: &mut Context<Self>) -> Div {

@@ -1,6 +1,7 @@
 //! The window's state: which project and thread are showing, the open tabs and
 //! the panels around them. Views live in the submodules.
 mod chat;
+mod commands;
 mod chrome;
 mod md;
 mod panes;
@@ -8,6 +9,7 @@ mod preferences;
 mod side;
 mod syntax;
 mod terminal;
+pub use terminal::init_terminal_keys;
 mod ui;
 
 use crate::{
@@ -80,6 +82,17 @@ impl Side {
     }
 }
 
+/// What a project had showing when you left it, put back when you return. The
+/// terminal is kept here too, so its shell goes on running in the background.
+struct ProjectView {
+    tabs: Vec<Tab>,
+    active: usize,
+    expanded: HashSet<PathBuf>,
+    terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
+    /// The thread that was showing, by id: indexes shift as threads are added.
+    thread: Option<usize>,
+}
+
 /// A file or folder in the Files page.
 #[derive(Clone)]
 pub struct Entry {
@@ -117,8 +130,13 @@ pub struct Workspace {
     /// The lines of each file open in a tab, or why it couldn't be shown.
     files: HashMap<PathBuf, Result<Rc<FileView>, SharedString>>,
     terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
+    /// Projects not showing, by index, as they were left.
+    views: HashMap<usize, ProjectView>,
     thread_search: Entity<InputState>,
     composer: Entity<InputState>,
+    command_index: usize,
+    command_scroll: ScrollHandle,
+    commands_dismissed: bool,
     /// Empty the composer on the next render, outside the action that sent it.
     clear_composer: bool,
     transcript: ScrollHandle,
@@ -184,8 +202,12 @@ impl Workspace {
             listings: HashMap::new(),
             files: HashMap::new(),
             terminal: None,
+            views: HashMap::new(),
             thread_search,
             composer,
+            command_index: 0,
+            command_scroll: ScrollHandle::new(),
+            commands_dismissed: false,
             clear_composer: false,
             transcript: ScrollHandle::new(),
             thread_panels: cx.new(|_| ResizableState::default()),
@@ -217,6 +239,7 @@ impl Workspace {
         } else {
             workspace.select_thread(0, cx);
         }
+        workspace.observe_command_draft(cx);
         workspace.composer.update(cx, |s, cx| s.focus(window, cx));
         workspace
     }
@@ -244,15 +267,43 @@ impl Workspace {
         if self.project == index {
             return;
         }
+        // Tabs, the file tree and the terminal belong to the project that was
+        // showing: put them away as they are, and bring back the new one's.
+        let leaving = ProjectView {
+            tabs: std::mem::take(&mut self.tabs),
+            active: self.active,
+            expanded: std::mem::take(&mut self.expanded),
+            terminal: self.terminal.take(),
+            thread: self.current_thread().map(|t| t.id),
+        };
+        self.views.insert(self.project, leaving);
         self.project = index;
-        // Tabs and the file tree belong to the project that was showing.
-        self.tabs.truncate(1);
-        self.terminal = None;
-        self.expanded.clear();
-        if self.projects[index].threads.is_empty() {
-            self.start_thread(cx);
-        } else {
-            self.select_thread(0, cx);
+        let back = self.views.remove(&index);
+        let thread = back.as_ref().and_then(|v| v.thread);
+        match back {
+            Some(view) => {
+                self.tabs = view.tabs;
+                self.expanded = view.expanded;
+                self.terminal = view.terminal;
+                self.active = view.active.min(self.tabs.len().saturating_sub(1));
+            }
+            None => {
+                self.tabs = vec![Tab { id: self.next_tab, kind: TabKind::Chat }];
+                self.next_tab += 1;
+                self.active = 0;
+            }
+        }
+        let threads = &self.projects[index].threads;
+        match thread.and_then(|id| threads.iter().position(|t| t.id == id)) {
+            Some(at) => {
+                // Back to the same thread and the same tab.
+                let active = self.active;
+                self.select_thread(at, cx);
+                self.active = active;
+                self.focus_terminal(cx);
+            }
+            None if threads.is_empty() => self.start_thread(cx),
+            None => self.select_thread(0, cx),
         }
     }
     /// Show a thread, starting its agent if it has none, so its models and

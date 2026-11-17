@@ -15,6 +15,15 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use std::sync::Arc;
 
 const HEIGHT: f32 = 20.;
+actions!(terminal, [SendTab, SendBackTab]);
+
+pub fn init_terminal_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("tab", SendTab, Some("Terminal")),
+        KeyBinding::new("shift-tab", SendBackTab, Some("Terminal")),
+    ]);
+}
+
 #[derive(Clone)]
 struct Listener(UnboundedSender<TerminalEvent>);
 impl EventListener for Listener {
@@ -361,6 +370,11 @@ impl Render for TerminalView {
                     .min_h_0()
                     .overflow_hidden()
                     .track_focus(&self.focus)
+                    // These actions take precedence over Root's focus traversal.
+                    .on_action(cx.listener(|s, _: &SendTab, _, cx| s.input(vec![b'\t'], cx)))
+                    .on_action(
+                        cx.listener(|s, _: &SendBackTab, _, cx| s.input(b"\x1b[Z".to_vec(), cx)),
+                    )
                     .on_key_down(cx.listener(Self::key))
                     .on_mouse_down(
                         MouseButton::Left,

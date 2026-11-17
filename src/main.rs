@@ -14,10 +14,8 @@ fn main() {
     Application::new().with_assets(icons::Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::init(cx);
+        workspace::init_terminal_keys(cx);
         cx.bind_keys([
-            // Keep terminal completion keys out of Root's focus navigation.
-            KeyBinding::new("tab", NoAction, Some("Terminal")),
-            KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
             KeyBinding::new("cmd-b", ToggleThreads, None),
             KeyBinding::new("cmd-alt-b", ToggleSide, None),
             KeyBinding::new("cmd-n", NewThread, None),

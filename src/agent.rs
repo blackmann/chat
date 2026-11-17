@@ -567,7 +567,11 @@ mod tests {
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
 
-        let Event::Ready { agent, settings, history, .. } = next() else { panic!("expected Ready first") };
+        // Commands can be announced as the session opens, before or after Ready.
+        let Event::Ready { agent, settings, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()
+        else {
+            panic!("expected Ready first")
+        };
         assert_eq!(history, History::New);
         assert_eq!(agent, "Mock Agent");
         assert_eq!(settings.iter().map(|s| s.role).collect::<Vec<_>>(), [Role::Mode, Role::Model, Role::Effort]);
@@ -617,7 +621,10 @@ mod tests {
         let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Some("mock-7".into()));
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
-        let Event::Ready { session, history, .. } = next() else { panic!("expected Ready first, with the replay dropped") };
+        let Event::Ready { session, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()
+        else {
+            panic!("expected Ready first, with the replay dropped")
+        };
         assert_eq!((session.as_str(), history), ("mock-7", History::Kept));
         commands.unbounded_send(Command::Prompt("explain".into())).unwrap();
         loop {
