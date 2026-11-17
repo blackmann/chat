@@ -242,6 +242,10 @@ impl Workspace {
                     s.git_diffs.insert(key, diff);
                 }
                 s.sync_git_watch();
+                // Commits and edits move open files' marks and blame.
+                for path in s.files.keys().cloned().collect::<Vec<_>>() {
+                    s.load_file_git(path, cx);
+                }
                 if s.git_queued {
                     s.refresh_git(cx);
                 }
