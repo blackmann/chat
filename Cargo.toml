@@ -1,0 +1,31 @@
+[package]
+name = "chat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A native GPUI agent IDE: projects, threads, and a tabbed workspace around the chat"
+
+[dependencies]
+gpui = "=0.2.2"
+gpui-component = { version = "=0.5.0", features = ["tree-sitter-languages"] }
+gpui-component-assets = "=0.5.0"
+similar = "2"
+markdown = "=1.0.0"
+agent-client-protocol = { version = "5.3", features = ["process"] }
+anyhow = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+alacritty_terminal = "0.25"
+
+[profile.dev]
+debug = 0
+
+# GPUI and its renderer are far smoother optimized; app code stays quick to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
