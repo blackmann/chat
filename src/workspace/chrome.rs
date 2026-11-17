@@ -7,6 +7,7 @@ use gpui_component::{
     Icon, IconName, Sizable, TitleBar,
     button::{Button, ButtonVariants},
     input::Input,
+    scroll::ScrollableElement,
     tooltip::Tooltip,
 };
 
@@ -466,7 +467,14 @@ impl Workspace {
                             .on_click(cx.listener(|s, _, w, cx| s.new_thread(&NewThread, w, cx))),
                     ),
             )
-            .child(div().id("thread-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().id("thread-list").size_full().overflow_y_scroll().track_scroll(&self.thread_scroll).child(list))
+                    .vertical_scrollbar(&self.thread_scroll),
+            )
             .into_any_element()
     }
 

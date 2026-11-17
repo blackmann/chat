@@ -1,6 +1,6 @@
 //! Projects, threads and what a thread has gathered from its agent. A thread is
 //! a fold over the agent's events; every panel reads from it.
-use crate::agent::{Answer, Command, Event, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
+use crate::agent::{Answer, Command, Event, Failure, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
 use serde::{Deserialize, Serialize};
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{SharedString, Task};
@@ -91,6 +91,8 @@ pub enum Block {
     Permission(Permission),
     /// Something the app has to say: a stop, a failure.
     Notice(String),
+    /// The agent isn't signed in, with the command that signs it in when there is one.
+    SignIn { agent: String, command: Option<String> },
     /// The close of an agent turn: when it ended and how long the agent worked.
     TurnEnded { at: i64, worked_ms: u64 },
 }
@@ -380,9 +382,12 @@ impl Thread {
                         self.notice("The agent hit its token or turn limit.");
                         ThreadState::Done
                     }
-                    Err(error) => {
+                    Err(failure) => {
                         self.settle_tools();
-                        self.notice(error);
+                        match failure {
+                            Failure::SignedOut { agent, command } => self.blocks.push(Block::SignIn { agent, command }),
+                            Failure::Other(error) => self.notice(error),
+                        }
                         ThreadState::Failed
                     }
                 };
@@ -416,7 +421,12 @@ impl Thread {
                 self.settle_tools();
                 self.stamp_turn();
                 if reason.is_some() || interrupted {
-                    self.problem = Some(reason.map_or("The agent exited.".into(), |r| format!("The agent stopped: {r}")));
+                    match reason {
+                        // How to sign in stays in the transcript; it outlasts the reconnect that clears a problem.
+                        Some(Failure::SignedOut { agent, command }) => self.blocks.push(Block::SignIn { agent, command }),
+                        Some(Failure::Other(reason)) => self.problem = Some(format!("The agent stopped: {reason}")),
+                        None => self.problem = Some("The agent exited.".into()),
+                    }
                     self.state = ThreadState::Failed;
                 }
             }
@@ -727,6 +737,20 @@ mod tests {
         t.apply(Event::TurnEnded(Ok(Stop::Finished)));
         assert_eq!(said(&t), ["initial", "follow-up"]);
         assert!(matches!(&t.blocks[1], Block::TurnEnded { .. }), "the first turn closes before the follow-up starts");
+    }
+
+    #[test]
+    fn a_signed_out_agent_leaves_how_to_sign_in() {
+        let signed_out = || Failure::SignedOut { agent: "Claude Code".into(), command: Some("claude auth login".into()) };
+        let mut t = Thread::new(0, 0);
+        t.submit("hi", "hi".into(), false);
+        t.apply(Event::TurnEnded(Err(signed_out())));
+        assert!(matches!(&t.blocks[1], Block::SignIn { agent, command: Some(_) } if agent == "Claude Code"));
+        assert!(t.state == ThreadState::Failed && matches!(t.blocks.last(), Some(Block::TurnEnded { .. })));
+        // Refused before the session opened: the same help, rather than a bare problem.
+        let mut t = Thread::new(0, 0);
+        t.apply(Event::Closed(Some(signed_out())));
+        assert!(matches!(t.blocks.last(), Some(Block::SignIn { .. })) && t.problem.is_none());
     }
 }
 

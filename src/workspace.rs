@@ -193,6 +193,7 @@ pub struct Workspace {
     file_mentions: Rc<RefCell<Vec<FileMention>>>,
     command_index: usize,
     command_scroll: ScrollHandle,
+    thread_scroll: ScrollHandle,
     commands_dismissed: bool,
     /// Empty the composer on the next render, outside the action that sent it.
     clear_composer: bool,
@@ -367,6 +368,7 @@ impl Workspace {
             tabs_scroll: ScrollHandle::new(),
             tab_in_view: std::cell::Cell::new(None),
             command_scroll: ScrollHandle::new(),
+            thread_scroll: ScrollHandle::new(),
             commands_dismissed: false,
             clear_composer: false,
             transcript: ScrollHandle::new(),

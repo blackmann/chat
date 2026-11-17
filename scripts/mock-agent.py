@@ -5,6 +5,7 @@ Speaks just enough of the Agent Client Protocol (v1, JSON-RPC over stdio) to
 drive every part of a thread: streamed text, thoughts, tool calls, an edit that
 asks permission first, a plan, usage, switchable model / effort / mode, and
 reloading an earlier session (which replays it, as real agents do).
+A prompt containing "sign in" is refused the way a signed-out agent refuses one.
 
 Add it to settings.json under "agents":
     {"name": "Mock", "command": "python3", "args": ["scripts/mock-agent.py"]}
@@ -237,6 +238,10 @@ def main():
         elif method == "session/prompt":
             session = params["sessionId"]
             prompt = "".join(b.get("text", "") for b in params.get("prompt", []))
+            # What a signed-out agent answers, to see how the thread explains it.
+            if "sign in" in prompt.lower():
+                send({"id": rid, "error": {"code": -32000, "message": "Authentication required"}})
+                continue
             with turn_lock:
                 active_turns[rid] = session
             threading.Thread(target=turn, args=(rid, session, prompt, cwds.get(session, ".")), daemon=True).start()
