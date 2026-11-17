@@ -8,7 +8,7 @@ use agent_client_protocol::{
     v1::{
         ConnectionTo,
         schema::{
-            CancelNotification, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+            CancelNotification, ContentBlock, McpServer, McpServerStdio, Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest,
             PermissionOptionKind, PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
             RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
             SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionNotification,
@@ -253,22 +253,25 @@ pub fn connect(
     extra: Vec<PathBuf>,
     previous: Option<String>,
     picks: Vec<(String, String)>,
+    tool: Option<Vec<String>>,
 ) -> (UnboundedSender<Command>, UnboundedReceiver<Event>, impl Future<Output = ()> + Send + 'static) {
     let (command_tx, command_rx) = unbounded();
     let (event_tx, event_rx) = unbounded();
     let run = async move {
-        let result = run(spec, cwd, extra, previous, picks, command_rx, event_tx.clone()).await;
+        let result = run(spec, cwd, extra, previous, picks, tool, command_rx, event_tx.clone()).await;
         let _ = event_tx.unbounded_send(Event::Closed(result.err().map(|e| e.to_string())));
     };
     (command_tx, event_rx, run)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     spec: AgentSpec,
     cwd: PathBuf,
     extra: Vec<PathBuf>,
     previous: Option<String>,
     picks: Vec<(String, String)>,
+    tool: Option<Vec<String>>,
     mut commands: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) -> Result<(), agent_client_protocol::Error> {
@@ -289,6 +292,12 @@ async fn run(
             config = config.env("CODEX_CONFIG", overrides);
         }
     }
+    // This app, started again as an MCP server, offers the agent its tools.
+    let servers: Vec<McpServer> = tool
+        .zip(std::env::current_exe().ok())
+        .map(|(args, exe)| McpServer::Stdio(McpServerStdio::new("chat", exe).args(args)))
+        .into_iter()
+        .collect();
     let mut agent = AcpAgent::new(config);
     if std::env::var_os("CHAT_ACP_LOG").is_some() {
         agent = agent.with_debug(|line, direction| {
@@ -367,14 +376,14 @@ async fn run(
             // quietly, load replays it.
             let reopened = match previous.clone() {
                 Some(id) if capabilities.session_capabilities.resume.is_some() => connection
-                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()))
+                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone()))
                     .block_task()
                     .await
                     .ok()
                     .map(|r| (id, r.config_options, r.modes)),
                 Some(id) if capabilities.load_session => {
                     replaying.store(true, Ordering::SeqCst);
-                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone())).block_task().await;
+                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone())).block_task().await;
                     replaying.store(false, Ordering::SeqCst);
                     loaded.ok().map(|r| (id, r.config_options, r.modes))
                 }
@@ -383,7 +392,7 @@ async fn run(
             let (session_id, options, modes, history) = match reopened {
                 Some((id, options, modes)) => (id.into(), options, modes, History::Kept),
                 None => {
-                    let session = connection.send_request(NewSessionRequest::new(cwd).additional_directories(extra)).block_task().await?;
+                    let session = connection.send_request(NewSessionRequest::new(cwd).additional_directories(extra).mcp_servers(servers)).block_task().await?;
                     let history = if previous.is_some() { History::Lost } else { History::New };
                     (session.session_id, session.config_options, session.modes, history)
                 }
@@ -681,7 +690,7 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), None, Vec::new());
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), None, Vec::new(), None);
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
 
@@ -747,7 +756,7 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), Some("mock-7".into()), Vec::new());
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), Some("mock-7".into()), Vec::new(), None);
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
         let Event::Ready { session, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()

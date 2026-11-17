@@ -30,6 +30,8 @@ struct SavedThread {
     session: Option<String>,
     #[serde(default)]
     picks: Vec<(String, String)>,
+    #[serde(default)]
+    worktrees: std::collections::BTreeMap<PathBuf, PathBuf>,
     blocks: Vec<Block>,
     #[serde(default)]
     plan: Vec<(Step, String)>,
@@ -79,6 +81,7 @@ pub fn load(project: &Project, agents: &[AgentSpec], default_agent: usize, next_
             thread.unread = s.unread;
             thread.session_id = s.session;
             thread.picks = s.picks;
+            thread.worktrees = s.worktrees;
             thread.blocks = s.blocks;
             thread.plan = s.plan;
             thread.usage = s.usage;
@@ -105,6 +108,7 @@ struct ThreadOut<'a> {
     unread: bool,
     session: &'a Option<String>,
     picks: Vec<(String, String)>,
+    worktrees: &'a std::collections::BTreeMap<PathBuf, PathBuf>,
     blocks: &'a [Block],
     plan: &'a [(Step, String)],
     usage: Option<(u64, u64)>,
@@ -125,6 +129,7 @@ pub fn snapshot(project: &Project, agents: &[AgentSpec]) -> Option<(PathBuf, Vec
             unread: t.unread,
             session: &t.session_id,
             picks: t.current_picks(),
+            worktrees: &t.worktrees,
             blocks: &t.blocks,
             plan: &t.plan,
             usage: t.usage,

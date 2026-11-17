@@ -75,6 +75,30 @@ pub struct Snapshot {
     pub ahead: usize,
     /// The commit `HEAD` points at; `None` before the first commit.
     pub last_commit: Option<LastCommit>,
+    /// Every checkout of the repository, the main one first.
+    pub worktrees: Vec<Worktree>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The branch checked out, or `None` when detached.
+    pub branch: Option<String>,
+}
+/// `worktree list --porcelain`: a record per checkout, separated by blank lines.
+fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Vec<Worktree> = Vec::new();
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            out.push(Worktree { path: PathBuf::from(p), branch: None });
+        } else if let (Some(b), Some(last)) = (line.strip_prefix("branch "), out.last_mut()) {
+            last.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_owned());
+        } else if line == "bare" {
+            // A bare repository has nothing checked out to show.
+            out.pop();
+        }
+    }
+    out
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastCommit {
@@ -250,7 +274,8 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
         let (parents, message) = out.split_once('\0')?;
         Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty() })
     });
-    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit })
+    let worktrees = run(&root, &["worktree", "list", "--porcelain"]).map(|out| parse_worktrees(&out)).unwrap_or_default();
+    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit, worktrees })
 }
 /// `--numstat -z` records: counts and a path, or counts, nothing, and two paths for a rename.
 fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
@@ -545,6 +570,19 @@ mod tests {
         let s = snapshot(&r.0).unwrap();
         assert!(s.last_commit.is_none());
         assert!(s.entries[0].staged());
+    }
+    #[test]
+    fn lists_worktrees_main_first() {
+        let list = parse_worktrees(b"worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /r-side\nHEAD def\ndetached\n\n");
+        assert_eq!(list, [Worktree { path: "/r".into(), branch: Some("main".into()) }, Worktree { path: "/r-side".into(), branch: None }]);
+        let r = Repo::new();
+        r.write("a", "x\n");
+        r.stage("a");
+        r.commit();
+        run(&r.0, &["worktree", "add", "-q", "-b", "side", "side-tree"]).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.worktrees[1].branch.as_deref(), Some("side"));
     }
     #[test]
     fn status_reads_upstream_and_ahead() {
