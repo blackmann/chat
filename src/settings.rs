@@ -66,7 +66,16 @@ pub struct Settings {
     pub mono_font_size: Option<f32>,
     /// How messages sent during a running turn are delivered.
     pub follow_up_mode: FollowUpMode,
+    /// Columns per tab stop in code views; unset means the default (4).
+    pub tab_width: Option<usize>,
+    /// Whether code views draw indent guides; unset means they do.
+    pub indent_guides: Option<bool>,
+    /// The commit box's height, once dragged; unset means it grows with its text.
+    pub commit_box_height: Option<f32>,
 }
+
+/// The commit box can't be dragged shorter than this.
+pub const COMMIT_BOX_MIN: f32 = 96.;
 
 /// Where settings live; `CHAT_CONFIG_DIR` overrides it, for trying things out.
 pub fn dir() -> Option<PathBuf> {
@@ -93,6 +102,8 @@ impl Settings {
         settings.agent = settings.agent.min(settings.agents.len() - 1);
         settings.ui_font_size = settings.ui_font_size.filter(|size| size.is_finite() && (11.0..=16.0).contains(size));
         settings.mono_font_size = settings.mono_font_size.filter(|size| size.is_finite() && (10.0..=16.0).contains(size));
+        settings.tab_width = settings.tab_width.filter(|width| (1..=8).contains(width));
+        settings.commit_box_height = settings.commit_box_height.filter(|h| h.is_finite() && *h >= COMMIT_BOX_MIN);
         settings
     }
     pub fn save(&self) -> anyhow::Result<()> {
@@ -147,5 +158,17 @@ mod tests {
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
         assert_eq!(restored.ui_font_size, Some(15.));
         assert_eq!(restored.mono_font_size, Some(14.));
+    }
+
+    #[test]
+    fn indentation_is_optional_and_round_trips() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.tab_width, None);
+        assert_eq!(old.indent_guides, None);
+
+        let settings = Settings { tab_width: Some(2), indent_guides: Some(false), ..Default::default() };
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.tab_width, Some(2));
+        assert_eq!(restored.indent_guides, Some(false));
     }
 }

@@ -140,6 +140,10 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     next_tab: usize,
+    /// The tab strip's scroll, and the tab it last brought into view (by id),
+    /// so a newly active tab scrolls in once without fighting the wheel after.
+    tabs_scroll: ScrollHandle,
+    tab_in_view: std::cell::Cell<Option<usize>>,
     side: Side,
     threads_open: bool,
     side_open: bool,
@@ -212,6 +216,10 @@ pub struct Workspace {
     thread_changes_only: bool,
     commit_message: Entity<InputState>,
     clear_commit_message: Option<String>,
+    /// An undone commit's message, to put back in an empty commit box.
+    restore_commit_message: Option<String>,
+    /// Which Git operation is running, so its button can say so.
+    git_running: Option<GitRunning>,
     /// The repository the Changes page shows, when a project spans several folders.
     git_repo: Option<PathBuf>,
     /// Text selected in the transcript.
@@ -243,10 +251,22 @@ pub struct Workspace {
     mention_dismissed: bool,
     /// Code views scrolled sideways, by view: their line numbers stay put.
     sideways: Rc<RefCell<HashMap<SharedString, panes::Sideways>>>,
+    /// The commit box was resized and the new height isn't saved yet; it is
+    /// when the drag ends.
+    commit_height_unsaved: bool,
     /// While a project is dragged along the rail: which one, and the gap it
     /// would drop into, counted as the index of the project below that gap.
     drop_slot: Option<(usize, usize)>,
     _quit: Option<Subscription>,
+}
+
+/// A Git operation in progress, as far as the commit box cares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitRunning {
+    Commit,
+    Push,
+    Undo,
+    Other,
 }
 
 impl Workspace {
@@ -265,8 +285,6 @@ impl Workspace {
         });
         cx.observe(&thread_search, |_, _, cx| cx.notify()).detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-        let commit_message = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 5).placeholder("Commit message…"));
-        cx.observe(&commit_message, |_, _, cx| cx.notify()).detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         cx.subscribe_in(&rename_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
             if let gpui_component::input::InputEvent::PressEnter { .. } = e {
@@ -275,6 +293,7 @@ impl Workspace {
         })
         .detach();
         let settings = Settings::load();
+        let commit_message = git_panel::commit_input(settings.commit_box_height.is_some(), window, cx);
         let mut projects = vec![Project::chats()];
         projects.extend(settings.projects.iter().filter(|p| p.path.is_dir()).cloned().map(Project::open));
         let mut next_thread = 0;
@@ -306,6 +325,8 @@ impl Workspace {
             composer,
             file_mentions,
             command_index: 0,
+            tabs_scroll: ScrollHandle::new(),
+            tab_in_view: std::cell::Cell::new(None),
             command_scroll: ScrollHandle::new(),
             commands_dismissed: false,
             clear_composer: false,
@@ -339,6 +360,8 @@ impl Workspace {
             thread_changes_only: false,
             commit_message,
             clear_commit_message: None,
+            restore_commit_message: None,
+            git_running: None,
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
@@ -360,6 +383,7 @@ impl Workspace {
             mention_dismissed: false,
             sideways: Rc::default(),
             drop_slot: None,
+            commit_height_unsaved: false,
             _quit: None,
         };
         // Whatever hasn't been written yet is written on the way out.
@@ -373,6 +397,10 @@ impl Workspace {
             workspace.settings.ui_font_size,
             workspace.settings.mono_font_size,
             cx,
+        );
+        syntax::set_indentation(
+            workspace.settings.tab_width.unwrap_or(syntax::DEFAULT_TAB_WIDTH),
+            workspace.settings.indent_guides.unwrap_or(true),
         );
         // Reopen where things were left: the project's latest thread.
         if workspace.current_project().threads.is_empty() {
@@ -1076,6 +1104,11 @@ impl Render for Workspace {
             let (commit, search) = self.project_inputs.remove(&self.project).unwrap_or_default();
             self.commit_message.update(cx, |s, cx| s.set_value(commit, window, cx));
             self.thread_search.update(cx, |s, cx| s.set_value(search, window, cx));
+        }
+        if let Some(message) = self.restore_commit_message.take() {
+            if self.commit_message.read(cx).value().trim().is_empty() {
+                self.commit_message.update(cx, |s, cx| s.set_value(message, window, cx));
+            }
         }
         if let Some(committed) = self.clear_commit_message.take() {
             if self.commit_message.read(cx).value().as_ref() == committed {

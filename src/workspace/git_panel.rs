@@ -11,8 +11,49 @@ use gpui_component::{
     Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
     checkbox::Checkbox,
-    input::Input,
+    input::{Input, InputState},
 };
+
+/// The commit message field. It grows with its text until the box is given a
+/// height by dragging its top edge; then it fills that height and scrolls.
+pub(super) fn commit_input(fixed: bool, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<InputState> {
+    let input = cx.new(|cx| {
+        let input = InputState::new(window, cx).multi_line(true).placeholder("Commit message…");
+        if fixed { input.rows(2) } else { input.auto_grow(2, 5) }
+    });
+    cx.observe(&input, |_, _, cx| cx.notify()).detach();
+    input
+}
+
+/// The commit box's top edge, while it is dragged. Nothing follows the cursor.
+#[derive(Clone)]
+struct CommitEdge;
+impl Render for CommitEdge {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// A raised, bordered button with an optional icon, as in a native toolbar.
+fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
+    row()
+        .id(id)
+        .h(px(24.))
+        .px(px(9.))
+        .gap(px(5.))
+        .flex_shrink_0()
+        .rounded(px(6.))
+        .border_1()
+        .border_color(rgb(colors.popover_border))
+        .bg(rgb(colors.hover))
+        .shadow_xs()
+        .text_size(px(crate::theme::scaled_ui(12.5)))
+        .text_color(rgb(colors.text))
+        .when_some(glyph, |s, g| s.child(icon(g).size(px(13.)).text_color(rgb(colors.muted))))
+        .child(text.into())
+        .when(enabled, |s| s.cursor_pointer().hover(|s| s.bg(rgb(colors.popover_hover))).active(|s| s.bg(rgb(colors.border))))
+        .when(!enabled, |s| s.opacity(0.5))
+}
 
 /// A checkbox: on under Staged, off under Unstaged.
 fn tick(colors: Palette, id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div> {
@@ -189,6 +230,12 @@ impl Workspace {
             return;
         };
         self.git_busy = true;
+        self.git_running = Some(match &operation {
+            Operation::Commit(_) | Operation::CommitTracked(_) => GitRunning::Commit,
+            Operation::Push => GitRunning::Push,
+            Operation::UndoCommit => GitRunning::Undo,
+            _ => GitRunning::Other,
+        });
         self.git_revision += 1;
         self.git_errors.remove(&folder);
         cx.notify();
@@ -196,16 +243,23 @@ impl Workspace {
             Operation::Commit(message) | Operation::CommitTracked(message) => Some(message.clone()),
             _ => None,
         };
+        let undone = matches!(operation, Operation::UndoCommit)
+            .then(|| self.git_snapshot().and_then(|s| s.last_commit.as_ref()).map(|c| c.message.clone()))
+            .flatten();
         cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(async move { git::operate(&root, operation) }).await;
             let _ = this.update(cx, |s, cx| {
                 s.git_busy = false;
+                s.git_running = None;
                 s.git_revision += 1;
                 match result {
                     Err(error) => {
                         s.git_errors.insert(folder, error);
                     }
-                    Ok(()) => s.clear_commit_message = committed,
+                    Ok(()) => {
+                        s.clear_commit_message = committed;
+                        s.restore_commit_message = undone;
+                    }
                 }
                 s.git_diffs.clear();
                 s.refresh_git(cx);
@@ -260,6 +314,31 @@ impl Workspace {
             }, cx))
             .child(branch_chip(colors, snapshot.branch.clone()))
             .into_any_element()
+    }
+
+    /// Give the commit box a height (`None` lets it grow with its text again),
+    /// swapping the field's mode to match while keeping what was typed.
+    fn set_commit_height(&mut self, height: Option<f32>, window: &mut Window, cx: &mut Context<Self>) {
+        if height.is_some() != self.settings.commit_box_height.is_some() {
+            let text = self.commit_message.read(cx).value().to_string();
+            let focused = self.commit_message.read(cx).focus_handle(cx).is_focused(window);
+            self.commit_message = commit_input(height.is_some(), window, cx);
+            self.commit_message.update(cx, |s, cx| {
+                s.set_value(text, window, cx);
+                if focused {
+                    s.focus(window, cx);
+                }
+            });
+        }
+        self.settings.commit_box_height = height;
+        self.commit_height_unsaved = true;
+        cx.notify();
+    }
+
+    fn save_commit_height(&mut self) {
+        if std::mem::take(&mut self.commit_height_unsaved) {
+            let _ = self.settings.save();
+        }
     }
 
     pub(super) fn changes_page(&self, cx: &mut Context<Self>) -> Div {
@@ -449,59 +528,158 @@ impl Workspace {
         // As in Zed: with nothing staged, commit every tracked change.
         let all_tracked = staged == 0;
         let can_commit = !self.git_busy && message && !conflicted && (staged > 0 || tracked);
-        page.child(
-            col()
+        let height = self.settings.commit_box_height;
+        let running = self.git_running;
+        let pushable = !self.git_busy && snapshot.can_push();
+        let push_tip: SharedString = match (&snapshot.upstream, snapshot.ahead) {
+            _ if snapshot.last_commit.is_none() => "Nothing to push yet".into(),
+            (None, _) => "Push this branch and track it on the remote".into(),
+            (Some(up), 0) => format!("Up to date with {up}").into(),
+            (Some(up), n) => format!("Push {n} commit{} to {up}", if n == 1 { "" } else { "s" }).into(),
+        };
+        let push_label = match running {
+            Some(GitRunning::Push) => "Pushing…".to_string(),
+            _ if snapshot.upstream.is_some() && snapshot.ahead > 0 => format!("Push {}", snapshot.ahead),
+            _ => "Push".to_string(),
+        };
+        let last = snapshot.last_commit.clone();
+        let pushed = snapshot.pushed();
+        let commit_box = col()
+            .id("commit-box")
+            .relative()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.background))
+            .min_h(px(crate::settings::COMMIT_BOX_MIN))
+            .when_some(height, |s, h| s.h(px(h)))
+            // The box's bottom stays put, so its height is the distance from
+            // the cursor down to it. It can take most of the panel, no more.
+            .on_drag_move(cx.listener(|s, e: &DragMoveEvent<CommitEdge>, window, cx| {
+                let max = (f32::from(window.viewport_size().height) * 0.7).max(crate::settings::COMMIT_BOX_MIN);
+                let h = f32::from(e.bounds.bottom() - e.event.position.y).clamp(crate::settings::COMMIT_BOX_MIN, max).round();
+                if s.settings.commit_box_height != Some(h) {
+                    s.set_commit_height(Some(h), window, cx);
+                }
+            }))
+            // The drag ends wherever the button comes up.
+            .on_mouse_up(MouseButton::Left, cx.listener(|s, _, _, _| s.save_commit_height()))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, _| s.save_commit_height()))
+            // The top edge: drag to resize, double-click to fit the text again.
+            .child(
+                div()
+                    .id("commit-box-edge")
+                    .absolute()
+                    .top(px(-3.))
+                    .left_0()
+                    .right_0()
+                    .h(px(6.))
+                    .cursor_row_resize()
+                    .on_drag(CommitEdge, |edge, _, _, cx| cx.new(|_| edge.clone()))
+                    .on_click(cx.listener(|s, e: &ClickEvent, window, cx| {
+                        if e.click_count() == 2 {
+                            s.set_commit_height(None, window, cx);
+                            s.save_commit_height();
+                        }
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .px(px(14.))
+                    .pt(px(12.))
+                    .pb(px(6.))
+                    // Commit messages are set in the code font, as in a terminal.
+                    .font_family(mono())
+                    .text_size(px(crate::theme::mono_size()))
+                    .child(
+                        Input::new(&self.commit_message)
+                            .appearance(false)
+                            .p_0()
+                            .font_family(mono())
+                            .text_size(px(crate::theme::mono_size()))
+                            .when(height.is_some(), |s| s.h(relative(1.))),
+                    ),
+            )
+            .child(
+                row()
+                    .h(px(40.))
+                    .px(px(10.))
+                    .gap(px(8.))
+                    .child(
+                        bar_button(colors, "push", Some(IconName::ArrowUp), push_label, pushable)
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(push_tip.clone()).build(window, cx))
+                            .when(pushable, |s| s.on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::Push, cx)))),
+                    )
+                    .child(
+                        label(
+                            colors,
+                            if all_tracked {
+                                String::new()
+                            } else {
+                                format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })
+                            },
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                    )
+                    .child(
+                        bar_button(
+                            colors,
+                            "commit",
+                            None,
+                            if running == Some(GitRunning::Commit) { "Committing…" } else { "Commit" },
+                            can_commit,
+                        )
+                        .when(can_commit, |s| {
+                            s.on_click(cx.listener(move |s, _, _, cx| {
+                                let message = s.commit_message.read(cx).value().to_string();
+                                let operation = if all_tracked { Operation::CommitTracked(message) } else { Operation::Commit(message) };
+                                s.git_operation(operation, cx);
+                            }))
+                        }),
+                    ),
+            );
+        // The last commit, with a way to take it back while it is still local.
+        let footer = last.map(|last| {
+            let undoable = !self.git_busy && !pushed;
+            row()
                 .flex_shrink_0()
+                .h(px(34.))
+                .pl(px(14.))
+                .pr(px(8.))
+                .gap(px(6.))
                 .border_t_1()
                 .border_color(rgb(colors.border))
                 .bg(rgb(colors.panel))
-                .min_h(px(96.))
                 .child(
                     div()
+                        .id("last-commit")
                         .flex_1()
-                        .px(px(14.))
-                        .pt(px(12.))
-                        .pb(px(6.))
-                        .child(Input::new(&self.commit_message).appearance(false).p_0()),
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(crate::theme::scaled_ui(12.5)))
+                        .text_color(rgb(colors.text))
+                        .child(last.subject().to_string())
+                        .tooltip({
+                            let message = SharedString::from(last.message.clone());
+                            move |window, cx| gpui_component::tooltip::Tooltip::new(message.clone()).build(window, cx)
+                        }),
                 )
                 .child(
-                    row()
-                        .h(px(36.))
-                        .px(px(8.))
-                        .gap(px(8.))
-                        .child(
-                            label(
-                                colors,
-                                if all_tracked {
-                                    String::new()
-                                } else {
-                                    format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })
-                                },
-                            )
-                            .flex_1()
-                            .min_w_0()
-                            .truncate(),
-                        )
-                        .child(
-                            Button::new("commit")
-                                .primary()
-                                .small()
-                                .label(if self.git_busy {
-                                    "Working…"
-                                } else if all_tracked {
-                                    "Commit Tracked"
-                                } else {
-                                    "Commit"
-                                })
-                                .disabled(!can_commit)
-                                .on_click(cx.listener(move |s, _, _, cx| {
-                                    let message = s.commit_message.read(cx).value().to_string();
-                                    let operation = if all_tracked { Operation::CommitTracked(message) } else { Operation::Commit(message) };
-                                    s.git_operation(operation, cx);
-                                })),
-                        ),
-                ),
-        )
+                    Button::new("undo-commit")
+                        .icon(IconName::Undo2)
+                        .ghost()
+                        .small()
+                        .loading(running == Some(GitRunning::Undo))
+                        .disabled(!undoable)
+                        .tooltip(if pushed { "Already pushed, so it can't be undone here" } else { "Undo last commit, keeping its changes staged" })
+                        .on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::UndoCommit, cx))),
+                )
+        });
+        page.child(commit_box).children(footer)
     }
 
     pub(super) fn git_diff_view(&self, path: &Path, staged: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {

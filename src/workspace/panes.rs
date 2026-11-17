@@ -166,7 +166,7 @@ fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
                 },
                 old: change.old_index().map(|i| i + 1),
                 new: change.new_index().map(|i| i + 1),
-                text: change.value().trim_end_matches(['\n', '\r']).replace('\t', "    "),
+                text: syntax::expand_tabs(change.value().trim_end_matches(['\n', '\r'])),
             });
         }
     }
@@ -294,7 +294,8 @@ impl Guides {
     }
 
     fn at(self, count: u16) -> Self {
-        Self { count, ..self }
+        // With guides turned off, every row has none.
+        Self { count: if syntax::show_guides() { count } else { 0 }, ..self }
     }
 }
 

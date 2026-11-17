@@ -542,7 +542,7 @@ impl Workspace {
             return div().child(line);
         }
         // Opened: the whole command, wrapped, and what it printed.
-        let mut lines = output.lines().map(|l| l.replace('\t', "    ")).collect::<Vec<_>>();
+        let mut lines = output.lines().map(super::syntax::expand_tabs).collect::<Vec<_>>();
         let hidden = lines.len().saturating_sub(TOOL_OUTPUT_LINES);
         lines.drain(..hidden);
         col().child(line).child(

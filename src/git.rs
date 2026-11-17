@@ -70,6 +70,35 @@ pub struct Snapshot {
     pub git_dir: PathBuf,
     pub branch: String,
     pub entries: Vec<Entry>,
+    /// The branch's upstream, if it tracks one, and how many commits it is ahead of it.
+    pub upstream: Option<String>,
+    pub ahead: usize,
+    /// The commit `HEAD` points at; `None` before the first commit.
+    pub last_commit: Option<LastCommit>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastCommit {
+    /// The whole message, to put back in the commit box when the commit is undone.
+    pub message: String,
+    /// Whether it has a parent; undoing a root commit empties the branch instead.
+    pub has_parent: bool,
+}
+impl LastCommit {
+    pub fn subject(&self) -> &str {
+        self.message.lines().next().unwrap_or_default()
+    }
+}
+impl Snapshot {
+    /// Whether the last commit is already on the upstream, where undoing it
+    /// would rewrite history others may have.
+    pub fn pushed(&self) -> bool {
+        self.upstream.is_some() && self.ahead == 0
+    }
+    /// Whether there is anything to push: commits ahead of the upstream, or a
+    /// branch with commits that has no upstream yet.
+    pub fn can_push(&self) -> bool {
+        self.last_commit.is_some() && (self.upstream.is_none() || self.ahead > 0)
+    }
 }
 #[derive(Clone, Debug)]
 pub enum Diff {
@@ -86,6 +115,10 @@ pub enum Operation {
     Commit(String),
     /// Commit every change to tracked files, staged or not, as `git commit -a` does.
     CommitTracked(String),
+    /// Push the branch, setting its upstream on the first remote if it has none.
+    Push,
+    /// Undo the last commit, keeping its changes staged.
+    UndoCommit,
 }
 
 fn command(root: &Path) -> Command {
@@ -118,9 +151,15 @@ fn path(bytes: &[u8]) -> PathBuf {
 }
 /// `status --porcelain=v2 --branch -z`: the branch headers, then one record per
 /// changed file (a rename's record is followed by its old path).
-fn parse_status(bytes: &[u8]) -> (String, Vec<Entry>) {
+struct Status {
+    branch: String,
+    entries: Vec<Entry>,
+    upstream: Option<String>,
+    ahead: usize,
+}
+fn parse_status(bytes: &[u8]) -> Status {
     let mut records = bytes.split(|b| *b == 0).filter(|r| !r.is_empty());
-    let (mut head, mut oid) = (None, None);
+    let (mut head, mut oid, mut upstream, mut ahead) = (None, None, None, 0);
     let mut entries = Vec::new();
     while let Some(record) = records.next() {
         // Fields before the path: ordinary 8, renamed or copied 9, unmerged 10.
@@ -131,6 +170,10 @@ fn parse_status(bytes: &[u8]) -> (String, Vec<Entry>) {
                     head = Some(name.to_owned());
                 } else if let Some(sha) = text.strip_prefix("# branch.oid ") {
                     oid = Some(sha.to_owned());
+                } else if let Some(name) = text.strip_prefix("# branch.upstream ") {
+                    upstream = Some(name.to_owned());
+                } else if let Some(ab) = text.strip_prefix("# branch.ab +") {
+                    ahead = ab.split(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
                 }
                 continue;
             }
@@ -172,7 +215,7 @@ fn parse_status(bytes: &[u8]) -> (String, Vec<Entry>) {
         Some("(detached)") | None => oid.map(|o| o.chars().take(7).collect()).unwrap_or_default(),
         Some(name) => name.to_owned(),
     };
-    (branch, entries)
+    Status { branch, entries, upstream, ahead }
 }
 pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
     let dirs = run(folder, &["rev-parse", "--show-toplevel", "--absolute-git-dir"])?;
@@ -180,7 +223,7 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
     let (Some(root), Some(git_dir)) = (dirs.next().map(path), dirs.next().map(path)) else {
         return Err("Not a working tree.".into());
     };
-    let (branch, mut entries) = parse_status(&run(
+    let Status { branch, mut entries, upstream, ahead } = parse_status(&run(
         &root,
         &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
     )?);
@@ -203,7 +246,13 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
             entry.unstaged_stat = find(&unstaged, &entry.path);
         }
     }
-    Ok(Snapshot { root, git_dir, branch, entries })
+    // Parents, then the message; fails before the first commit.
+    let last_commit = run(&root, &["log", "-1", "--format=%P%x00%B"]).ok().and_then(|out| {
+        let out = String::from_utf8_lossy(&out);
+        let (parents, message) = out.split_once('\0')?;
+        Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty() })
+    });
+    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit })
 }
 /// `--numstat -z` records: counts and a path, or counts, nothing, and two paths for a rename.
 fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
@@ -302,6 +351,30 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
         }
         Operation::CommitTracked(message) => {
             checked(command(root).arg("commit").arg("-a").arg("-m").arg(OsString::from(message)).output())?;
+        }
+        Operation::Push => {
+            // Never wait on a credential prompt nobody can see.
+            let push = || {
+                let mut cmd = command(root);
+                cmd.env("GIT_TERMINAL_PROMPT", "0").arg("push");
+                cmd
+            };
+            if run(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).is_ok() {
+                checked(push().output())?;
+            } else {
+                let remotes = run(root, &["remote"])?;
+                let remotes = String::from_utf8_lossy(&remotes);
+                let remote = if remotes.lines().any(|r| r == "origin") { "origin" } else { remotes.lines().next().ok_or("No remote to push to.")? };
+                checked(push().args(["-u", remote, "HEAD"]).output())?;
+            }
+        }
+        Operation::UndoCommit => {
+            if run(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
+                run(root, &["reset", "--soft", "-q", "HEAD~1"])?;
+            } else {
+                // The first commit: the branch goes back to having none, the index stays.
+                run(root, &["update-ref", "-d", "HEAD"])?;
+            }
         }
     }
     Ok(())
@@ -465,5 +538,35 @@ mod tests {
         let s = snapshot(&r.0).unwrap();
         assert_eq!(s.entries.len(), 1);
         assert!(s.entries[0].untracked());
+    }
+    #[test]
+    fn undo_commit_keeps_changes_staged() {
+        let r = Repo::new();
+        r.write("a", "one\n");
+        r.stage("a");
+        r.commit();
+        assert_eq!(snapshot(&r.0).unwrap().last_commit.unwrap().has_parent, false);
+        r.write("a", "two\n");
+        r.stage("a");
+        operate(&r.0, Operation::Commit("second\n\nbody".into())).unwrap();
+        let last = snapshot(&r.0).unwrap().last_commit.unwrap();
+        assert_eq!((last.subject(), last.has_parent), ("second", true));
+        assert!(last.message.ends_with("body"));
+
+        operate(&r.0, Operation::UndoCommit).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.last_commit.unwrap().subject(), "test");
+        assert!(s.entries[0].staged());
+
+        // Undoing the first commit leaves the branch empty and its file staged.
+        operate(&r.0, Operation::UndoCommit).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.last_commit.is_none());
+        assert!(s.entries[0].staged());
+    }
+    #[test]
+    fn status_reads_upstream_and_ahead() {
+        let status = parse_status(b"# branch.oid abc\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +2 -0\0");
+        assert_eq!((status.upstream.as_deref(), status.ahead), (Some("origin/main"), 2));
     }
 }
