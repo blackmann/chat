@@ -67,6 +67,10 @@ pub(super) struct TerminalView {
     size: GridSize,
     exited: bool,
     selecting: bool,
+    /// The scrollbar's thumb is held, this far below its top.
+    bar_drag: Option<f32>,
+    /// The pointer is over the scrollbar.
+    bar_hover: bool,
     marked: String,
     pub(super) request_focus: bool,
     _events: Task<()>,
@@ -158,12 +162,31 @@ impl TerminalView {
                 size,
                 exited: false,
                 selecting: false,
+                bar_drag: None,
+                bar_hover: false,
                 marked: String::new(),
                 request_focus: true,
                 _events: events,
             }
         }))
     }
+    /// How far up from the bottom it's scrolled, and how much history there is.
+    #[cfg(test)]
+    pub(super) fn scroll_state(&self) -> (usize, usize) {
+        let term = self.term.lock();
+        (term.grid().display_offset(), term.grid().history_size())
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_selection(&self) -> bool {
+        self.term.lock().selection.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.input(text.as_bytes().to_vec(), cx);
+    }
+
     fn input(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
         if self.exited {
             return;
@@ -335,6 +358,131 @@ fn ansi_color(color: Color, colors: Palette) -> u32 {
         }
     }
 }
+/// Width of the scrollbar's track, at the terminal's right edge.
+const BAR: f32 = 10.;
+/// The thumb never gets shorter than this, however long the history.
+const MIN_THUMB: f32 = 24.;
+
+/// Where the scrollbar's thumb sits in a track `track` pixels tall: its top and
+/// height, for `history` lines above a screen of `rows`, scrolled `offset`
+/// lines up from the bottom. No history, no thumb.
+fn thumb(track: f32, rows: usize, history: usize, offset: usize) -> Option<(f32, f32)> {
+    if history == 0 || track <= 0. {
+        return None;
+    }
+    let total = (history + rows) as f32;
+    let height = (track * rows as f32 / total).max(MIN_THUMB).min(track);
+    let top = (track - height) * (history - offset.min(history)) as f32 / history as f32;
+    Some((top, height))
+}
+
+/// How far up from the bottom to scroll for the thumb's top to be at `top`.
+fn offset_for(top: f32, track: f32, height: f32, history: usize) -> usize {
+    let room = (track - height).max(1.);
+    history - ((top / room).clamp(0., 1.) * history as f32).round() as usize
+}
+
+impl TerminalView {
+    /// Scroll to `offset` lines up from the bottom.
+    fn scroll_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let mut term = self.term.lock();
+        let delta = offset as i32 - term.grid().display_offset() as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+            drop(term);
+            cx.notify();
+        }
+    }
+
+    /// The scrollbar: a thumb sized to how much of the history shows, dragged
+    /// to scroll, or the track pressed to jump there. Full-screen programs
+    /// (an editor, a pager) have no history to show, so no bar.
+    fn scrollbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
+        let theme = gpui_component::ActiveTheme::theme(&**cx);
+        let (thumb_color, thumb_hover) = (theme.scrollbar_thumb, theme.scrollbar_thumb_hover);
+        let bar = canvas(
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |bounds, hitbox, window, cx| {
+                let geometry = move |s: &TerminalView| {
+                    let term = s.term.lock();
+                    if term.mode().contains(TermMode::ALT_SCREEN) {
+                        return None;
+                    }
+                    let grid = term.grid();
+                    let history = grid.history_size();
+                    let (top, height) = thumb(f32::from(bounds.size.height), grid.screen_lines(), history, grid.display_offset())?;
+                    Some((top, height, history))
+                };
+                let (drawn, lit) = {
+                    let s = entity.read(cx);
+                    (geometry(s), s.bar_drag.is_some() || s.bar_hover)
+                };
+                if let Some((top, height, _)) = drawn {
+                    let thumb = Bounds::new(
+                        point(bounds.left() + px(3.), bounds.top() + px(top)),
+                        size(px(BAR - 5.), px(height)),
+                    );
+                    window.paint_quad(fill(thumb, if lit { thumb_hover } else { thumb_color }).corner_radii(px(3.)));
+                }
+
+                let (e1, h1) = (entity.clone(), hitbox.clone());
+                window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble || e.button != MouseButton::Left || !h1.is_hovered(window) {
+                        return;
+                    }
+                    // Over the bar, a press is the bar's, not the start of a selection.
+                    cx.stop_propagation();
+                    e1.update(cx, |s, cx| {
+                        let Some((top, height, history)) = geometry(s) else { return };
+                        let y = f32::from(e.position.y - bounds.top());
+                        let grab = if (top..top + height).contains(&y) {
+                            y - top
+                        } else {
+                            // Off the thumb: centre it there, and hold it.
+                            s.scroll_to(offset_for(y - height / 2., f32::from(bounds.size.height), height, history), cx);
+                            height / 2.
+                        };
+                        s.bar_drag = Some(grab);
+                        cx.notify();
+                    });
+                });
+                let (e2, h2) = (entity.clone(), hitbox.clone());
+                window.on_mouse_event(move |e: &MouseMoveEvent, _, window, cx| {
+                    let hovered = h2.is_hovered(window);
+                    e2.update(cx, |s, cx| {
+                        if s.bar_hover != hovered {
+                            s.bar_hover = hovered;
+                            cx.notify();
+                        }
+                        let Some(grab) = s.bar_drag else { return };
+                        if e.pressed_button != Some(MouseButton::Left) {
+                            s.bar_drag = None;
+                            cx.notify();
+                            return;
+                        }
+                        let Some((_, height, history)) = geometry(s) else { return };
+                        let top = f32::from(e.position.y - bounds.top()) - grab;
+                        s.scroll_to(offset_for(top, f32::from(bounds.size.height), height, history), cx);
+                    });
+                });
+                let e3 = entity.clone();
+                window.on_mouse_event(move |e: &MouseUpEvent, _, _, cx| {
+                    if e.button == MouseButton::Left {
+                        e3.update(cx, |s, cx| {
+                            if s.bar_drag.take().is_some() {
+                                cx.notify();
+                            }
+                        });
+                    }
+                });
+            },
+        )
+        .size_full();
+        div().absolute().top_0().bottom_0().right_0().w(px(BAR)).debug_selector(|| "terminal-bar".into()).child(bar)
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.request_focus {
@@ -365,6 +513,7 @@ impl Render for TerminalView {
                 div()
                     .id("terminal-grid")
                     .key_context("Terminal")
+                    .relative()
                     .p_3()
                     .flex_1()
                     .min_h_0()
@@ -578,7 +727,8 @@ impl Render for TerminalView {
                             },
                         )
                         .size_full(),
-                    ),
+                    )
+                    .child(self.scrollbar(cx)),
             )
     }
 }
@@ -587,6 +737,35 @@ impl Render for TerminalView {
 mod tests {
     use super::*;
     use alacritty_terminal::{event::VoidListener, vte::ansi::Processor};
+
+    #[::core::prelude::v1::test]
+    fn the_thumb_shows_how_much_history_is_on_screen() {
+        // No history: no bar.
+        assert_eq!(thumb(500., 50, 0, 0), None);
+        // A screen of 50 over 150 lines in all: a third of the track, at the bottom.
+        let (top, height) = thumb(600., 50, 100, 0).unwrap();
+        assert_eq!((top, height), (400., 200.));
+        // Scrolled all the way up: at the top.
+        assert_eq!(thumb(600., 50, 100, 100).unwrap().0, 0.);
+        // Long histories keep a thumb big enough to grab.
+        assert_eq!(thumb(600., 50, 100_000, 0).unwrap().1, MIN_THUMB);
+    }
+
+    #[::core::prelude::v1::test]
+    fn dragging_the_thumb_maps_back_to_lines() {
+        let (track, height, history) = (600., 200., 100);
+        assert_eq!(offset_for(400., track, height, history), 0);
+        assert_eq!(offset_for(0., track, height, history), 100);
+        assert_eq!(offset_for(200., track, height, history), 50);
+        // Past either end, it stops there.
+        assert_eq!(offset_for(-50., track, height, history), 100);
+        assert_eq!(offset_for(900., track, height, history), 0);
+        // And back: where a thumb is drawn is where it scrolls to.
+        for offset in [0, 13, 50, 99, 100] {
+            let (top, h) = thumb(track, 50, history, offset).unwrap();
+            assert_eq!(offset_for(top, track, h, history), offset);
+        }
+    }
 
     #[::core::prelude::v1::test]
     fn terminal_keys_follow_application_cursor_mode() {

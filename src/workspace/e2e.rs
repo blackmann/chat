@@ -650,3 +650,53 @@ fn installs_and_drives_typescript_and_json(cx: &mut TestAppContext) {
     assert!(managed.contains(&"typescript-language-server".to_string()));
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// The terminal's scrollbar, through its real mouse handlers: dragging the
+/// thumb, pressing the track, and the wheel bringing it back.
+#[gpui::test]
+fn scrolls_the_terminal_with_its_bar(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.act(|s, cx| s.open(TabKind::Terminal, cx));
+    let term = d.read(|s| match &s.terminal {
+        Some(Ok(t)) => t.clone(),
+        _ => panic!("no terminal"),
+    });
+    let state = |d: &mut Driver| d.cx.update(|_, cx| term.read(cx).scroll_state());
+    // Enough output to scroll back through.
+    d.cx.update(|_, cx| term.update(cx, |t, cx| t.type_text("seq 1 500\n", cx)));
+    d.wait("output with history", 30, |d| state(d).1 > 300);
+    let (offset, history) = state(&mut d);
+    assert_eq!(offset, 0, "it follows the output");
+    let bar = d.cx.debug_bounds("terminal-bar").expect("a bar once there's history");
+    eprintln!("bar {bar:?}, history {history}");
+
+    // The thumb starts at the bottom; drag it to the top.
+    let low = point(bar.center().x, bar.bottom() - px(4.));
+    d.cx.simulate_mouse_move(low, None, Modifiers::none());
+    d.cx.simulate_mouse_down(low, gpui::MouseButton::Left, Modifiers::none());
+    let high = point(bar.center().x, bar.top() - px(200.));
+    d.cx.simulate_mouse_move(high, gpui::MouseButton::Left, Modifiers::none());
+    d.cx.simulate_mouse_up(high, gpui::MouseButton::Left, Modifiers::none());
+    d.settle();
+    assert_eq!(state(&mut d).0, history, "dragged to the top of the history");
+
+    // Pressing the track's middle goes about halfway.
+    d.cx.simulate_click(bar.center(), Modifiers::none());
+    d.settle();
+    let middle = state(&mut d).0 as f32 / history as f32;
+    assert!((0.35..0.65).contains(&middle), "pressing the middle went to {middle}");
+
+    // Presses on the bar aren't the start of a selection in the terminal.
+    assert!(!d.cx.update(|_, cx| term.read(cx).has_selection()), "a press on the bar selected text");
+    // The wheel still scrolls, down to the bottom.
+    d.cx.simulate_event(gpui::ScrollWheelEvent {
+        position: point(bar.left() - px(100.), bar.center().y),
+        delta: gpui::ScrollDelta::Lines(point(0., -10_000.)),
+        ..Default::default()
+    });
+    d.settle();
+    assert_eq!(state(&mut d).0, 0, "the wheel goes back to the bottom");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
