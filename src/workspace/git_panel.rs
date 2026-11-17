@@ -364,7 +364,7 @@ impl Workspace {
             .rounded(px(5.))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(colors.hover)))
-            .child(icon(Glyph::Branch).size(px(13.)).text_color(rgb(if main { colors.muted } else { colors.blue })))
+            .child(icon(Glyph::Worktree).size(px(13.)).text_color(rgb(if main { colors.muted } else { colors.blue })))
             .child(div().font_weight(FontWeight::MEDIUM).text_color(rgb(if main { colors.text } else { colors.blue })).child(name))
             .when(following, |s| s.child(label(colors, "· this thread").text_size(px(crate::theme::scaled_ui(11.)))))
             .child(icon(IconName::ChevronDown).size(px(11.)).text_color(rgb(colors.quiet)));
@@ -385,7 +385,7 @@ impl Workspace {
                 let target = if i == 0 { folder.clone() } else { tree.path.clone() };
                 let (weak, folder) = (weak.clone(), folder.clone());
                 let item = crate::menu::Item::new(title)
-                    .icon(Glyph::Branch)
+                    .icon(Glyph::Worktree)
                     .detail(detail)
                     .checked(same_dir(&tree.path, &snapshot.root))
                     .on_click(move |_, cx| {

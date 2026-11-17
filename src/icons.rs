@@ -8,6 +8,8 @@ pub enum Glyph {
     Message,
     Compose,
     Branch,
+    /// A checkout of a repository besides its main one.
+    Worktree,
     Terminal,
     FileDiff,
     FileCode,
@@ -50,10 +52,11 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 37] = [
+    pub const ALL: [Glyph; 38] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
+        Self::Worktree,
         Self::Terminal,
         Self::FileDiff,
         Self::FileCode,
@@ -94,6 +97,7 @@ impl Glyph {
             Self::Message => "message.svg",
             Self::Compose => "square-pen.svg",
             Self::Branch => "git-branch.svg",
+            Self::Worktree => "git-fork.svg",
             Self::Terminal => "terminal.svg",
             Self::FileDiff => "file-diff.svg",
             Self::FileCode => "file-code.svg",
@@ -146,6 +150,9 @@ fn svg(file: &str) -> Option<&'static str> {
         }
         "git-branch.svg" => {
             r#"<line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>"#
+        }
+        "git-fork.svg" => {
+            r#"<circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/>"#
         }
         "terminal.svg" => r#"<polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>"#,
         "file-diff.svg" => {

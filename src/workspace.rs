@@ -126,6 +126,8 @@ pub struct Entry {
     pub name: SharedString,
     pub path: PathBuf,
     pub dir: bool,
+    /// Git ignores it, or a folder it's in: shown faded.
+    pub ignored: bool,
 }
 
 #[derive(Clone)]
@@ -179,7 +181,9 @@ pub struct Workspace {
     file_scroll: HashMap<PathBuf, UniformListScrollHandle>,
     /// Each open file's changes since HEAD and blame, read in the background.
     file_git: HashMap<PathBuf, Rc<crate::git::FileInfo>>,
-    /// File views show who last changed each line.
+    /// The line last clicked in each open file, where its blame shows.
+    cursor_line: HashMap<PathBuf, usize>,
+    /// File views show who last changed the cursor's line.
     show_blame: bool,
     /// Lines a link jumped to, lit briefly so the eye finds them.
     flash: Option<Flash>,
@@ -357,6 +361,7 @@ impl Workspace {
             files: HashMap::new(),
             file_scroll: HashMap::new(),
             file_git: HashMap::new(),
+            cursor_line: HashMap::new(),
             show_blame: true,
             flash: None,
             terminal: None,
@@ -1106,7 +1111,13 @@ impl Workspace {
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_path_buf());
             // Read again on every open, so new files show up.
-            self.listings.insert(path.to_path_buf(), list(path));
+            // A folder git ignores passes that on to what's inside.
+            let ignored = path
+                .parent()
+                .and_then(|parent| self.listings.get(parent))
+                .and_then(|entries| entries.iter().find(|e| e.path == path))
+                .is_some_and(|e| e.ignored);
+            self.listings.insert(path.to_path_buf(), list(path, ignored));
         }
         cx.notify();
     }
@@ -1177,16 +1188,28 @@ fn instruction_files(root: Option<&Path>) -> Vec<(PathBuf, &'static str)> {
 }
 
 /// A folder's entries: folders first, then files, each by name.
-fn list(dir: &Path) -> Vec<Entry> {
+/// A folder's entries, folders first. With `ignored`, the folder is itself
+/// ignored, and so is everything in it.
+fn list(dir: &Path, ignored: bool) -> Vec<Entry> {
+    // What a gitignore-aware walk one level down keeps; the rest git ignores.
+    // It reads every `.gitignore` from the repository's root down, the
+    // repository's own excludes and the user's global ones.
+    let kept: HashSet<PathBuf> = if ignored {
+        HashSet::new()
+    } else {
+        ignore::WalkBuilder::new(dir).max_depth(Some(1)).hidden(false).build().flatten().map(|e| e.into_path()).collect()
+    };
     let mut entries: Vec<Entry> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
+            let path = e.path();
             (!SKIPPED.contains(&name.as_str())).then(|| Entry {
                 dir: e.file_type().is_ok_and(|t| t.is_dir()),
-                path: e.path(),
+                ignored: ignored || !kept.contains(&path),
+                path,
                 name: name.into(),
             })
         })
@@ -1300,7 +1323,7 @@ impl Render for Workspace {
         if let Some(root) = self.current_project().path.clone()
             && !self.listings.contains_key(&root)
         {
-            self.listings.insert(root.clone(), list(&root));
+            self.listings.insert(root.clone(), list(&root, false));
         }
         let colors = palette(cx);
         let center = ui::col()
@@ -1447,5 +1470,54 @@ impl Render for Workspace {
                     .with_priority(2),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    // Not `super::*`: gpui's own `test` attribute would shadow the built-in one.
+    use super::list;
+    use std::path::Path;
+
+    fn ignored(entries: &[super::Entry], name: &str) -> bool {
+        entries.iter().find(|e| e.name.as_ref() == name).unwrap_or_else(|| panic!("{name} isn't listed")).ignored
+    }
+
+    #[test]
+    fn marks_what_git_ignores() {
+        let dir = std::env::temp_dir().join(format!("chat-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in [
+            (".gitignore", "build/\n*.log\n"),
+            ("main.rs", ""),
+            ("debug.log", ""),
+            ("build/out.txt", ""),
+            ("nested/.gitignore", "secret.txt\n"),
+            ("nested/secret.txt", ""),
+            ("nested/kept.txt", ""),
+        ] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").args(args).current_dir(&dir).output().unwrap().status.success());
+        git(&["init", "-q"]);
+
+        let top = list(&dir, false);
+        assert!(!ignored(&top, "main.rs") && !ignored(&top, ".gitignore") && !ignored(&top, "nested"));
+        assert!(ignored(&top, "debug.log") && ignored(&top, "build"));
+        // Nested rules count in their own folder.
+        let nested = list(&dir.join("nested"), false);
+        assert!(ignored(&nested, "secret.txt") && !ignored(&nested, "kept.txt"));
+        // Inside an ignored folder, everything is.
+        assert!(ignored(&list(&dir.join("build"), true), "out.txt"));
+        // Outside a repository nothing is ignored.
+        let loose = std::env::temp_dir().join(format!("chat-loose-{}", std::process::id()));
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(loose.join(".gitignore"), "*.log\n").unwrap();
+        std::fs::write(loose.join("x.log"), "").unwrap();
+        assert!(!ignored(&list(Path::new(&loose), false), "x.log"));
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&loose).unwrap();
     }
 }

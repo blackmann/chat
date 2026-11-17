@@ -745,14 +745,14 @@ impl Workspace {
             }
         });
         let used = limit.used.map(|u| format!("{}%", u.round() as u32));
-        let (tint, text) = match limit.status {
-            LimitStatus::Rejected => (colors.red, match &resets {
-                Some(resets) => format!("{} limit · back {resets}", limit.short_name()),
-                None => format!("{} limit reached", limit.short_name()),
-            }),
+        let (tint, mut text) = match limit.status {
+            LimitStatus::Rejected => (colors.red, format!("{} limit reached", limit.short_name())),
             LimitStatus::Warning => (colors.amber, format!("{} {}", limit.short_name(), used.clone().unwrap_or_else(|| "near limit".into()))),
             LimitStatus::Allowed => (colors.muted, format!("{} {}", limit.short_name(), used.clone().unwrap_or_else(|| "OK".into()))),
         };
+        if let Some(resets) = &resets {
+            text.push_str(&format!(" · resets {resets}"));
+        }
         let mut tip = limit.long_name();
         match (&used, limit.status) {
             (_, LimitStatus::Rejected) => tip.push_str(" reached"),

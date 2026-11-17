@@ -61,7 +61,9 @@ pub fn installer(spec: &ServerSpec) -> Option<Installer> {
     Some(match spec.name.as_str() {
         "typescript-language-server" => Installer::Npm {
             dir: "typescript-language-server",
-            packages: &["typescript-language-server", "typescript"],
+            // TypeScript 7 is the native port, without the `tsserver` this
+            // server drives; 6 is the last with it.
+            packages: &["typescript-language-server", "typescript@6"],
             bin: "typescript-language-server",
         },
         "vscode-json-language-server" => shared("vscode-json-language-server"),
@@ -136,6 +138,14 @@ pub fn servers_dir() -> Option<PathBuf> {
     Some(crate::settings::dir()?.join("servers"))
 }
 
+/// An npm package as `npm install` is given it: as pinned, or at its newest
+/// when updating one that isn't pinned.
+fn package_spec(package: &str, latest: bool) -> String {
+    // A scope's `@` comes first; a version's after the name.
+    let pinned = package.get(1..).is_some_and(|rest| rest.contains('@'));
+    if latest && !pinned { format!("{package}@latest") } else { package.to_string() }
+}
+
 fn dir_has_typescript(root: &Path) -> bool {
     root.join(TS).join("node_modules/typescript/lib/tsserver.js").is_file()
 }
@@ -208,7 +218,7 @@ pub fn install(spec: &ServerSpec, path: Option<&str>, latest: bool) -> Outcome {
             Installer::Npm { packages, .. } => {
                 let mut cmd = Command::new(registry::which("npm", path).ok_or("npm isn't on PATH")?);
                 cmd.args(["install", "--no-audit", "--no-fund", "--no-save", "--loglevel=error", "--prefix"]).arg(&dir);
-                cmd.args(packages.iter().map(|p| if latest { format!("{p}@latest") } else { p.to_string() }));
+                cmd.args(packages.iter().map(|p| package_spec(p, latest)));
                 cmd
             }
             Installer::Release { bin: name, .. } => {
@@ -237,6 +247,12 @@ pub fn install(spec: &ServerSpec, path: Option<&str>, latest: bool) -> Outcome {
             let last = output.iter().rev().find(|l| !l.trim().is_empty()).cloned().unwrap_or_default();
             return Err(format!("the install failed: {last}"));
         }
+        // Checked as it will be used, so a package that installs but can't
+        // serve (a TypeScript without `tsserver`) fails here, once, rather
+        // than being installed again and again.
+        if spec.name == TS && !dir_has_typescript(&root) {
+            return Err("TypeScript installed, but without the tsserver this server needs".into());
+        }
         if !runnable(&bin) {
             return Err(format!("the install finished, but {} isn't there", bin.display()));
         }
@@ -256,7 +272,7 @@ mod tests {
 
     #[test]
     fn knows_how_to_install_the_common_servers() {
-        assert!(matches!(installer(&spec("typescript-language-server")), Some(Installer::Npm { packages, .. }) if packages.contains(&"typescript")));
+        assert!(matches!(installer(&spec("typescript-language-server")), Some(Installer::Npm { packages, .. }) if packages.contains(&"typescript@6")));
         // JSON, CSS and HTML share one package and one folder.
         let dirs: Vec<_> = ["vscode-json-language-server", "vscode-css-language-server", "vscode-html-language-server"]
             .iter()
@@ -279,6 +295,15 @@ mod tests {
             Path::new("/x/vscode-langservers-extracted/node_modules/.bin/vscode-css-language-server")
         );
         assert_eq!(installer(&spec("gopls")).unwrap().bin_in(root), Path::new("/x/gopls/bin/gopls"));
+    }
+
+    #[test]
+    fn keeps_pins_when_updating() {
+        assert_eq!(package_spec("typescript@6", true), "typescript@6");
+        assert_eq!(package_spec("typescript-language-server", true), "typescript-language-server@latest");
+        assert_eq!(package_spec("@vue/language-server", true), "@vue/language-server@latest");
+        assert_eq!(package_spec("@vue/language-server@2", true), "@vue/language-server@2");
+        assert_eq!(package_spec("pyright", false), "pyright");
     }
 
     #[test]

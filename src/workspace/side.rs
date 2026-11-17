@@ -315,7 +315,7 @@ impl Workspace {
             // Several folders: each is a top-level folder of its own.
             for root in &roots {
                 let name = crate::model::folder_name(root);
-                rows.push((0, Entry { name: name.into(), path: root.clone(), dir: true }));
+                rows.push((0, Entry { name: name.into(), path: root.clone(), dir: true, ignored: false }));
                 if self.expanded.contains(root) {
                     self.tree_rows(root, 1, &mut rows);
                 }
@@ -340,6 +340,8 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |s| s.bg(rgb(colors.selected)))
                     .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                    // What git ignores fades back, unless it's the file open.
+                    .when(entry.ignored && !active, |s| s.opacity(0.45))
                     .child(if dir {
                         icon(if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
                             .size(px(12.))

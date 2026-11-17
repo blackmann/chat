@@ -289,7 +289,7 @@ fn diff_body(
             .child(div().w(px(3.)).h_full().flex_shrink_0().when_some(bars[n], |s, hue| s.bg(rgb(hue))))
             // Removed lines have no place in the new file, so no number.
             .child(number(colors, if line.kind == LineKind::Del { None } else { line.new }, width).pr_3())
-            .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(levels[n]), pick));
+            .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(levels[n]), pick, None));
         rows = rows.child(cells);
     }
     let gutter = if select.is_some() { GUTTER } else { 0. };
@@ -361,7 +361,7 @@ pub(super) fn tints(colors: Palette) -> symbols::Tints {
 /// A plain click on a word picks it, anywhere else lets it go; ⌘-click goes to
 /// its definition and ⌘⇧-click lists its references. Resting on a word shows
 /// what the server knows about it.
-fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick>) -> Stateful<Div> {
+fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick>, after: Option<AnyElement>) -> Stateful<Div> {
     let lines = (0..guides.count).map(|k| {
         div().absolute().top_0().bottom_0().left(guides.step * k as f32).w(px(1.)).bg(guides.color)
     });
@@ -385,11 +385,14 @@ fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick
                 let Pick { this, source, line, row, .. } = &*down;
                 let m = e.modifiers;
                 let (source, row) = (source.clone(), *row);
-                this.update(cx, |s, cx| match (m.platform, m.shift, m.alt || m.control) {
+                this.update(cx, |s, cx| {
+                    s.place_cursor(&source, row, cx);
+                    match (m.platform, m.shift, m.alt || m.control) {
                     (true, true, false) => s.find_references_at(source, row, line, at, e.position, window, cx),
                     (true, false, false) => s.go_to_definition_at(source, row, line, at, e.position, window, cx),
                     (false, false, false) => s.pick_symbol(source, row, line, at, e.position, window, cx),
                     _ => {}
+                    }
                 })
                 .ok();
             })
@@ -419,7 +422,8 @@ fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick
             // Where a row's code starts, for tests that point at words.
             .debug_selector(move || format!("code:{id}"))
             .children(lines)
-            .child(text),
+            .child(text)
+            .children(after),
     )
 }
 
@@ -464,36 +468,32 @@ fn sideways_track(bounds: Bounds<Pixels>, gutter: f32) -> Bounds<Pixels> {
     Bounds::new(point(left, bounds.bottom() - px(10.)), size((right - left).max(px(0.)), px(10.)))
 }
 
-/// Width of a file view's blame column.
-const BLAME: f32 = 190.;
-
-/// Who last changed a file's line and when, written only where a run of lines
-/// from one commit begins; hovering shows the commit.
-fn blame_cell(colors: Palette, git: Option<&crate::git::FileInfo>, i: usize, now: i64) -> AnyElement {
-    let cell = div().w(px(BLAME)).h_full().flex_shrink_0().pl_1().pr_3().flex().items_center().overflow_hidden();
-    let Some((git, at)) = git.and_then(|g| Some((g, (*g.blame.get(i)?)?))) else {
-        return cell.into_any_element();
-    };
-    let commit = &git.commits[at];
-    let first = i == 0 || git.blame.get(i - 1).copied().flatten() != Some(at);
+/// Who last changed a file's line and when, written after the code of the
+/// line the cursor is on; hovering shows the commit.
+fn blame_note(colors: Palette, git: &crate::git::FileInfo, i: usize, now: i64) -> Option<AnyElement> {
+    let commit = &git.commits[(*git.blame.get(i)?)?];
     let (who, tip) = if commit.committed() {
         let date = chrono::DateTime::from_timestamp(commit.time, 0).map(|d| d.format("%b %-d, %Y").to_string()).unwrap_or_default();
         (
-            format!("{} · {}", commit.author, ago(now - commit.time)),
+            format!("{}, {}", commit.author, ago(now - commit.time)),
             format!("{} · {} · {}\n{}", &commit.sha[..7.min(commit.sha.len())], commit.author, date, commit.summary),
         )
     } else {
-        ("Not committed yet".to_owned(), "Not committed yet".to_owned())
+        ("You, not committed yet".to_owned(), "Not committed yet".to_owned())
     };
-    cell.id(("blame", i))
-        .font_family(crate::theme::ui_font())
-        .text_size(px(crate::theme::scaled_ui(11.)))
-        .text_color(rgb(colors.quiet))
-        .when(i > 0 && first, |s| s.border_t_1().border_color(rgb(colors.row_border)))
-        .hover(|s| s.text_color(rgb(colors.muted)))
-        .when(first, |s| s.child(div().truncate().child(who)))
-        .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
-        .into_any_element()
+    Some(
+        row()
+            .id(("blame", i))
+            .ml(px(48.))
+            .gap_1()
+            .flex_shrink_0()
+            .text_color(rgb(colors.quiet))
+            .hover(|s| s.text_color(rgb(colors.muted)))
+            .child(icon(Glyph::Branch).size(px(12.)))
+            .child(who)
+            .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+            .into_any_element(),
+    )
 }
 
 /// A span of seconds as a short "how long ago".
@@ -572,7 +572,8 @@ impl Workspace {
         let tints = tints(colors);
         let git = self.file_git.get(&path).cloned();
         let has_blame = git.as_ref().is_some_and(|g| !g.blame.is_empty());
-        let blame = has_blame && self.show_blame;
+        let cursor = self.cursor_line.get(&path).copied();
+        let blame = git.clone().filter(|_| has_blame && self.show_blame).zip(cursor);
         let now = chrono::Utc::now().timestamp();
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
@@ -589,12 +590,18 @@ impl Workspace {
                         .when_some(flash.as_ref().filter(|(rows, _)| rows.contains(&i)), |s, (_, k)| {
                             s.bg(Hsla::from(rgb(colors.amber)).opacity(0.22 * k))
                         })
+                        .when(cursor == Some(i), |s| s.bg(rgb(colors.hover)))
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
-                        .when(blame, |s| s.child(blame_cell(colors, git.as_deref(), i, now)))
                         .child(number(colors, Some(i + 1), 44.).mr_2())
                         .child(change_bar(colors, git.as_ref().and_then(|g| g.marks.get(i).copied().flatten())))
                         .child(
-                            code_cell(offset, StyledText::new(line).with_highlights(marks), guides.at(file.guides.1[i]), Some(pick))
+                            code_cell(
+                                offset,
+                                StyledText::new(line).with_highlights(marks),
+                                guides.at(file.guides.1[i]),
+                                Some(pick),
+                                blame.as_ref().filter(|(_, at)| *at == i).and_then(|(g, _)| blame_note(colors, g, i, now)),
+                            )
                                 .text_color(rgb(colors.code)),
                         )
                 })
@@ -645,7 +652,7 @@ impl Workspace {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(self.scroll_sideways(key, longest, GUTTER + if blame { BLAME } else { 0. } + 65., window, list, cx))
+                    .child(self.scroll_sideways(key, longest, GUTTER + 65., window, list, cx))
                     .vertical_scrollbar(&scroll),
             )
             .into_any_element()
@@ -798,6 +805,15 @@ impl Workspace {
         self.scroll_sideways(key, longest, gutter, window, list, cx).vertical_scrollbar(&scroll).into_any_element()
     }
 
+    /// Put a file's cursor on line `row`, where its blame shows.
+    fn place_cursor(&mut self, source: &LineSource, row: usize, cx: &mut Context<Self>) {
+        if let LineSource::File(path) = source
+            && self.cursor_line.insert(path.clone(), row) != Some(row)
+        {
+            cx.notify();
+        }
+    }
+
     /// The selected rows, when they are in `source`.
     fn selected_rows(&self, source: &LineSource) -> Option<std::ops::RangeInclusive<usize>> {
         self.line_selection.as_ref().filter(|l| &l.source == source).map(LineSelection::rows)
@@ -814,6 +830,7 @@ impl Workspace {
     }
 
     fn press_line(&mut self, source: LineSource, n: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.place_cursor(&source, n, cx);
         self.selection.borrow_mut().clear();
         match &mut self.line_selection {
             Some(lines) if extend && lines.source == source => {

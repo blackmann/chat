@@ -328,6 +328,11 @@ impl Workspace {
                                 *owner = new;
                             }
                         }
+                        // Installed, yet still not runnable: say so, rather than
+                        // install it again and again.
+                        if let Some(server) = s.servers.all.get_mut(&new).filter(|srv| srv.status == Status::Installing) {
+                            server.status = Status::Failed("Installed, but it still can't run. See its log in the ⚡ menu.".into());
+                        }
                     }
                     Err(why) => {
                         server.status = Status::Failed(format!("Couldn't install it: {why}"));
