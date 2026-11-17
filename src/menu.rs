@@ -26,6 +26,10 @@ pub struct Item {
     keep_open: bool,
     font: Option<SharedString>,
     handler: Option<Handler>,
+    /// A small coloured dot before the label, for a status.
+    dot: Option<u32>,
+    /// Entries shown beside this one when it's highlighted.
+    submenu: Option<Builder>,
 }
 impl Item {
     pub fn new(label: impl Into<SharedString>) -> Self {
@@ -39,7 +43,18 @@ impl Item {
             keep_open: false,
             font: None,
             handler: None,
+            dot: None,
+            submenu: None,
         }
+    }
+    pub fn dot(mut self, color: u32) -> Self {
+        self.dot = Some(color);
+        self
+    }
+    /// Open these entries beside the item when it's highlighted (hover or →).
+    pub fn submenu(mut self, build: Builder) -> Self {
+        self.submenu = Some(build);
+        self
     }
     pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
         self.detail = Some(detail.into());
@@ -89,6 +104,10 @@ pub enum Entry {
 
 pub type Builder = Rc<dyn Fn(&App) -> Vec<Entry>>;
 
+/// A submenu asks to close and hand focus back (← or Escape), without
+/// closing the menu it came from.
+pub struct Back;
+
 pub struct Menu {
     focus: FocusHandle,
     search: Option<Entity<InputState>>,
@@ -96,8 +115,17 @@ pub struct Menu {
     highlighted: Option<usize>,
     width: Pixels,
     scroll: ScrollHandle,
+    /// The submenu showing, and the item it belongs to.
+    sub: Option<(usize, Entity<Menu>)>,
+    /// Where the submenu was last drawn, so a press there isn't "outside".
+    sub_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
+    /// Where each item with a submenu was last drawn, to open it beside.
+    rows: Rc<std::cell::RefCell<std::collections::HashMap<usize, Bounds<Pixels>>>>,
+    /// This menu is another's submenu: its parent decides when it closes.
+    nested: bool,
 }
 impl EventEmitter<DismissEvent> for Menu {}
+impl EventEmitter<Back> for Menu {}
 impl Focusable for Menu {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -133,6 +161,10 @@ impl Menu {
             highlighted: None,
             width,
             scroll: ScrollHandle::new(),
+            sub: None,
+            sub_bounds: Rc::default(),
+            rows: Rc::default(),
+            nested: false,
         }
     }
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -184,6 +216,10 @@ impl Menu {
         if item.disabled {
             return;
         }
+        if item.submenu.is_some() {
+            self.open_sub(index, true, window, cx);
+            return;
+        }
         if let Some(handler) = item.handler.clone() {
             handler(window, cx);
         }
@@ -192,6 +228,52 @@ impl Menu {
         } else {
             cx.emit(DismissEvent);
         }
+    }
+    /// Show the submenu of item `index`, if it has one, closing any other;
+    /// with `focus`, keys go to it.
+    fn open_sub(&mut self, index: usize, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sub.as_ref().is_some_and(|(i, _)| *i == index) {
+            if focus && let Some((_, sub)) = &self.sub {
+                sub.update(cx, |m, cx| m.focus(window, cx));
+            }
+            return;
+        }
+        self.sub = None;
+        let entries = self.visible(cx);
+        let Some(Entry::Item(Item { submenu: Some(build), .. })) = entries.get(index) else {
+            cx.notify();
+            return;
+        };
+        let build = build.clone();
+        let sub = cx.new(|cx| {
+            let mut m = Menu::new(build, None, px(220.), window, cx);
+            m.nested = true;
+            m
+        });
+        // Picking something in the submenu closes the whole menu; backing out
+        // of it returns here.
+        cx.subscribe(&sub, |_, _, _: &DismissEvent, cx| cx.emit(DismissEvent)).detach();
+        cx.subscribe_in(&sub, window, |m: &mut Menu, _, _: &Back, window, cx| {
+            m.sub = None;
+            m.focus.focus(window);
+            cx.notify();
+        })
+        .detach();
+        if focus {
+            sub.update(cx, |m, cx| {
+                m.focus(window, cx);
+                m.step(true, cx);
+            });
+        }
+        self.sub = Some((index, sub));
+        cx.notify();
+    }
+    /// Draw again, with any submenu: the state it shows has changed.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, sub)) = &self.sub {
+            sub.update(cx, |m, cx| m.refresh(cx));
+        }
+        cx.notify();
     }
     fn step(&mut self, down: bool, cx: &mut Context<Self>) {
         let entries = self.visible(cx);
@@ -220,10 +302,23 @@ impl Menu {
     }
     /// Without a search field the menu itself holds focus and sees raw keys.
     fn key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The submenu sits inside this menu, so its keys pass here first: leave
+        // them to it while it has focus.
+        if let Some((_, sub)) = &self.sub
+            && sub.read(cx).focus.is_focused(window)
+        {
+            return;
+        }
         match event.keystroke.key.as_str() {
             "down" => self.step(true, cx),
             "up" => self.step(false, cx),
             "enter" => self.confirm(window, cx),
+            "right" => match self.highlighted {
+                Some(i) => self.open_sub(i, true, window, cx),
+                None => return,
+            },
+            "left" if self.nested => cx.emit(Back),
+            "escape" if self.nested => cx.emit(Back),
             "escape" => cx.emit(DismissEvent),
             _ => return,
         }
@@ -248,6 +343,11 @@ impl Render for Menu {
             .overflow_y_scroll()
             .p(px(4.));
         let empty = entries.is_empty();
+        // The open submenu, once its item has been drawn somewhere to open beside.
+        let sub = self
+            .sub
+            .as_ref()
+            .and_then(|(i, m)| Some((m.clone(), *self.rows.borrow().get(i)?)));
         for (i, entry) in entries.into_iter().enumerate() {
             list = list.child(match entry {
                 Entry::Label(text) => div()
@@ -267,8 +367,11 @@ impl Render for Menu {
                     .into_any_element(),
                 Entry::Item(item) => {
                     let highlighted = self.highlighted == Some(i);
+                    let has_sub = item.submenu.is_some();
+                    let rows = self.rows.clone();
                     div()
                         .id(("menu-item", i))
+                        .relative()
                         // The list scrolls; rows keep their height rather than squeeze.
                         .flex_shrink_0()
                         .flex()
@@ -282,9 +385,11 @@ impl Render for Menu {
                         .when(!item.disabled, |s| {
                             s.cursor_pointer()
                                 .when(highlighted, |s| s.bg(rgb(colors.popover_hover)))
-                                .on_mouse_move(cx.listener(move |m, _, _, cx| {
+                                .on_mouse_move(cx.listener(move |m, _, window, cx| {
                                     if m.highlighted != Some(i) {
                                         m.highlighted = Some(i);
+                                        // Hovering another item closes a submenu, or opens its own.
+                                        m.open_sub(i, false, window, cx);
                                         cx.notify();
                                     }
                                 }))
@@ -292,6 +397,9 @@ impl Render for Menu {
                         })
                         .when_some(item.icon, |s, icon| {
                             s.child(icon.size(px(14.)).text_color(rgb(colors.muted)))
+                        })
+                        .when_some(item.dot, |s, dot| {
+                            s.child(div().flex_shrink_0().size(px(7.)).rounded_full().bg(rgb(dot)))
                         })
                         .child(
                             div()
@@ -333,6 +441,27 @@ impl Render for Menu {
                                     .child(d),
                             )
                         })
+                        .when(has_sub, |s| {
+                            s.child(
+                                Icon::new(IconName::ChevronRight)
+                                    .flex_shrink_0()
+                                    .size(px(14.))
+                                    .text_color(rgb(colors.muted)),
+                            )
+                        })
+                        // Note where it is, for its submenu to open beside.
+                        .when(has_sub, |s| {
+                            s.child(
+                                canvas(
+                                    move |bounds, _, _| {
+                                        rows.borrow_mut().insert(i, bounds);
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                        })
                         .into_any_element()
                 }
             });
@@ -370,7 +499,13 @@ impl Render for Menu {
                 cx.stop_propagation();
                 cx.emit(DismissEvent)
             }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            .on_mouse_down_out(cx.listener(|m, e: &MouseDownEvent, _, cx| {
+                // A submenu is its parent's to close; a press in it isn't outside.
+                let in_sub = m.sub.is_some() && m.sub_bounds.get().is_some_and(|b| b.contains(&e.position));
+                if !m.nested && !in_sub {
+                    cx.emit(DismissEvent)
+                }
+            }))
             .occlude()
             .w(self.width)
             .flex()
@@ -380,7 +515,6 @@ impl Render for Menu {
             .border_color(rgb(colors.popover_border))
             .rounded(px(10.))
             .shadow_lg()
-            .overflow_hidden()
             .text_color(rgb(colors.text))
             .font_family(crate::theme::ui_font())
             .when_some(self.search.clone(), |s, search| {
@@ -395,6 +529,24 @@ impl Render for Menu {
                         .child(Input::new(&search).appearance(false).small()),
                 )
             })
-            .child(list)
+            .child(div().rounded(px(10.)).overflow_hidden().child(list))
+            // The submenu, beside its item and level with it. Drawn last and
+            // outside the list, so nothing covers or clips it; menus are
+            // already drawn deferred, so it can't be deferred again.
+            .when_some(sub, |s, (sub, at)| {
+                let sub_bounds = self.sub_bounds.clone();
+                s.child(
+                    anchored()
+                        .position(point(at.right() + px(6.), at.top() - px(5.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            div().relative().child(sub).child(
+                                canvas(move |bounds, _, _| sub_bounds.set(Some(bounds)), |_, _, _, _| {})
+                                    .absolute()
+                                    .inset_0(),
+                            ),
+                        ),
+                )
+            })
     }
 }

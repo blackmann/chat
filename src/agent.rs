@@ -190,6 +190,79 @@ pub enum History {
     Lost,
 }
 
+/// One of a subscription's usage limits, as the agent last reported it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RateLimit {
+    /// The window, as Claude names it: `five_hour`, `seven_day`, `seven_day_opus`, …
+    pub window: String,
+    pub status: LimitStatus,
+    /// How much of the window is used, 0–100, when told.
+    pub used: Option<f64>,
+    /// When the window resets, in Unix seconds.
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitStatus {
+    Allowed,
+    Warning,
+    Rejected,
+}
+
+impl RateLimit {
+    /// Read the Claude SDK's `SDKRateLimitInfo`.
+    fn parse(info: &serde_json::Value) -> Option<Self> {
+        let status = match info.get("status")?.as_str()? {
+            "allowed" => LimitStatus::Allowed,
+            "allowed_warning" => LimitStatus::Warning,
+            "rejected" => LimitStatus::Rejected,
+            _ => return None,
+        };
+        let window = info.get("rateLimitType")?.as_str()?.to_string();
+        // A fraction from the API headers; take a percentage too, in case it's ever sent as one.
+        let used = info.get("utilization").and_then(|u| u.as_f64()).map(|u| if u <= 1. { u * 100. } else { u }).map(|u| u.clamp(0., 100.));
+        let resets_at = info.get("resetsAt").and_then(|r| r.as_f64()).map(|r| if r > 1e11 { r / 1000. } else { r } as i64);
+        Some(Self { window, status, used, resets_at })
+    }
+
+    /// Shorter windows first: the five-hour one, then the weekly ones, then overage.
+    pub fn rank(&self) -> u8 {
+        match self.window.as_str() {
+            "five_hour" => 0,
+            w if w.starts_with("seven_day") => 1,
+            _ => 2,
+        }
+    }
+
+    /// A short name for the status bar: `5h`, `Week`, `Opus week`, …
+    pub fn short_name(&self) -> String {
+        match self.window.as_str() {
+            "five_hour" => "5h".into(),
+            "seven_day" => "Week".into(),
+            "overage" => "Extra".into(),
+            w => match w.strip_prefix("seven_day_") {
+                Some(model) => format!("{} week", capitalize(&model.replace('_', " "))),
+                None => capitalize(&w.replace('_', " ")),
+            },
+        }
+    }
+
+    /// The full name, for a tooltip.
+    pub fn long_name(&self) -> String {
+        match self.window.as_str() {
+            "five_hour" => "5-hour limit".into(),
+            "seven_day" => "Weekly limit".into(),
+            "overage" => "Extra usage".into(),
+            _ => format!("{} limit", self.short_name().replace("week", "weekly")),
+        }
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Event {
     /// The session is open and can take prompts. `session` is the agent's id
@@ -203,6 +276,8 @@ pub enum Event {
     /// Context window use, in tokens, and what the session has cost so far
     /// (amount and currency) when the agent says.
     Usage { used: u64, size: u64, cost: Option<(f64, String)> },
+    /// Where one of the account's usage limits stands (Claude subscriptions).
+    RateLimit(RateLimit),
     /// The slash commands the agent offers: name and description.
     Commands(Vec<(String, String)>),
     Title(String),
@@ -407,6 +482,12 @@ async fn run(
                         let events = events.clone();
                         connection.spawn(async move {
                             let result = response.block_task().await;
+                            // A turn stopped by a usage limit says which, and when it lifts.
+                            if let Err(e) = &result
+                                && let Some(limit) = e.data.as_ref().and_then(|d| d.get("rateLimit")).and_then(RateLimit::parse)
+                            {
+                                let _ = events.unbounded_send(Event::RateLimit(limit));
+                            }
                             let _ = events.unbounded_send(Event::TurnEnded(match result {
                                 Ok(response) => Ok(match response.stop_reason {
                                     StopReason::EndTurn => Stop::Finished,
@@ -614,11 +695,15 @@ fn translate(update: SessionUpdate) -> Option<Event> {
                 .collect(),
         ),
         SessionUpdate::ConfigOptionUpdate(update) => Event::Settings(settings(update.config_options, None)),
-        SessionUpdate::UsageUpdate(usage) => Event::Usage {
-            used: usage.used,
-            size: usage.size,
-            cost: usage.cost.map(|c| (c.amount, c.currency)),
-        },
+        SessionUpdate::UsageUpdate(usage) => {
+            // Claude's adapter sends a rate limit event as a usage update that
+            // repeats the last context figures, with the limit in `_meta`.
+            let limit = usage.meta.as_ref().and_then(|m| m.get("_claude/rateLimit")).and_then(RateLimit::parse);
+            match limit {
+                Some(limit) => Event::RateLimit(limit),
+                None => Event::Usage { used: usage.used, size: usage.size, cost: usage.cost.map(|c| (c.amount, c.currency)) },
+            }
+        }
         SessionUpdate::AvailableCommandsUpdate(update) => {
             Event::Commands(update.available_commands.into_iter().map(|c| (c.name, c.description)).collect())
         }
@@ -629,7 +714,7 @@ fn translate(update: SessionUpdate) -> Option<Event> {
 
 /// The user's shell PATH. An app launched from the Dock gets a bare PATH that
 /// has neither `npx` nor anything a version manager installed.
-fn shell_path() -> Option<String> {
+pub fn shell_path() -> Option<String> {
     static PATH: OnceLock<Option<String>> = OnceLock::new();
     PATH.get_or_init(|| {
         let shell = std::env::var("SHELL").ok()?;
@@ -651,6 +736,35 @@ fn shell_path() -> Option<String> {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn rate_limit_reads_claude_info() {
+        let limit = RateLimit::parse(&serde_json::json!({
+            "status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.82, "resetsAt": 1_800_000_000
+        }))
+        .unwrap();
+        assert_eq!(limit.status, LimitStatus::Warning);
+        assert_eq!(limit.short_name(), "5h");
+        assert_eq!(limit.used.map(|u| u.round()), Some(82.));
+        assert_eq!(limit.resets_at, Some(1_800_000_000));
+
+        let weekly = RateLimit::parse(&serde_json::json!({ "status": "rejected", "rateLimitType": "seven_day_opus", "resetsAt": 1_800_000_000_000u64 })).unwrap();
+        assert_eq!((weekly.short_name().as_str(), weekly.long_name().as_str()), ("Opus week", "Opus weekly limit"));
+        assert_eq!(weekly.resets_at, Some(1_800_000_000));
+        assert!(limit.rank() < weekly.rank());
+
+        assert_eq!(RateLimit::parse(&serde_json::json!({ "status": "allowed" })), None);
+    }
+
+    #[test]
+    fn rate_limit_usage_update_becomes_its_own_event() {
+        let update: SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate": "usage_update", "used": 10, "size": 100,
+            "_meta": { "_claude/rateLimit": { "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1 } }
+        }))
+        .unwrap();
+        assert!(matches!(translate(update), Some(Event::RateLimit(RateLimit { status: LimitStatus::Allowed, .. }))));
+    }
 
     #[test]
     fn codex_resume_uses_the_saved_model_and_effort_with_existing_config() {

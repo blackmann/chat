@@ -9,18 +9,18 @@ const LINE: f32 = 20.;
 const CONTEXT: usize = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LineKind {
+pub(super) enum LineKind {
     Hunk,
     Context,
     Add,
     Del,
 }
 
-struct DiffLine {
-    kind: LineKind,
-    old: Option<usize>,
-    new: Option<usize>,
-    text: String,
+pub(super) struct DiffLine {
+    pub kind: LineKind,
+    pub old: Option<usize>,
+    pub new: Option<usize>,
+    pub text: String,
 }
 
 /// The pane whose lines are selected.
@@ -143,7 +143,7 @@ fn diff_span(lines: &[DiffLine]) -> Option<(usize, usize)> {
 }
 
 /// A unified diff of two texts, hunk by hunk.
-fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
+pub(super) fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
     use similar::ChangeTag;
     let diff = similar::TextDiff::from_lines(old, new);
     let mut lines = Vec::new();
@@ -175,7 +175,7 @@ fn diff_lines(old: &str, new: &str) -> Vec<DiffLine> {
 }
 
 /// Where a pane's content came from: a path, and whatever belongs at the far end.
-fn pane_header(colors: Palette, glyph: impl Into<Icon>, path: &str, trailing: impl IntoElement) -> Div {
+pub(super) fn pane_header(colors: Palette, glyph: impl Into<Icon>, path: &str, trailing: impl IntoElement) -> Div {
     let (name, dir) = split_path(path);
     row()
         .h(px(30.))
@@ -186,21 +186,29 @@ fn pane_header(colors: Palette, glyph: impl Into<Icon>, path: &str, trailing: im
         .border_color(rgb(colors.row_border))
         .font_family(mono())
         .text_size(px(crate::theme::mono_size()))
-        .child(icon(glyph).size(px(13.)).text_color(rgb(colors.muted)))
+        .child(icon(glyph).size(px(13.)).flex_shrink_0().text_color(rgb(colors.muted)))
+        // A long path gives way: its folders shrink to an ellipsis, while the
+        // file's name and what's on the right stay whole.
         .child(
             row()
+                .debug_selector(|| "pane-path".into())
+                .flex_1()
                 .min_w_0()
-                .when(!dir.is_empty(), |s| s.child(div().text_color(rgb(colors.muted)).child(format!("{dir}/"))))
-                .child(name.to_string()),
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .when(!dir.is_empty(), |s| {
+                    s.child(div().min_w_0().flex_shrink().overflow_hidden().text_ellipsis().text_color(rgb(colors.muted)).child(format!("{dir}/")))
+                })
+                .child(div().flex_shrink_0().child(name.to_string())),
         )
-        .child(div().flex_1())
-        .child(trailing)
+        .child(div().debug_selector(|| "pane-trailing".into()).flex_shrink_0().child(trailing))
 }
 
 /// A file's change drawn as Zed draws one: hunks of the new file with the removed
 /// lines among them, a coloured bar down the gutter beside each change, line
 /// numbers, syntax colours, and a quiet gap between hunks instead of `@@` lines.
 /// Returns the rows, the longest line in characters, and the gutter's width.
+#[allow(clippy::too_many_arguments)]
 fn diff_body(
     colors: Palette,
     name: &str,
@@ -208,6 +216,7 @@ fn diff_body(
     new: &str,
     offset: Pixels,
     select: Option<Select>,
+    decor: Decor,
     window: &Window,
 ) -> Option<(Div, usize, f32)> {
     let (before, after) = (syntax::cached(name, old), syntax::cached(name, new));
@@ -260,6 +269,12 @@ fn diff_body(
             .filter(|marks| marks.iter().all(|(r, _)| r.end <= line.text.len() && line.text.is_char_boundary(r.end)))
             .cloned()
             .unwrap_or_default();
+        let row_marks = select.as_ref().map(|(_, source, _)| decor.row(source, n));
+        let linked = row_marks.as_ref().is_some_and(|m| m.link.is_some());
+        let marks = match row_marks {
+            Some(row_marks) => symbols::overlay(marks, &line.text, row_marks, decor.tints),
+            None => marks,
+        };
         let selected = select.as_ref().and_then(|(_, _, rows)| rows.as_ref()).is_some_and(|rows| rows.contains(&n));
         let bg = match line.kind {
             _ if selected => Some(colors.selected),
@@ -267,12 +282,14 @@ fn diff_body(
             LineKind::Del => Some(colors.red_tint),
             _ => None,
         };
+        let text = SharedString::from(line.text);
+        let pick = select.as_ref().map(|(this, source, _)| Pick { this: (*this).clone(), source: (*source).clone(), line: text.clone(), row: n, linked });
         let cells = code_row(colors, select.as_ref(), n)
             .when_some(bg, |s, bg| s.bg(rgb(bg)))
             .child(div().w(px(3.)).h_full().flex_shrink_0().when_some(bars[n], |s, hue| s.bg(rgb(hue))))
             // Removed lines have no place in the new file, so no number.
             .child(number(colors, if line.kind == LineKind::Del { None } else { line.new }, width).pr_3())
-            .child(code_cell(offset, StyledText::new(line.text).with_highlights(marks), guides.at(levels[n])));
+            .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(levels[n]), pick));
         rows = rows.child(cells);
     }
     let gutter = if select.is_some() { GUTTER } else { 0. };
@@ -301,17 +318,95 @@ impl Guides {
 }
 
 /// The width of one character in the code font.
-fn glyph_width(window: &Window) -> Pixels {
+pub(super) fn glyph_width(window: &Window) -> Pixels {
     text_width_in(window, "0000000000", crate::theme::mono_size(), mono()) / 10.
+}
+
+/// Who to tell when a line's code is clicked or hovered, which pane and row
+/// it is, and the line as shown.
+struct Pick {
+    this: WeakEntity<Workspace>,
+    source: LineSource,
+    line: SharedString,
+    row: usize,
+    /// The word under the pointer here is a link (⌘ held).
+    linked: bool,
+}
+
+/// The marks code views draw over their lines: the picked symbol and the link
+/// under the pointer while ⌘ is held.
+pub(super) struct Decor<'a> {
+    pub symbol: Option<&'a symbols::SymbolMark>,
+    pub link: Option<&'a super::lsp::Link>,
+    pub tints: symbols::Tints,
+}
+impl Decor<'_> {
+    fn row(&self, source: &LineSource, row: usize) -> symbols::RowMarks<'_> {
+        let mut marks = self.symbol.map(|s| s.row(source, row)).unwrap_or_default();
+        marks.link = self.link.filter(|l| &l.source == source && l.row == row).map(|l| l.range.clone());
+        marks
+    }
+}
+
+pub(super) fn tints(colors: Palette) -> symbols::Tints {
+    symbols::Tints {
+        read: Hsla::from(rgb(colors.blue)).opacity(if colors.dark { 0.24 } else { 0.18 }),
+        write: Hsla::from(rgb(colors.amber)).opacity(if colors.dark { 0.28 } else { 0.24 }),
+        link: rgb(colors.blue).into(),
+    }
 }
 
 /// A line's code, shifted left by how far the view has scrolled sideways and
 /// clipped at the gutter, which stays put. Indent guides scroll with the code.
-fn code_cell(offset: Pixels, text: impl IntoElement, guides: Guides) -> Div {
+/// A plain click on a word picks it, anywhere else lets it go; ⌘-click goes to
+/// its definition and ⌘⇧-click lists its references. Resting on a word shows
+/// what the server knows about it.
+fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick>) -> Stateful<Div> {
     let lines = (0..guides.count).map(|k| {
         div().absolute().top_0().bottom_0().left(guides.step * k as f32).w(px(1.)).bg(guides.color)
     });
-    div().flex().flex_1().min_w_0().h_full().items_center().overflow_hidden().child(
+    let layout = text.layout().clone();
+    let id = pick.as_ref().map_or(0, |p| p.row);
+    div()
+        .id(("code-cell", id))
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .items_center()
+        .overflow_hidden()
+        .when_some(pick, |s, pick| {
+            let s = s.when(pick.linked, |s| s.cursor_pointer());
+            let pick = Rc::new(pick);
+            let (down, moved, left) = (pick.clone(), pick.clone(), pick);
+            let (l1, l2) = (layout.clone(), layout);
+            s.on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
+                let at = l1.index_for_position(e.position).ok();
+                let Pick { this, source, line, row, .. } = &*down;
+                let m = e.modifiers;
+                let (source, row) = (source.clone(), *row);
+                this.update(cx, |s, cx| match (m.platform, m.shift, m.alt || m.control) {
+                    (true, true, false) => s.find_references_at(source, row, line, at, e.position, window, cx),
+                    (true, false, false) => s.go_to_definition_at(source, row, line, at, e.position, window, cx),
+                    (false, false, false) => s.pick_symbol(source, row, line, at, e.position, window, cx),
+                    _ => {}
+                })
+                .ok();
+            })
+            .on_mouse_move(move |e: &MouseMoveEvent, _, cx| {
+                // The text hasn't been laid out yet on the frame it first shows.
+                let at = l2.index_for_position(e.position).ok();
+                let Pick { this, source, line, row, .. } = &*moved;
+                this.update(cx, |s, cx| s.hover_code(source, *row, line, at, e.modifiers.platform, e.position, cx)).ok();
+            })
+            .on_hover(move |hovered: &bool, _, cx| {
+                if !*hovered {
+                    let Pick { this, source, row, .. } = &*left;
+                    this.update(cx, |s, cx| s.leave_code(source, *row, cx)).ok();
+                }
+            })
+        })
+        .child(
         div()
             .relative()
             .h_full()
@@ -321,6 +416,8 @@ fn code_cell(offset: Pixels, text: impl IntoElement, guides: Guides) -> Div {
             .whitespace_nowrap()
             .pr_4()
             .ml(-offset)
+            // Where a row's code starts, for tests that point at words.
+            .debug_selector(move || format!("code:{id}"))
             .children(lines)
             .child(text),
     )
@@ -377,8 +474,11 @@ fn number(colors: Palette, n: Option<usize>, width: f32) -> Div {
 }
 
 impl Workspace {
-    fn relative(&self, path: &Path) -> String {
-        self.current_project().relative(path).to_string_lossy().into_owned()
+    /// A path as headers show it: from its project root, or from home (`~/…`)
+    /// when it's outside the project, such as a library's source.
+    pub(super) fn relative(&self, path: &Path) -> String {
+        let relative = self.current_project().relative(path);
+        if relative.is_absolute() { crate::model::tilde(&relative) } else { relative.to_string_lossy().into_owned() }
     }
 
     pub(super) fn file_view(&self, path: PathBuf, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -403,12 +503,20 @@ impl Workspace {
         }
         let scroll = self.file_scroll.get(&path).cloned().unwrap_or_default();
         let guides = Guides::new(colors, window, file.guides.0);
+        let symbol = self.symbol.clone();
+        let link = self.servers.link.clone();
+        let tints = tints(colors);
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
             range
                 .map(|i| {
                     let line = file.lines[i].clone();
                     let marks = file.highlights.as_ref().and_then(|h| h.line(colors.dark, i)).cloned().unwrap_or_default();
+                    let decor = Decor { symbol: symbol.as_ref(), link: link.as_ref(), tints };
+                    let row_marks = decor.row(&source, i);
+                    let linked = row_marks.link.is_some();
+                    let marks = symbols::overlay(marks, &line, row_marks, tints);
+                    let pick = Pick { this: this.clone(), source: source.clone(), line: line.clone(), row: i, linked };
                     code_row(colors, Some(&(&this, &source, selected.clone())), i)
                         .when_some(flash.as_ref().filter(|(rows, _)| rows.contains(&i)), |s, (_, k)| {
                             s.bg(Hsla::from(rgb(colors.amber)).opacity(0.22 * k))
@@ -416,7 +524,7 @@ impl Workspace {
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
                         .child(number(colors, Some(i + 1), 44.).mr_4())
                         .child(
-                            code_cell(offset, StyledText::new(line).with_highlights(marks), guides.at(file.guides.1[i]))
+                            code_cell(offset, StyledText::new(line).with_highlights(marks), guides.at(file.guides.1[i]), Some(pick))
                                 .text_color(rgb(colors.code)),
                         )
                 })
@@ -437,6 +545,20 @@ impl Workspace {
                     .gap_2()
                     .font_family(crate::theme::ui_font())
                     .when(edited, |s| s.child(pill("Edited in this thread", colors.amber, colors.amber_tint)))
+                    .when_some(self.lsp_badge(&path), |s, badge| {
+                        let text = if badge.warn {
+                            pill(badge.text, colors.amber, colors.amber_tint)
+                        } else {
+                            label(colors, badge.text)
+                        };
+                        let tip = badge.tooltip;
+                        s.child(
+                            div()
+                                .id("lsp-badge")
+                                .child(text)
+                                .when_some(tip, |s, tip| s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(w, cx))),
+                        )
+                    })
                     .child(label(colors, format!("{count} lines"))),
             ))
             .child(
@@ -588,7 +710,8 @@ impl Workspace {
         };
         let this = cx.weak_entity();
         let select = Some((&this, &source, self.selected_rows(&source)));
-        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, window) else {
+        let decor = Decor { symbol: self.symbol.as_ref(), link: self.servers.link.as_ref(), tints: tints(colors) };
+        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, decor, window) else {
             return empty(colors, Glyph::FileDiff, "No changes", "The two sides are the same.").into_any_element();
         };
         let scroll = self.sideways.borrow_mut().entry(key.clone()).or_default().scroll.clone();
@@ -637,7 +760,7 @@ impl Workspace {
     }
 
     /// The texts a diff source compares, as its pane shows them.
-    fn diff_sides(&self, source: &LineSource) -> Option<(String, String)> {
+    pub(super) fn diff_sides(&self, source: &LineSource) -> Option<(String, String)> {
         match source {
             LineSource::File(_) => None,
             LineSource::Diff(path) => {

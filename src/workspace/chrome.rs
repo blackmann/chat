@@ -16,6 +16,7 @@ pub fn tab_glyph(kind: &TabKind) -> Icon {
         TabKind::File(_) => Glyph::FileCode.into(),
         TabKind::Diff(_) | TabKind::GitDiff(..) => Glyph::FileDiff.into(),
         TabKind::Terminal => Glyph::Terminal.into(),
+        TabKind::ServerLog(..) => Glyph::Zap.into(),
     }
 }
 
@@ -121,6 +122,65 @@ impl Workspace {
             entries
         });
         self.open_popover("project-menu", position, Corner::TopLeft, 200., None, build, window, cx);
+    }
+
+    /// The right-click menu on a diff — a row that opens one, or its tab.
+    pub(super) fn diff_menu(&mut self, path: PathBuf, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let build: crate::menu::Builder = Rc::new(move |_: &App| {
+            let open = weak.clone();
+            let target = path.clone();
+            vec![crate::menu::Entry::Item(
+                crate::menu::Item::new("View file").icon(Glyph::FileCode).disabled(!path.is_file()).on_click(move |_, cx| {
+                    let _ = open.update(cx, |s, cx| s.open(TabKind::File(target.clone()), cx));
+                }),
+            )]
+        });
+        self.open_popover("diff-menu", position, Corner::TopLeft, 180., None, build, window, cx);
+    }
+
+    /// A tab's right-click menu. The tab is found by id when an item is picked,
+    /// as its place in the strip may have changed since the menu opened.
+    fn tab_menu(&mut self, id: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else { return };
+        let (kind, pinned) = (tab.kind.clone(), tab.pinned);
+        let others = self.tabs.iter().any(|t| t.id != id && !t.fixed());
+        let weak = cx.weak_entity();
+        let build: crate::menu::Builder = Rc::new(move |_: &App| {
+            let act = |f: fn(&mut Workspace, usize, &mut Context<Workspace>)| {
+                let weak = weak.clone();
+                move |_: &mut Window, cx: &mut App| {
+                    let _ = weak.update(cx, |s, cx| {
+                        if let Some(i) = s.tabs.iter().position(|t| t.id == id) {
+                            f(s, i, cx);
+                        }
+                    });
+                }
+            };
+            let mut entries = Vec::new();
+            if let TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind {
+                let open = weak.clone();
+                let target = path.clone();
+                entries.push(crate::menu::Entry::Item(
+                    crate::menu::Item::new("View file").icon(Glyph::FileCode).disabled(!path.is_file()).on_click(move |_, cx| {
+                        let _ = open.update(cx, |s, cx| s.open(TabKind::File(target.clone()), cx));
+                    }),
+                ));
+            }
+            if kind == TabKind::Terminal {
+                entries.push(crate::menu::Entry::Item(
+                    crate::menu::Item::new(if pinned { "Unpin" } else { "Pin" }).icon(Glyph::Pin).on_click(act(Workspace::toggle_pin)),
+                ));
+            }
+            if !entries.is_empty() {
+                entries.push(crate::menu::Entry::Separator);
+            }
+            entries.push(crate::menu::Entry::Item(
+                crate::menu::Item::new("Close others").icon(IconName::Close).disabled(!others).on_click(act(Workspace::close_others)),
+            ));
+            entries
+        });
+        self.open_popover("tab-menu", position, Corner::TopLeft, 180., None, build, window, cx);
     }
 
     pub(super) fn title(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -413,25 +473,27 @@ impl Workspace {
     pub(super) fn tabs_view(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         // The chat stays put at the start; the other tabs scroll behind it.
-        let mut pinned_tab = None;
+        let mut fixed_tabs = Vec::new();
         let mut tabs = row().id("tabs-scroll").h_full().overflow_x_scroll().track_scroll(&self.tabs_scroll);
         // Bring the active tab into view when it changes. Children of the strip
         // are the unpinned tabs, so count those that come before it.
         if let Some(active) = self.tabs.get(self.active) {
-            if self.tab_in_view.replace(Some(active.id)) != Some(active.id) && active.kind != TabKind::Chat {
-                let index = self.tabs[..self.active].iter().filter(|t| t.kind != TabKind::Chat).count();
+            if self.tab_in_view.replace(Some(active.id)) != Some(active.id) && !active.fixed() {
+                let index = self.tabs[..self.active].iter().filter(|t| !t.fixed()).count();
                 self.tabs_scroll.scroll_to_item(index);
             }
         }
         for (i, t) in self.tabs.iter().enumerate() {
             let active = self.active == i;
-            let pinned = t.kind == TabKind::Chat;
+            let pinned = t.fixed();
             let stale = self.stale(&t.kind).is_some();
             let group = SharedString::from(format!("tab-{}", t.id));
             let (name, detail) = match &t.kind {
                 TabKind::Chat => ("Chat".to_string(), String::new()),
                 TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) => {
-                    let relative = self.current_project().relative(path).to_string_lossy().into_owned();
+                    let relative = self.current_project().relative(path);
+                    // Outside the project (a library's source), from home.
+                    let relative = if relative.is_absolute() { crate::model::tilde(&relative) } else { relative.to_string_lossy().into_owned() };
                     let (name, dir) = split_path(&relative);
                     let detail = match &t.kind {
                         TabKind::GitDiff(_, staged) => {
@@ -443,6 +505,10 @@ impl Workspace {
                     (name.to_string(), detail)
                 }
                 TabKind::Terminal => ("Terminal".to_string(), String::new()),
+                TabKind::ServerLog(name, root) => {
+                    let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    (format!("{name} logs"), folder)
+                }
             };
             let tab = row()
                     .id(("tab", t.id))
@@ -483,7 +549,7 @@ impl Workspace {
                     })
                     .when(stale, |s| s.tooltip(move |window, cx| Tooltip::new("Out of date — open it to see why").build(window, cx)))
                     .child(if pinned {
-                        // The chat can't be closed: a pin sits where the close button would.
+                        // The chat (or a pinned tab) can't be closed: a pin sits where the close button would.
                         row()
                             .size(px(22.))
                             .justify_center()
@@ -502,13 +568,17 @@ impl Workspace {
                         )
                     })
                     .on_mouse_down(MouseButton::Middle, cx.listener(move |s, _, _, cx| s.close(i, cx)))
+                    .on_mouse_down(MouseButton::Right, cx.listener({
+                        let id = t.id;
+                        move |s, e: &MouseDownEvent, window, cx| s.tab_menu(id, e.position, window, cx)
+                    }))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.active = i;
                         s.focus_terminal(cx);
                         cx.notify();
                     }));
             if pinned {
-                pinned_tab = Some(tab);
+                fixed_tabs.push(tab.flex_shrink_0());
             } else {
                 tabs = tabs.child(tab);
             }
@@ -517,7 +587,7 @@ impl Workspace {
             .h(px(BAR))
             .flex_shrink_0()
             .bg(rgb(colors.chrome))
-            .children(pinned_tab.map(|tab| tab.flex_shrink_0()))
+            .children(fixed_tabs)
             .child(div().min_w_0().h_full().child(tabs))
             .child(div().flex_1().h_full().border_b_1().border_color(rgb(colors.border)))
             .child(
@@ -563,7 +633,7 @@ impl Workspace {
                     "Nothing is unstaged in this file anymore. This diff is out of date."
                 })
             }
-            TabKind::Chat | TabKind::Terminal => None,
+            TabKind::Chat | TabKind::Terminal | TabKind::ServerLog(..) => None,
         }
     }
 
@@ -576,6 +646,7 @@ impl Workspace {
             TabKind::Diff(path) => return self.diff_view(path.clone(), window, cx),
             TabKind::GitDiff(path, staged) => self.git_diff_view(path, *staged, window, cx),
             TabKind::Terminal => return self.terminal_view(cx),
+            TabKind::ServerLog(name, root) => return self.server_log_view(name, root, cx),
         };
         // A Git diff that failed to load already says why in its place.
         let explained = match kind {
@@ -624,6 +695,7 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when_some(self.servers_button(cx), |s, button| s.child(button))
             .child(div().flex_1())
             .when(working > 0, |s| {
                 s.child(
@@ -634,6 +706,7 @@ impl Workspace {
                 )
                 .child(divider(colors))
             })
+            .when_some(self.limit_item(cx), |s, item| s.child(item).child(divider(colors)))
             .when_some(self.current_thread(), |s, t| {
                 s.child(match self.setting(Role::Model) {
                     Some(model) => format!("{} · {}", self.agent_name(t), model.current_name()),
@@ -641,5 +714,57 @@ impl Workspace {
                 })
             })
             .into_any_element()
+    }
+
+    /// The current agent's shortest usage limit window (Claude's five-hour one)
+    /// in the status bar, or whichever has run out.
+    fn limit_item(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use crate::agent::LimitStatus;
+        let colors = palette(cx);
+        let thread = self.current_thread()?;
+        let now = chrono::Utc::now().timestamp();
+        // A window that has reset no longer says anything.
+        let live = self.limits.get(&thread.agent)?.values().filter(|l| l.resets_at.is_none_or(|at| at > now));
+        let limit = live
+            .min_by_key(|l| (l.status != LimitStatus::Rejected, l.rank()))?
+            .clone();
+        let resets = limit.resets_at.and_then(|at| chrono::DateTime::from_timestamp(at, 0)).map(|at| {
+            let at = at.with_timezone(&chrono::Local);
+            if at.date_naive() == chrono::Local::now().date_naive() {
+                at.format("%-I:%M %p").to_string()
+            } else {
+                at.format("%a %-I:%M %p").to_string()
+            }
+        });
+        let used = limit.used.map(|u| format!("{}%", u.round() as u32));
+        let (tint, text) = match limit.status {
+            LimitStatus::Rejected => (colors.red, match &resets {
+                Some(resets) => format!("{} limit · back {resets}", limit.short_name()),
+                None => format!("{} limit reached", limit.short_name()),
+            }),
+            LimitStatus::Warning => (colors.amber, format!("{} {}", limit.short_name(), used.clone().unwrap_or_else(|| "near limit".into()))),
+            LimitStatus::Allowed => (colors.muted, format!("{} {}", limit.short_name(), used.clone().unwrap_or_else(|| "OK".into()))),
+        };
+        let mut tip = limit.long_name();
+        match (&used, limit.status) {
+            (_, LimitStatus::Rejected) => tip.push_str(" reached"),
+            (Some(used), _) => tip.push_str(&format!(" · {used} used")),
+            (None, _) => {}
+        }
+        if let Some(resets) = &resets {
+            tip.push_str(&format!(" · resets {resets}"));
+        }
+        let tip: SharedString = tip.into();
+        Some(
+            row()
+                .id("rate-limit")
+                .debug_selector(|| "rate-limit".into())
+                .gap(px(4.))
+                .text_color(rgb(tint))
+                .when(limit.status != LimitStatus::Allowed, |s| s.child(icon(IconName::TriangleAlert).size(px(12.)).text_color(rgb(tint))))
+                .child(text)
+                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                .into_any_element(),
+        )
     }
 }

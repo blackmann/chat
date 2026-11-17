@@ -11,11 +11,16 @@ mod panes;
 mod preferences;
 mod select;
 mod side;
+mod symbols;
+mod lsp;
+mod servers;
 mod git_panel;
 mod syntax;
 mod terminal;
 pub use terminal::init_terminal_keys;
 mod ui;
+#[cfg(test)]
+mod e2e;
 
 use crate::{
     agent::{self, Command, Event, Role, Setting},
@@ -54,10 +59,14 @@ actions!(
         OpenTerminal,
         OpenPreferences,
         AddToChat,
+        GoToDefinition,
+        FindReferences,
+        GoBack,
+        GoForward,
     ]
 );
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TabKind {
     Chat,
     File(PathBuf),
@@ -65,11 +74,21 @@ pub enum TabKind {
     /// One side of a file's change, from the Git panel: staged (HEAD → index) or not.
     GitDiff(PathBuf, bool),
     Terminal,
+    /// A language server's log, by its name and root.
+    ServerLog(String, PathBuf),
 }
 
 pub struct Tab {
     pub id: usize,
     pub kind: TabKind,
+    /// Held at the start of the strip beside the chat, and not closed with the rest.
+    pub pinned: bool,
+}
+impl Tab {
+    /// The chat always stays; a pinned tab stays until it's unpinned.
+    pub fn fixed(&self) -> bool {
+        self.pinned || self.kind == TabKind::Chat
+    }
 }
 
 /// The right panel's pages.
@@ -231,6 +250,10 @@ pub struct Workspace {
     selection: select::Shared,
     /// Lines selected in a file or diff pane.
     line_selection: Option<panes::LineSelection>,
+    /// The word clicked in a file or diff pane, marked wherever it appears there.
+    symbol: Option<symbols::SymbolMark>,
+    /// Language servers for the files open in tabs.
+    servers: lsp::Servers,
     /// The reasoning effort slider is showing.
     effort_open: bool,
     /// Where the effort slider's track was last painted, to map the pointer to a step.
@@ -262,6 +285,9 @@ pub struct Workspace {
     /// While a project is dragged along the rail: which one, and the gap it
     /// would drop into, counted as the index of the project below that gap.
     drop_slot: Option<(usize, usize)>,
+    /// The usage limits each agent (by index) last reported, by window. They
+    /// belong to the account, so any of the agent's threads updates them.
+    limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
     _quit: Option<Subscription>,
 }
 
@@ -313,7 +339,7 @@ impl Workspace {
             projects,
             thread: 0,
             next_thread,
-            tabs: vec![Tab { id: 0, kind: TabKind::Chat }],
+            tabs: vec![Tab { id: 0, kind: TabKind::Chat, pinned: false }],
             active: 0,
             next_tab: 1,
             side: Side::Context,
@@ -371,6 +397,8 @@ impl Workspace {
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
+            symbol: None,
+            servers: lsp::Servers::default(),
             effort_open: false,
             effort_track: Rc::default(),
             effort_dragging: false,
@@ -389,6 +417,7 @@ impl Workspace {
             mention_dismissed: false,
             sideways: Rc::default(),
             drop_slot: None,
+            limits: HashMap::new(),
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
             _quit: None,
@@ -396,6 +425,7 @@ impl Workspace {
         // Whatever hasn't been written yet is written on the way out.
         workspace._quit = Some(cx.on_app_quit(|s, _| {
             s.save_now();
+            s.lsp_shutdown();
             async {}
         }));
         crate::theme::set_fonts(
@@ -480,7 +510,7 @@ impl Workspace {
                 self.active = view.active.min(self.tabs.len().saturating_sub(1));
             }
             None => {
-                self.tabs = vec![Tab { id: self.next_tab, kind: TabKind::Chat }];
+                self.tabs = vec![Tab { id: self.next_tab, kind: TabKind::Chat, pinned: false }];
                 self.next_tab += 1;
                 self.active = 0;
             }
@@ -784,6 +814,9 @@ impl Workspace {
         };
         // A connection that fails before it opens usually means the agent isn't installed or signed in.
         let failed_to_open = matches!(&event, Event::Closed(Some(_))) && !thread.ready;
+        if let Event::RateLimit(limit) = &event {
+            self.limits.entry(thread.agent).or_default().insert(limit.window.clone(), limit.clone());
+        }
         let was_busy = thread.state.busy();
         thread.apply(event);
         // A turn that finishes out of sight waits to be read.
@@ -899,10 +932,15 @@ impl Workspace {
             self.files.insert(path.clone(), read_lines(path));
             self.file_scroll.entry(path.clone()).or_default();
         }
+        // A diff's file goes to its server too, so its lines can be looked up.
+        if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind {
+            let path = path.clone();
+            self.lsp_open(&path, cx);
+        }
         self.active = match self.tabs.iter().position(|t| t.kind == kind) {
             Some(i) => i,
             None => {
-                self.tabs.push(Tab { id: self.next_tab, kind });
+                self.tabs.push(Tab { id: self.next_tab, kind, pinned: false });
                 self.next_tab += 1;
                 self.tabs.len() - 1
             }
@@ -932,16 +970,54 @@ impl Workspace {
         }
     }
     fn close(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.tabs.get(index).is_none_or(|t| t.kind == TabKind::Chat) {
+        if self.tabs.get(index).is_none_or(Tab::fixed) {
             return;
         }
         if self.tabs[index].kind == TabKind::Terminal { self.terminal = None; }
-        if let TabKind::File(path) = self.tabs.remove(index).kind {
-            self.files.remove(&path);
-            self.file_scroll.remove(&path);
+        let kind = self.tabs.remove(index).kind;
+        if let TabKind::File(path) = &kind {
+            self.files.remove(path);
+            self.file_scroll.remove(path);
+        }
+        // Its server forgets the file once no tab shows it.
+        if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind
+            && !self.tabs.iter().any(|t| matches!(&t.kind, TabKind::File(p) | TabKind::Diff(p) | TabKind::GitDiff(p, _) if p == path))
+        {
+            self.lsp_close(path, cx);
         }
         if self.active >= index {
             self.active = self.active.saturating_sub(1);
+        }
+        cx.notify();
+    }
+    /// Close every tab but the one at `index` (and those that stay put), and show it.
+    pub(super) fn close_others(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(keep) = self.tabs.get(index).map(|t| t.id) else { return };
+        for i in (0..self.tabs.len()).rev() {
+            if self.tabs[i].id != keep {
+                self.close(i, cx);
+            }
+        }
+        if let Some(i) = self.tabs.iter().position(|t| t.id == keep) {
+            self.active = i;
+        }
+        self.focus_terminal(cx);
+        cx.notify();
+    }
+    /// Pin or unpin the tab at `index`. Pinned tabs gather right after the chat,
+    /// so cycling through tabs goes in the order they're shown.
+    pub(super) fn toggle_pin(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.tabs.get(index).is_none_or(|t| t.kind == TabKind::Chat) {
+            return;
+        }
+        let active = self.tabs.get(self.active).map(|t| t.id);
+        let mut tab = self.tabs.remove(index);
+        tab.pinned = !tab.pinned;
+        // Pinning joins the end of the fixed run; unpinning leads the rest.
+        let at = self.tabs.iter().take_while(|t| t.fixed()).count();
+        self.tabs.insert(at, tab);
+        if let Some(i) = active.and_then(|id| self.tabs.iter().position(|t| t.id == id)) {
+            self.active = i;
         }
         cx.notify();
     }
@@ -991,6 +1067,9 @@ impl Workspace {
                 s.prefs_focus.focus(window);
             } else if s.renaming.is_some() {
                 // The menu's Rename item has just put the caret in the name field.
+            } else if s.dismissed.is_some_and(|(a, _)| a == lsp::LOCATIONS) {
+                // Back to the code the list was opened from.
+                s.focus.focus(window);
             } else {
                 s.composer.update(cx, |c, cx| c.focus(window, cx));
             }
@@ -1065,6 +1144,8 @@ impl Flash {
 
 /// An open file: its lines and, where a grammar fits, their syntax colours.
 pub struct FileView {
+    /// The text as read, which language servers count positions in.
+    pub text: String,
     pub lines: Vec<SharedString>,
     /// The longest line, which sets how far the view scrolls sideways.
     pub longest: usize,
@@ -1083,7 +1164,7 @@ fn read_lines(path: &Path) -> Result<Rc<FileView>, SharedString> {
     let highlights = syntax::language(&path.to_string_lossy()).and_then(|lang| syntax::highlight(lang, &lines));
     let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.chars().count()).map_or(0, |(i, _)| i);
     let guides = syntax::indent_guides(&lines);
-    Ok(Rc::new(FileView { lines, longest, highlights, guides }))
+    Ok(Rc::new(FileView { text, lines, longest, highlights, guides }))
 }
 
 impl Workspace {
@@ -1214,6 +1295,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &ShowFiles, _, cx| s.show_side(Side::Files, cx)))
             .on_action(cx.listener(|s, _: &OpenTerminal, _, cx| s.open(TabKind::Terminal, cx)))
             .on_action(cx.listener(Self::open_prefs))
+            .on_action(cx.listener(|s, _: &GoToDefinition, window, cx| s.go_to_definition(window, cx)))
+            .on_action(cx.listener(|s, _: &FindReferences, window, cx| s.find_references(window, cx)))
+            .on_action(cx.listener(|s, _: &GoBack, _, cx| s.go_back(cx)))
+            .on_action(cx.listener(|s, _: &GoForward, _, cx| s.go_forward(cx)))
+            // Letting go of ⌘ takes the link away from the word under the pointer.
+            .on_modifiers_changed(cx.listener(|s, e: &ModifiersChangedEvent, _, cx| s.lsp_modifiers(e.modifiers.platform, cx)))
             // Escape interrupts the agent, as the transcript says it will.
             .on_key_down(cx.listener(|s, e: &KeyDownEvent, window, cx| {
                 let key = e.keystroke.key.as_str();
@@ -1231,6 +1318,9 @@ impl Render for Workspace {
                     s.close_effort(cx);
                 } else if s.line_selection.is_some() {
                     s.line_selection = None;
+                    cx.notify();
+                } else if s.symbol.is_some() {
+                    s.symbol = None;
                     cx.notify();
                 } else if !s.selection.borrow().is_empty() {
                     s.selection.borrow_mut().clear();
@@ -1275,6 +1365,7 @@ impl Render for Workspace {
                     .with_priority(3),
                 )
             })
+            .when_some(self.lsp_overlay(cx), |root, overlay| root.child(overlay))
             .when_some(self.popup.clone(), |root, menu| {
                 root.child(
                     deferred(

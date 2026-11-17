@@ -576,6 +576,10 @@ impl Workspace {
                         }))
                         .child(self.path_label(window, colors, &diff.path, px(COLUMN - 240.)))
                         .child(stat(colors, adds as u32, dels as u32))
+                        .on_mouse_down(MouseButton::Right, {
+                            let path = path.clone();
+                            cx.listener(move |s, e: &MouseDownEvent, window, cx| s.diff_menu(path.clone(), e.position, window, cx))
+                        })
                         .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::Diff(path.clone()), cx))),
                 );
             }

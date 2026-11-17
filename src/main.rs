@@ -2,6 +2,7 @@ mod agent;
 mod icons;
 mod git;
 mod git_watch;
+mod lsp;
 mod menu;
 mod model;
 mod settings;
@@ -12,35 +13,44 @@ use gpui::*;
 use gpui_component::{Root, TitleBar};
 use workspace::*;
 
+/// The app's keys, shared with the tests that drive it.
+pub fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-b", ToggleThreads, None),
+        KeyBinding::new("cmd-alt-b", ToggleSide, None),
+        KeyBinding::new("cmd-n", NewThread, None),
+        KeyBinding::new("cmd-o", AddProject, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
+        KeyBinding::new("cmd-shift-]", NextTab, None),
+        KeyBinding::new("cmd-shift-[", PreviousTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+        KeyBinding::new("cmd-1", ShowContext, None),
+        KeyBinding::new("cmd-2", ShowChanges, None),
+        KeyBinding::new("cmd-3", ShowFiles, None),
+        KeyBinding::new("ctrl-`", OpenTerminal, None),
+        KeyBinding::new("enter", Submit, Some("Composer > Input")),
+        KeyBinding::new(
+            "shift-enter",
+            gpui_component::input::Enter { secondary: false },
+            Some("Composer > Input"),
+        ),
+        KeyBinding::new("cmd-,", OpenPreferences, None),
+        KeyBinding::new("cmd-l", AddToChat, None),
+        KeyBinding::new("f12", GoToDefinition, None),
+        KeyBinding::new("shift-f12", FindReferences, None),
+        KeyBinding::new("ctrl--", GoBack, None),
+        KeyBinding::new("ctrl-shift--", GoForward, None),
+        KeyBinding::new("cmd-q", Quit, None),
+    ]
+}
+
 fn main() {
     Application::new().with_assets(icons::Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::init(cx);
         workspace::init_terminal_keys(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-b", ToggleThreads, None),
-            KeyBinding::new("cmd-alt-b", ToggleSide, None),
-            KeyBinding::new("cmd-n", NewThread, None),
-            KeyBinding::new("cmd-o", AddProject, None),
-            KeyBinding::new("cmd-w", CloseTab, None),
-            KeyBinding::new("cmd-shift-]", NextTab, None),
-            KeyBinding::new("cmd-shift-[", PreviousTab, None),
-            KeyBinding::new("ctrl-tab", NextTab, None),
-            KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
-            KeyBinding::new("cmd-1", ShowContext, None),
-            KeyBinding::new("cmd-2", ShowChanges, None),
-            KeyBinding::new("cmd-3", ShowFiles, None),
-            KeyBinding::new("ctrl-`", OpenTerminal, None),
-            KeyBinding::new("enter", Submit, Some("Composer > Input")),
-            KeyBinding::new(
-                "shift-enter",
-                gpui_component::input::Enter { secondary: false },
-                Some("Composer > Input"),
-            ),
-            KeyBinding::new("cmd-,", OpenPreferences, None),
-            KeyBinding::new("cmd-l", AddToChat, None),
-            KeyBinding::new("cmd-q", Quit, None),
-        ]);
+        cx.bind_keys(key_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.set_menus(vec![
             Menu {

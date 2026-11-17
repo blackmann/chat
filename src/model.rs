@@ -348,6 +348,8 @@ impl Thread {
                     self.cost = cost;
                 }
             }
+            // Limits are the account's, not the thread's: the workspace keeps them.
+            Event::RateLimit(_) => {}
             Event::Commands(commands) => self.commands = commands,
             Event::Title(title) => {
                 if !title.trim().is_empty() {

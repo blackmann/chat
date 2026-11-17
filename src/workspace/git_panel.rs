@@ -160,6 +160,8 @@ impl Workspace {
     /// Read every folder of the project again (each shows its branch), and the
     /// diff in the open tab.
     pub(super) fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        // The watcher that wakes this also catches open files changing.
+        self.lsp_sync();
         if self.git_refreshing || self.git_busy {
             self.git_queued = true;
             return;
@@ -507,6 +509,10 @@ impl Workspace {
                                 .text_color(rgb(hue))
                                 .child(if status == b'?' { "U".to_string() } else { char::from(status).to_string() }),
                         )
+                        .on_mouse_down(MouseButton::Right, {
+                            let path = path.clone();
+                            cx.listener(move |s, e: &MouseDownEvent, window, cx| s.diff_menu(path.clone(), e.position, window, cx))
+                        })
                         .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::GitDiff(path.clone(), staged), cx))),
                 );
             }

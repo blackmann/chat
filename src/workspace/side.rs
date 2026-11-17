@@ -137,8 +137,15 @@ impl Workspace {
         let meter = match thread.usage {
             Some((used, size)) if size > 0 => {
                 let share = (used as f32 / size as f32).min(1.);
-                // The bar warms as the window fills.
-                let hue = if share > 0.85 { colors.red } else if share > 0.6 { colors.amber } else { colors.blue };
+                // The bar warms as the window fills: it starts blue and its
+                // leading edge blends toward an orange-red.
+                let hot = if colors.dark { 0xef6a45 } else { 0xd4462a };
+                let edge = blend(colors.blue, hot, share * share);
+                let fill = linear_gradient(
+                    90.,
+                    linear_color_stop(rgb(colors.blue), 0.),
+                    linear_color_stop(rgb(edge), 1.),
+                );
                 col()
                     .child(
                         row()
@@ -156,7 +163,7 @@ impl Workspace {
                             .rounded(px(3.))
                             .overflow_hidden()
                             .bg(rgb(colors.hover))
-                            .child(div().h_full().w(relative(share)).bg(rgb(hue))),
+                            .child(div().h_full().w(relative(share)).bg(fill)),
                     )
                     .child(
                         row()
@@ -215,6 +222,12 @@ impl Workspace {
                 .id(("context-file", i))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgb(colors.hover)))
+                .when(*touch != Touch::Read, |s| {
+                    let path = path.clone();
+                    s.on_mouse_down(MouseButton::Right, cx.listener(move |s, e: &MouseDownEvent, window, cx| {
+                        s.diff_menu(path.clone(), e.position, window, cx)
+                    }))
+                })
                 .on_click(cx.listener(move |s, _, _, cx| s.open(target.clone(), cx))),
             );
         }
@@ -440,4 +453,15 @@ impl Workspace {
             .child(div().id("side-page").flex_1().min_h_0().overflow_y_scroll().child(page))
             .into_any_element()
     }
+}
+
+/// Mixes two `0xRRGGBB` colors, `t` of the way from `from` to `to`.
+fn blend(from: u32, to: u32, t: f32) -> u32 {
+    let t = t.clamp(0., 1.);
+    let channel = |shift: u32| {
+        let a = ((from >> shift) & 0xff) as f32;
+        let b = ((to >> shift) & 0xff) as f32;
+        ((a + (b - a) * t).round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
 }

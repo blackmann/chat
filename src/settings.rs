@@ -87,6 +87,9 @@ pub struct Settings {
     pub indent_guides: Option<bool>,
     /// The commit box's height, once dragged; unset means it grows with its text.
     pub commit_box_height: Option<f32>,
+    /// Language servers beside or instead of the defaults, matched by name.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub language_servers: Vec<crate::lsp::ServerSpec>,
 }
 
 /// The commit box can't be dragged shorter than this.
