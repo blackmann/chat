@@ -15,6 +15,8 @@ import threading
 import time
 
 lock = threading.Lock()
+turn_lock = threading.Lock()
+active_turns = {}
 cancelled = threading.Event()
 replies = {}  # request id -> (event, result holder), for requests we send
 next_id = [1000]
@@ -194,7 +196,9 @@ def turn(rid, session, prompt, cwd):
 def finish(rid, session):
     update(session, {"sessionUpdate": "usage_update", "used": 42000 + turns[0] * 3100, "size": 200000,
                       "cost": {"amount": 0.21 * turns[0], "currency": "USD"}})
-    send({"id": rid, "result": {"stopReason": "cancelled" if cancelled.is_set() else "end_turn"}})
+    with turn_lock:
+        del active_turns[rid]
+        send({"id": rid, "result": {"stopReason": "cancelled" if cancelled.is_set() else "end_turn"}})
 
 
 def main():
@@ -212,6 +216,7 @@ def main():
                 done.set()
         elif method == "initialize":
             send({"id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": [],
+                                        "_meta": {"steering": {"supported": True}},
                                         "agentInfo": {"name": "mock", "title": "Mock Agent", "version": "0.1.0"}}})
         elif method == "session/new":
             session = f"mock-{len(cwds) + 1}"
@@ -232,7 +237,22 @@ def main():
         elif method == "session/prompt":
             session = params["sessionId"]
             prompt = "".join(b.get("text", "") for b in params.get("prompt", []))
+            with turn_lock:
+                active_turns[rid] = session
             threading.Thread(target=turn, args=(rid, session, prompt, cwds.get(session, ".")), daemon=True).start()
+        elif method == "_session/steering":
+            session = params["sessionId"]
+            prompt = "".join(b["text"] for b in params["prompt"] if b["type"] == "text")
+            if not prompt or params.get("_meta", {}).get("steering", {}).get("idleBehavior") != "promptRequired":
+                send({"id": rid, "error": {"code": -32602, "message": "Expected text and promptRequired idle behavior"}})
+                continue
+            with turn_lock:
+                if session in active_turns.values():
+                    send({"id": rid, "result": {"outcome": "injected"}})
+                    update(session, {"sessionUpdate": "agent_message_chunk",
+                                     "content": {"type": "text", "text": "Steered: " + prompt + "\n"}})
+                else:
+                    send({"id": rid, "result": {"outcome": "promptRequired", "reason": "noRunningTurn"}})
         elif method == "session/cancel":
             cancelled.set()
         elif method == "session/set_config_option":

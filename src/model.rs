@@ -1,10 +1,10 @@
 //! Projects, threads and what a thread has gathered from its agent. A thread is
 //! a fold over the agent's events; every panel reads from it.
-use crate::agent::{Answer, Command, Event, FileDiff, History, Kind, Setting, Status, Step, Stop};
+use crate::agent::{Answer, Command, Event, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
 use serde::{Deserialize, Serialize};
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{SharedString, Task};
-use std::path::{Path, PathBuf};
+use std::{collections::VecDeque, path::{Path, PathBuf}};
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThreadState {
@@ -73,6 +73,7 @@ pub struct Thread {
     pub session: Option<Session>,
     /// The session has opened; until then prompts wait in the channel.
     pub ready: bool,
+    pub supports_steering: bool,
     /// Model, effort, mode: whatever the agent lets the user change mid-thread.
     pub settings: Vec<Setting>,
     pub plan: Vec<(Step, String)>,
@@ -90,6 +91,18 @@ pub struct Thread {
     /// Setting choices (id, value) to put back once a reopened session is ready,
     /// so a thread keeps the model it was switched to.
     pub picks: Vec<(String, String)>,
+    /// Index of the current turn's first block. Steering adds user blocks
+    /// inside the turn, so the last user block no longer marks its start.
+    turn_start: usize,
+    /// One steer awaits a reply before the next follow-up can be dispatched.
+    pending_steer: Option<(usize, QueuedMessage)>,
+    pub queued: VecDeque<QueuedMessage>,
+}
+
+pub struct QueuedMessage {
+    pub shown: SharedString,
+    prompt: String,
+    steer: bool,
 }
 
 /// A file's net change across a thread: its text before the first edit and after the last.
@@ -111,6 +124,7 @@ impl Thread {
             agent,
             session: None,
             ready: false,
+            supports_steering: false,
             settings: Vec::new(),
             plan: Vec::new(),
             usage: None,
@@ -119,6 +133,9 @@ impl Thread {
             problem: None,
             session_id: None,
             picks: Vec::new(),
+            turn_start: 0,
+            pending_steer: None,
+            queued: VecDeque::new(),
         }
     }
     pub fn send(&self, command: Command) {
@@ -128,6 +145,42 @@ impl Thread {
     }
     pub fn notice(&mut self, text: impl Into<String>) {
         self.blocks.push(Block::Notice(text.into()));
+    }
+    fn prompt(&mut self, shown: impl Into<SharedString>, prompt: String) {
+        self.turn_start = self.blocks.len();
+        self.blocks.push(Block::User(shown.into()));
+        self.state = ThreadState::Running;
+        self.send(Command::Prompt(prompt));
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state.busy() || self.pending_steer.is_some()
+    }
+
+    pub fn submit(&mut self, shown: impl Into<SharedString>, prompt: String, steer: bool) {
+        self.queued.push_back(QueuedMessage { shown: shown.into(), prompt, steer });
+        self.advance_follow_ups();
+    }
+
+    fn advance_follow_ups(&mut self) {
+        if self.pending_steer.is_some() {
+            return;
+        }
+        let busy = self.state.busy();
+        let can_steer = self.ready && self.supports_steering
+            && self.queued.front().is_some_and(|message| message.steer);
+        if busy && !can_steer {
+            return;
+        }
+        let Some(message) = self.queued.pop_front() else { return };
+        if busy {
+            let index = self.blocks.len();
+            self.blocks.push(Block::User(message.shown.clone()));
+            self.send(Command::Steer(message.prompt.clone()));
+            self.pending_steer = Some((index, message));
+        } else {
+            self.prompt(message.shown, message.prompt);
+        }
     }
     /// Unanswered permission requests can't be answered once a turn is over.
     fn dismiss_permissions(&mut self) {
@@ -152,8 +205,9 @@ impl Thread {
 
     pub fn apply(&mut self, event: Event) {
         match event {
-            Event::Ready { settings, session, history, .. } => {
+            Event::Ready { settings, session, history, supports_steering, .. } => {
                 self.ready = true;
+                self.supports_steering = supports_steering;
                 self.settings = settings;
                 self.session_id = Some(session);
                 if history == History::Lost && !self.blocks.is_empty() {
@@ -169,6 +223,9 @@ impl Thread {
                         }
                     }
                 }
+                if self.state.busy() {
+                    self.advance_follow_ups();
+                }
             }
             Event::Text(text) => match self.blocks.last_mut() {
                 Some(Block::Text(existing)) => existing.push_str(&text),
@@ -181,11 +238,9 @@ impl Thread {
             Event::Tool { id, patch } => {
                 // Ids are only unique within a session, and a restored thread may
                 // be on a new one; only this turn's calls can be the same call.
-                let existing = self
-                    .blocks
+                let existing = self.blocks[self.turn_start..]
                     .iter_mut()
                     .rev()
-                    .take_while(|b| !matches!(b, Block::User(_)))
                     .find_map(|b| match b {
                         Block::Tool(t) if t.id == id => Some(t),
                         _ => None,
@@ -266,11 +321,31 @@ impl Thread {
                         ThreadState::Failed
                     }
                 };
+                self.advance_follow_ups();
+            }
+            Event::SteerEnded(result) => {
+                let Some((index, mut message)) = self.pending_steer.take() else { return };
+                match result {
+                    Ok(SteerOutcome::Injected) => {}
+                    Ok(SteerOutcome::PromptRequired) => {
+                        self.blocks.remove(index);
+                        message.steer = false;
+                        self.queued.push_front(message);
+                    }
+                    Ok(SteerOutcome::StartedNewTurn) => {
+                        self.notice("The adapter started a separate turn for this message.");
+                    }
+                    Ok(SteerOutcome::Failed) => self.notice("The agent could not apply the steering message."),
+                    Err(error) => self.notice(format!("Steering failed: {error}")),
+                }
+                self.advance_follow_ups();
             }
             Event::Closed(reason) => {
-                let interrupted = self.state.busy() || !self.ready;
+                let interrupted = self.is_active() || !self.ready;
                 self.session = None;
                 self.ready = false;
+                self.supports_steering = false;
+                self.pending_steer = None;
                 self.dismiss_permissions();
                 self.settle_tools();
                 if reason.is_some() || interrupted {
@@ -297,6 +372,7 @@ impl Thread {
             self.notice("Interrupted when Chat closed.");
             self.state = ThreadState::Idle;
         }
+        self.turn_start = self.blocks.len();
     }
 
     /// Every file the agent's finished edits touched, in the order first touched.
@@ -447,9 +523,9 @@ mod tests {
     fn a_reused_tool_id_in_a_later_turn_is_a_new_call() {
         let mut t = Thread::new(1, 0);
         let read = |status| Event::Tool { id: "1".into(), patch: ToolPatch { title: Some("read".into()), status: Some(status), ..Default::default() } };
-        t.blocks.push(Block::User("one".into()));
+        t.prompt("one", "one".into());
         t.apply(read(Status::Done));
-        t.blocks.push(Block::User("two".into()));
+        t.prompt("two", "two".into());
         t.apply(read(Status::Running));
         let tools: Vec<_> = t.blocks.iter().filter_map(|b| if let Block::Tool(c) = b { Some(c.status) } else { None }).collect();
         assert_eq!(tools, [Status::Done, Status::Running]);
@@ -491,5 +567,62 @@ mod tests {
         t.apply(Event::Closed(None));
         assert!(t.state == ThreadState::Failed && !t.ready && t.problem.is_some());
         assert!(matches!(&t.blocks[0], Block::Permission(p) if p.chosen.is_some()));
+    }
+
+    #[test]
+    fn a_steer_keeps_the_current_turns_permission_and_tool_call() {
+        let mut t = Thread::new(1, 0);
+        t.ready = true;
+        t.supports_steering = true;
+        t.submit("initial", "initial".into(), true);
+        t.apply(edit("x", Status::Running, "old", "new"));
+        t.apply(Event::Permission { id: 1, tool: "x".into(), title: "Edit".into(), answers: Vec::new() });
+        t.submit("adjust", "adjust".into(), true);
+        assert!(t.pending_steer.is_some());
+        t.apply(Event::SteerEnded(Ok(SteerOutcome::Injected)));
+        assert!(t.pending_steer.is_none());
+        assert!(t.state == ThreadState::Waiting);
+        assert!(matches!(&t.blocks[2], Block::Permission(p) if p.chosen.is_none()));
+        t.apply(edit("x", Status::Done, "old", "new"));
+        assert!(matches!(&t.blocks[1], Block::Tool(call) if call.status == Status::Done));
+        assert!(matches!(&t.blocks[3], Block::User(text) if text.as_ref() == "adjust"));
+        t.apply(Event::TurnEnded(Ok(Stop::Finished)));
+        assert!(t.state == ThreadState::Done);
+    }
+
+    #[test]
+    fn a_late_steer_becomes_one_prompt_after_the_running_turn_finishes() {
+        for reply_first in [true, false] {
+            let mut t = Thread::new(1, 0);
+            t.ready = true;
+            t.supports_steering = true;
+            t.submit("initial", "initial".into(), true);
+            t.submit("first", "first".into(), true);
+            t.submit("second", "second".into(), false);
+            let ended = Event::TurnEnded(Ok(Stop::Finished));
+            let fallback = Event::SteerEnded(Ok(SteerOutcome::PromptRequired));
+            let (first, second) = if reply_first { (fallback, ended) } else { (ended, fallback) };
+            t.apply(first);
+            assert_eq!(t.turn_start, 0);
+            t.apply(second);
+            assert!(t.state == ThreadState::Running);
+            assert!(matches!(&t.blocks[1], Block::User(text) if text.as_ref() == "first"));
+            assert_eq!(t.queued.len(), 1);
+            t.apply(Event::TurnEnded(Ok(Stop::Finished)));
+            assert!(matches!(&t.blocks[2], Block::User(text) if text.as_ref() == "second"));
+            assert!(t.queued.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_follow_up_queues_when_the_agent_does_not_support_steering() {
+        let mut t = Thread::new(1, 0);
+        t.ready = true;
+        t.submit("initial", "initial".into(), false);
+        t.submit("follow-up", "follow-up".into(), true);
+        assert!(t.pending_steer.is_none());
+        assert_eq!(t.queued.len(), 1);
+        t.apply(Event::TurnEnded(Ok(Stop::Finished)));
+        assert!(matches!(&t.blocks[1], Block::User(text) if text.as_ref() == "follow-up"));
     }
 }

@@ -7,12 +7,105 @@ use crate::{
     menu::{Entry, Item},
     model::{Permission, ToolCall},
 };
-use gpui_component::{Icon, IconName, input::Input, tooltip::Tooltip};
+use gpui_component::{Icon, IconName, Rope, input::{DocumentColorProvider, Input}, tooltip::Tooltip};
+use lsp_types::{Color, ColorInformation, Position, Range};
 
 /// The transcript and composer share one readable column.
 const COLUMN: f32 = 760.;
 /// How much of a tool's output an opened tool call shows: the end, where results are.
 const TOOL_OUTPUT_LINES: usize = 200;
+/// Word joiner is zero-width but survives ordinary editing and copying, so it
+/// can bind a visible basename to its full path without showing that path.
+const FILE_MARKER: &str = "\u{2060}";
+
+/// Agent thought updates often arrive as short lines separated by blank lines.
+/// Empty lines are spacing, not another selectable update.
+fn thought_lines(text: &str) -> Vec<SharedString> {
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| SharedString::from(line.to_string()))
+        .collect::<Vec<_>>();
+    if lines.is_empty() { vec![SharedString::default()] } else { lines }
+}
+
+fn dropped_path(path: &Path, root: Option<&Path>) -> String {
+    let shown = root
+        .and_then(|root| path.strip_prefix(root).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(path);
+    format!("@{}", shown.to_string_lossy())
+}
+
+fn file_mention(path: &Path, root: Option<&Path>) -> FileMention {
+    let label = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+    // Non-breaking spaces supply the horizontal padding inside the highlight.
+    let token = format!("{FILE_MARKER}\u{a0}{label}\u{a0}{FILE_MARKER}");
+    FileMention { token, label, path: dropped_path(path, root) }
+}
+
+fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>) -> String {
+    let added = paths.paths().iter().map(|path| file_mention(path, root)).collect::<Vec<_>>();
+    let mut text = added.iter().map(|mention| mention.token.as_str()).collect::<Vec<_>>().join(" ");
+    mentions.extend(added);
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text
+}
+
+pub(super) fn replace_file_mentions(text: &str, mentions: &[FileMention], paths: bool) -> String {
+    let mut text = text.to_string();
+    for mention in mentions {
+        text = text.replacen(&mention.token, if paths { &mention.path } else { &mention.label }, 1);
+    }
+    // If a token was partially edited, do not leak its invisible delimiters.
+    text.replace(FILE_MARKER, "")
+}
+
+fn position(text: &str, offset: usize) -> Position {
+    let before = &text[..offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let column = before.rsplit_once('\n').map_or(before, |(_, line)| line).encode_utf16().count() as u32;
+    Position::new(line, column)
+}
+
+/// Uses the input's document-color hook to paint dropped basenames like inline
+/// chips. The full path never enters the rendered text.
+pub(super) struct FileMentionColors(Rc<RefCell<Vec<FileMention>>>);
+
+impl FileMentionColors {
+    pub(super) fn new(mentions: Rc<RefCell<Vec<FileMention>>>) -> Self {
+        Self(mentions)
+    }
+}
+
+impl DocumentColorProvider for FileMentionColors {
+    fn document_colors(&self, text: &Rope, _: &mut Window, cx: &mut App) -> Task<anyhow::Result<Vec<ColorInformation>>> {
+        let text = text.to_string();
+        let color = palette(cx).hover;
+        let color = Color {
+            red: ((color >> 16) & 0xff) as f32 / 255.,
+            green: ((color >> 8) & 0xff) as f32 / 255.,
+            blue: (color & 0xff) as f32 / 255.,
+            alpha: 1.,
+        };
+        let mut colors = Vec::new();
+        let mut seen = HashSet::new();
+        for mention in self.0.borrow().iter() {
+            if !seen.insert(mention.token.clone()) {
+                continue;
+            }
+            for (start, _) in text.match_indices(&mention.token) {
+                let start = start + FILE_MARKER.len();
+                let end = start + mention.token.len() - FILE_MARKER.len() * 2;
+                colors.push(ColorInformation { range: Range::new(position(&text, start), position(&text, end)), color });
+            }
+        }
+        Task::ready(Ok(colors))
+    }
+}
 
 /// A quiet control in the composer's footer: glyph and current value.
 fn option(colors: Palette, id: &'static str, glyph: impl Into<Icon>, text: impl Into<SharedString>, tip: &'static str) -> Stateful<Div> {
@@ -49,6 +142,19 @@ fn choices(setting: &Setting, weak: WeakEntity<Workspace>) -> Vec<Entry> {
 }
 
 impl Workspace {
+    fn insert_dropped_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.current_project().path.as_deref();
+        let text = dropped_paths(paths, root, &mut self.file_mentions.borrow_mut());
+        if text.is_empty() {
+            return;
+        }
+        self.composer.update(cx, |input, cx| {
+            // No range means the active selection, or the caret when it is empty.
+            input.replace_text_in_range(None, &text, window, cx);
+            input.focus(window, cx);
+        });
+    }
+
     fn user_block(&self, colors: Palette, text: &SharedString) -> Div {
         div()
             .mt_2()
@@ -60,6 +166,65 @@ impl Workspace {
             .bg(rgb(colors.panel))
             .line_height(relative(1.5))
             .child(text.clone())
+    }
+
+    fn queued_block(&self, colors: Palette, text: &SharedString) -> Div {
+        col()
+            .mt_2()
+            .px_3()
+            .py(px(9.))
+            .gap_1()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.panel))
+            .child(div().text_size(px(11.)).text_color(rgb(colors.quiet)).child("Queued"))
+            .child(div().line_height(relative(1.5)).child(text.clone()))
+    }
+
+    /// Thought progress stays one row tall. Each short vertical marker stands
+    /// for one update; hovering a marker makes its update the persistent one.
+    fn thought_block(&self, colors: Palette, thread: usize, block: usize, text: &str, cx: &mut Context<Self>) -> Div {
+        let lines = thought_lines(text);
+        let key = (thread, block);
+        let selected = self
+            .thought_selection
+            .get(&key)
+            .copied()
+            .unwrap_or(lines.len() - 1)
+            .min(lines.len() - 1);
+        let mut markers = row().h(px(16.)).gap(px(2.)).flex_shrink_0();
+        for i in 0..lines.len() {
+            markers = markers.child(
+                row()
+                    .id(SharedString::from(format!("thought-{thread}-{block}-{i}")))
+                    .w(px(5.))
+                    .h_full()
+                    .justify_center()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .w(px(2.))
+                            .h_full()
+                            .rounded_full()
+                            .bg(rgb(if i == selected { colors.muted } else { colors.border })),
+                    )
+                    .on_mouse_move(cx.listener(move |s, _, _, cx| {
+                        if s.thought_selection.get(&key).copied() != Some(i) {
+                            s.thought_selection.insert(key, i);
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        row()
+            .h(px(25.))
+            .gap(px(8.))
+            .items_center()
+            .text_size(px(12.5))
+            .text_color(rgb(colors.muted))
+            .child(markers)
+            .child(one_line(lines[selected].clone(), 19.).flex_1().min_w_0())
     }
 
     /// A file path as a mono name and a quiet folder, relative to the project:
@@ -350,7 +515,23 @@ impl Workspace {
         let mode = setting(Role::Mode, "mode", "mode-button", Glyph::ShieldCheck.into(), Corner::BottomLeft, "How much the agent may do before asking", cx);
         let model = setting(Role::Model, "model", "model-button", Glyph::Sparkle.into(), Corner::BottomRight, "Model", cx);
         let effort = setting(Role::Effort, "effort", "effort-button", Glyph::Gauge.into(), Corner::BottomRight, "Reasoning effort", cx);
-        // While the agent works the button stops it; one turn runs at a time.
+        let follow_up = self.settings.follow_up_mode;
+        let supports_steering = thread.supports_steering;
+        let stop = busy.then(|| {
+            row()
+                .id("stop")
+                .size(px(26.))
+                .ml_1()
+                .flex_shrink_0()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(colors.text))
+                .text_color(rgb(colors.background))
+                .cursor_pointer()
+                .child(icon(Glyph::Stop).size(px(12.)))
+                .tooltip(|w, cx| Tooltip::new("Stop · esc").build(w, cx))
+                .on_click(cx.listener(|s, _, _, cx| s.stop(cx)))
+        });
         let send = row()
             .id("send")
             .size(px(26.))
@@ -359,23 +540,34 @@ impl Workspace {
             .justify_center()
             .rounded_full()
             .map(|s| {
-                if busy {
-                    s.bg(rgb(colors.text)).text_color(rgb(colors.background)).cursor_pointer()
-                } else if empty {
+                if empty {
                     s.bg(rgb(colors.hover)).text_color(rgb(colors.quiet))
                 } else {
                     s.bg(rgb(colors.blue)).text_color(rgb(colors.primary_text)).cursor_pointer()
                 }
             })
-            .child(if busy { icon(Glyph::Stop).size(px(12.)) } else { icon(IconName::ArrowUp) })
-            .tooltip(move |w, cx| Tooltip::new(if busy { "Stop · esc" } else { "Send · ⌘ ↵" }).build(w, cx))
-            .on_click(cx.listener(move |s, _, w, cx| if busy { s.stop(cx) } else { s.submit(&Submit, w, cx) }));
+            .child(icon(IconName::ArrowUp))
+            .tooltip(move |w, cx| {
+                let tip = if !busy {
+                    "Send · ↵"
+                } else if follow_up == FollowUpMode::Queue || !supports_steering {
+                    "Queue message · ↵"
+                } else {
+                    "Steer agent · ↵"
+                };
+                Tooltip::new(tip).build(w, cx)
+            })
+            .on_click(cx.listener(|s, _, w, cx| s.submit(&Submit, w, cx)));
         let composer = col()
             .rounded(px(10.))
             .border_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.panel))
-            .child(div().px_1().pt_1().child(Input::new(&self.composer).appearance(false)))
+            .drag_over::<ExternalPaths>(move |s, _, _, _| s.border_color(rgb(colors.blue)))
+            .on_drop(cx.listener(|s, paths: &ExternalPaths, window, cx| {
+                s.insert_dropped_paths(paths, window, cx);
+            }))
+            .child(div().key_context("Composer").px_1().pt_1().child(Input::new(&self.composer).appearance(false)))
             .child(
                 row()
                     .h(px(36.))
@@ -389,6 +581,7 @@ impl Workspace {
                     .child(agent)
                     .children(model)
                     .children(effort)
+                    .children(stop)
                     .child(send),
             );
         self.with_command_menu(composer, colors, window, cx)
@@ -417,14 +610,7 @@ impl Workspace {
                     mono(),
                     px(crate::theme::MONO_SIZE),
                 )),
-                Block::Thought(text) => div()
-                    .pl_3()
-                    .border_l_2()
-                    .border_color(rgb(colors.border))
-                    .text_size(px(12.5))
-                    .text_color(rgb(colors.muted))
-                    .line_height(relative(1.5))
-                    .child(text.trim().to_string()),
+                Block::Thought(text) => self.thought_block(colors, thread.id, i, text, cx),
                 Block::Tool(tool) => self.tool_block(window, colors, thread.id, i, tool, cx),
                 Block::Permission(permission) => self.permission_block(colors, permission, cx),
                 Block::Notice(text) => row()
@@ -436,6 +622,9 @@ impl Workspace {
                     .child(row().h(px(19.)).child(icon(IconName::Info).size(px(13.)).text_color(rgb(colors.quiet))))
                     .child(div().flex_1().min_w_0().line_height(relative(1.5)).child(text.clone())),
             });
+        }
+        for queued in &thread.queued {
+            list = list.child(self.queued_block(colors, &queued.shown));
         }
         if thread.state == ThreadState::Running {
             list = list.child(
@@ -497,5 +686,32 @@ impl Workspace {
                 ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_mention, replace_file_mentions, thought_lines};
+    use std::path::Path;
+
+    #[test]
+    fn dropped_project_file_shows_only_its_name_and_sends_its_path() {
+        let mention = file_mention(Path::new("/project/src/main.rs"), Some(Path::new("/project")));
+        assert!(!mention.token.contains("src/"));
+        assert!(mention.token.contains("main.rs"));
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], false), "main.rs");
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], true), "@src/main.rs");
+    }
+
+    #[test]
+    fn dropped_external_file_sends_its_absolute_path() {
+        let mention = file_mention(Path::new("/tmp/example.txt"), Some(Path::new("/project")));
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], true), "@/tmp/example.txt");
+    }
+
+    #[test]
+    fn thought_updates_ignore_spacing_lines() {
+        let lines = thought_lines("Planning\n\n  Designing  \n\r\nRefining\n");
+        assert_eq!(lines, ["Planning", "Designing", "Refining"]);
     }
 }

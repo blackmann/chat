@@ -11,6 +11,7 @@ use gpui_component::{
     IconName, Sizable,
     button::{Button, ButtonVariants},
     kbd::Kbd,
+    radio::Radio,
 };
 
 /// Monospace families worth offering first, where installed.
@@ -125,6 +126,31 @@ impl Workspace {
         cx.notify();
     }
 
+    fn set_follow_up_mode(&mut self, mode: FollowUpMode, cx: &mut Context<Self>) {
+        self.settings.follow_up_mode = mode;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    fn follow_up_picker(&self, cx: &mut Context<Self>) -> Div {
+        let mode = self.settings.follow_up_mode;
+        row()
+            .w(px(CONTROL))
+            .gap_4()
+            .child(
+                Radio::new("follow-up-queue")
+                    .label("Queue")
+                    .checked(mode == FollowUpMode::Queue)
+                    .on_click(cx.listener(|s, _, _, cx| s.set_follow_up_mode(FollowUpMode::Queue, cx))),
+            )
+            .child(
+                Radio::new("follow-up-steer")
+                    .label("Steer")
+                    .checked(mode == FollowUpMode::Steer)
+                    .on_click(cx.listener(|s, _, _, cx| s.set_follow_up_mode(FollowUpMode::Steer, cx))),
+            )
+    }
+
     /// The menu for one font: a default, suggestions that are installed, then everything.
     fn font_menu(&self, role: FontRole, weak: WeakEntity<Workspace>, cx: &App) -> Vec<MenuEntry> {
         let names = self.font_names.get_or_init(|| {
@@ -237,7 +263,7 @@ impl Workspace {
         let customised = self.settings.ui_font.is_some() || self.settings.mono_font.is_some();
         let page = col()
             .w(px(PAGE))
-            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Appearance"))
+            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
             .child(group(colors, "Fonts"))
             .child(setting(
                 colors,
@@ -261,7 +287,14 @@ impl Workspace {
                         })),
                     )
                 }),
-            );
+            )
+            .child(group(colors, "Messages"))
+            .child(setting(
+                colors,
+                "While the agent is working",
+                "Queue waits for the current turn to finish. Steer sends the message to the running turn when the agent supports it.",
+                self.follow_up_picker(cx),
+            ));
         div()
             .id("prefs-scrim")
             .absolute()

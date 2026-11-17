@@ -5,6 +5,17 @@ pub use crate::agent::AgentSpec;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// What sending another message does while the agent is still working.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowUpMode {
+    /// Hold the message until the current turn finishes.
+    #[default]
+    Queue,
+    /// Deliver the message to the running turn immediately.
+    Steer,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -16,6 +27,8 @@ pub struct Settings {
     /// Interface and code fonts by family name; unset means the default.
     pub ui_font: Option<String>,
     pub mono_font: Option<String>,
+    /// How messages sent during a running turn are delivered.
+    pub follow_up_mode: FollowUpMode,
 }
 
 /// Where settings live; `CHAT_CONFIG_DIR` overrides it, for trying things out.
@@ -54,5 +67,23 @@ impl Settings {
         let dir = dir().unwrap_or_else(std::env::temp_dir).join("scratch");
         let _ = std::fs::create_dir_all(&dir);
         dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_default_to_queue_mode() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.follow_up_mode, FollowUpMode::Queue);
+    }
+
+    #[test]
+    fn follow_up_mode_round_trips() {
+        let settings = Settings { follow_up_mode: FollowUpMode::Steer, ..Default::default() };
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.follow_up_mode, FollowUpMode::Steer);
     }
 }

@@ -942,6 +942,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "lsp-types",
  "markdown",
  "serde",
  "serde_json",

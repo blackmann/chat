@@ -7,6 +7,7 @@ mod md;
 mod panes;
 mod preferences;
 mod side;
+mod git_panel;
 mod syntax;
 mod terminal;
 pub use terminal::init_terminal_keys;
@@ -17,7 +18,7 @@ use crate::{
     store,
     menu::{self as popover, Menu},
     model::{Block, Project, Session, Thread, ThreadState, tilde},
-    settings::Settings,
+    settings::{FollowUpMode, Settings},
     theme::{Palette, mono, palette},
 };
 use futures::StreamExt;
@@ -56,6 +57,7 @@ pub enum TabKind {
     Chat,
     File(PathBuf),
     Diff(PathBuf),
+    GitDiff(PathBuf, bool),
     Terminal,
 }
 
@@ -101,6 +103,13 @@ pub struct Entry {
     pub dir: bool,
 }
 
+#[derive(Clone)]
+struct FileMention {
+    token: String,
+    label: String,
+    path: String,
+}
+
 /// Folders that are never worth walking into.
 const SKIPPED: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 /// Agent processes kept running at once. Past this, the least recently shown
@@ -134,6 +143,9 @@ pub struct Workspace {
     views: HashMap<usize, ProjectView>,
     thread_search: Entity<InputState>,
     composer: Entity<InputState>,
+    /// Dropped files displayed as basename chips in the composer. Their paths
+    /// are substituted only in the prompt sent to the agent.
+    file_mentions: Rc<RefCell<Vec<FileMention>>>,
     command_index: usize,
     command_scroll: ScrollHandle,
     commands_dismissed: bool,
@@ -159,24 +171,44 @@ pub struct Workspace {
     instructions: HashMap<Option<PathBuf>, Vec<(PathBuf, &'static str)>>,
     /// Tool calls opened to show their full command and output, by thread and block.
     open_tools: HashSet<(usize, usize)>,
+    /// The last thought line shown in each collapsed thought block. Entries are
+    /// created only after hovering, so a growing block otherwise follows its
+    /// newest line automatically.
+    thought_selection: HashMap<(usize, usize), usize>,
     /// Threads with a running agent, least recently shown first.
     live: Vec<usize>,
     /// A save is already scheduled.
     saving: bool,
+    git_snapshots: HashMap<PathBuf, Result<crate::git::Snapshot, String>>,
+    git_diffs: HashMap<(PathBuf, bool), Result<crate::git::Diff, String>>,
+    git_refreshing: bool,
+    git_busy: bool,
+    git_revision: usize,
+    git_errors: HashMap<PathBuf, String>,
+    thread_changes_only: bool,
+    commit_message: Entity<InputState>,
+    clear_commit_message: Option<String>,
     _quit: Option<Subscription>,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let thread_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search threads…"));
+        let file_mentions = Rc::new(RefCell::new(Vec::new()));
+        let composer_mentions = file_mentions.clone();
         let composer = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
                 .auto_grow(2, 12)
                 .placeholder("Ask for a change, or how something works…")
         });
+        composer.update(cx, |input, _| {
+            input.lsp.document_color_provider = Some(Rc::new(chat::FileMentionColors::new(composer_mentions)));
+        });
         cx.observe(&thread_search, |_, _, cx| cx.notify()).detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+        let commit_message = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 5).placeholder("Commit message…"));
+        cx.observe(&commit_message, |_, _, cx| cx.notify()).detach();
         let settings = Settings::load();
         let mut projects = vec![Project::chats()];
         projects.extend(settings.projects.iter().filter(|p| p.is_dir()).cloned().map(Project::open));
@@ -205,6 +237,7 @@ impl Workspace {
             views: HashMap::new(),
             thread_search,
             composer,
+            file_mentions,
             command_index: 0,
             command_scroll: ScrollHandle::new(),
             commands_dismissed: false,
@@ -223,8 +256,18 @@ impl Workspace {
             font_names: Rc::default(),
             instructions: HashMap::new(),
             open_tools: HashSet::new(),
+            thought_selection: HashMap::new(),
             live: Vec::new(),
             saving: false,
+            git_snapshots: HashMap::new(),
+            git_diffs: HashMap::new(),
+            git_refreshing: false,
+            git_busy: false,
+            git_revision: 0,
+            git_errors: HashMap::new(),
+            thread_changes_only: false,
+            commit_message,
+            clear_commit_message: None,
             _quit: None,
         };
         // Whatever hasn't been written yet is written on the way out.
@@ -239,6 +282,7 @@ impl Workspace {
         } else {
             workspace.select_thread(0, cx);
         }
+        workspace.start_git_poll(cx);
         workspace.observe_command_draft(cx);
         workspace.composer.update(cx, |s, cx| s.focus(window, cx));
         workspace
@@ -383,7 +427,9 @@ impl Workspace {
             return;
         };
         let id = t.id;
-        let (commands, mut events, run) = agent::connect(spec, cwd, t.session_id.clone());
+        // Capture the latest choices before clearing the controls for reconnect.
+        t.picks = t.current_picks();
+        let (commands, mut events, run) = agent::connect(spec, cwd, t.session_id.clone(), t.picks.clone());
         let driver = cx.background_executor().spawn(run);
         let listener = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -393,13 +439,10 @@ impl Workspace {
             }
         });
         t.ready = false;
+        t.supports_steering = false;
         t.problem = None;
         if t.state == ThreadState::Failed && t.blocks.is_empty() {
             t.state = ThreadState::Idle;
-        }
-        // A reconnect puts back the choices made before it.
-        if !t.settings.is_empty() {
-            t.picks = t.current_picks();
         }
         t.settings.clear();
         t.session = Some(Session { commands, _driver: driver, _listener: listener });
@@ -415,7 +458,7 @@ impl Workspace {
             let threads = self.projects.iter_mut().flat_map(|p| &mut p.threads);
             let mut threads: HashMap<usize, &mut Thread> = threads.map(|t| (t.id, t)).collect();
             let victim = self.live.iter().position(|id| {
-                Some(*id) != showing && threads.get(id).is_none_or(|t| !t.state.busy())
+                Some(*id) != showing && threads.get(id).is_none_or(|t| !t.is_active())
             });
             let Some(at) = victim else { break };
             let id = self.live.remove(at);
@@ -426,6 +469,7 @@ impl Workspace {
                 // Dropping the session kills the process; nothing is reported back.
                 t.session = None;
                 t.ready = false;
+                t.supports_steering = false;
                 t.settings.clear();
             }
         }
@@ -536,26 +580,31 @@ impl Workspace {
         }
         cx.notify();
     }
-    /// Send the composer's text as the thread's next turn.
+    /// Send the composer's text, either steering the active turn or queueing a
+    /// follow-up according to the saved preference.
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().trim().to_string();
+        let draft = self.composer.read(cx).value();
+        let mentions = self.file_mentions.borrow();
+        let shown = chat::replace_file_mentions(draft.trim(), &mentions, false);
+        let text = chat::replace_file_mentions(draft.trim(), &mentions, true);
+        drop(mentions);
         let (project, index) = (self.project, self.thread);
-        let Some(thread) = self.current_thread_mut() else {
+        let mode = self.settings.follow_up_mode;
+        let Some(thread) = self.current_thread() else {
             return;
         };
-        // One turn at a time: the agent has to finish or be stopped first.
-        if text.is_empty() || thread.state.busy() {
+        if text.is_empty() {
             return;
         }
-        if thread.blocks.is_empty() {
-            thread.title = text.lines().next().unwrap_or_default().to_string().into();
-        }
-        thread.blocks.push(Block::User(text.clone().into()));
-        thread.state = ThreadState::Running;
         if thread.session.is_none() {
             self.connect(project, index, cx);
         }
-        self.projects[project].threads[index].send(Command::Prompt(text));
+        let thread = &mut self.projects[project].threads[index];
+        if thread.blocks.is_empty() {
+            thread.title = shown.lines().next().unwrap_or_default().to_string().into();
+        }
+        thread.submit(shown, text, mode == FollowUpMode::Steer);
+        self.file_mentions.borrow_mut().clear();
         self.clear_composer = true;
         self.active = 0;
         self.transcript.scroll_to_bottom();
@@ -582,6 +631,7 @@ impl Workspace {
                 self.tabs.len() - 1
             }
         };
+        self.refresh_git(cx);
         self.focus_terminal(cx);
         cx.notify();
     }
@@ -725,6 +775,11 @@ impl Render for Workspace {
         use gpui_component::resizable::{h_resizable, resizable_panel};
         if std::mem::take(&mut self.clear_composer) {
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        if let Some(committed) = self.clear_commit_message.take() {
+            if self.commit_message.read(cx).value().as_ref() == committed {
+                self.commit_message.update(cx, |s, cx| s.set_value("", window, cx));
+            }
         }
         // Instruction files are looked for once per project.
         let root = self.current_project().path.clone();

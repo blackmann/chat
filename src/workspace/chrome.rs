@@ -14,7 +14,7 @@ pub fn tab_glyph(kind: &TabKind) -> Icon {
     match kind {
         TabKind::Chat => Glyph::Message.into(),
         TabKind::File(_) => Glyph::FileCode.into(),
-        TabKind::Diff(_) => Glyph::FileDiff.into(),
+        TabKind::Diff(_) | TabKind::GitDiff(_, _) => Glyph::FileDiff.into(),
         TabKind::Terminal => Glyph::Terminal.into(),
     }
 }
@@ -293,10 +293,17 @@ impl Workspace {
             let group = SharedString::from(format!("tab-{}", t.id));
             let (name, detail) = match &t.kind {
                 TabKind::Chat => ("Chat".to_string(), String::new()),
-                TabKind::File(path) | TabKind::Diff(path) => {
+                TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) => {
                     let relative = self.current_project().relative(path).to_string_lossy().into_owned();
                     let (name, dir) = split_path(&relative);
-                    (name.to_string(), dir.to_string())
+                    let detail = match &t.kind {
+                        TabKind::GitDiff(_, staged) => {
+                            let section = if *staged { "Staged" } else { "Unstaged" };
+                            if dir.is_empty() { section.to_string() } else { format!("{section} · {dir}") }
+                        }
+                        _ => dir.to_string(),
+                    };
+                    (name.to_string(), detail)
                 }
                 TabKind::Terminal => ("Terminal".to_string(), String::new()),
             };
@@ -322,7 +329,7 @@ impl Workspace {
                         }
                     })
                     .child(icon(tab_glyph(&t.kind)).size(px(13.)).text_color(rgb(match (&t.kind, active) {
-                        (TabKind::Diff(_), _) => colors.amber,
+                        (TabKind::Diff(_) | TabKind::GitDiff(_, _), _) => colors.amber,
                         (_, true) => colors.blue,
                         _ => colors.muted,
                     })))
@@ -392,6 +399,7 @@ impl Workspace {
             TabKind::Chat => self.chat_view(window, cx),
             TabKind::File(path) => self.file_view(path.clone(), cx),
             TabKind::Diff(path) => self.diff_view(path.clone(), cx),
+            TabKind::GitDiff(path, staged) => self.git_diff_view(path, *staged, cx),
             TabKind::Terminal => self.terminal_view(cx),
         }
     }

@@ -1,5 +1,6 @@
 mod agent;
 mod icons;
+mod git;
 mod menu;
 mod model;
 mod settings;
@@ -29,7 +30,12 @@ fn main() {
             KeyBinding::new("cmd-2", ShowChanges, None),
             KeyBinding::new("cmd-3", ShowFiles, None),
             KeyBinding::new("ctrl-`", OpenTerminal, None),
-            KeyBinding::new("cmd-enter", Submit, None),
+            KeyBinding::new("enter", Submit, Some("Composer > Input")),
+            KeyBinding::new(
+                "shift-enter",
+                gpui_component::input::Enter { secondary: false },
+                Some("Composer > Input"),
+            ),
             KeyBinding::new("cmd-,", OpenPreferences, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);

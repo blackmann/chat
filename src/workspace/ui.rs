@@ -104,7 +104,8 @@ pub fn one_line(text: impl Into<SharedString>, height: f32) -> Div {
 /// `one_line` with a trailing note in another colour, such as a file's folder.
 /// Both share one line, so the note is what gives way first.
 pub fn line_with_detail(text: impl Into<SharedString>, detail: Option<(SharedString, Hsla)>, height: f32) -> Div {
-    let main: SharedString = text.into();
+    let main = single_line_text(&text.into());
+    let detail = detail.map(|(text, color)| (single_line_text(&text), color));
     div().h(px(height)).child(
         canvas(
             move |bounds, window, cx| {
@@ -128,15 +129,34 @@ pub fn line_with_detail(text: impl Into<SharedString>, detail: Option<(SharedStr
     )
 }
 
+// Normalize before computing run lengths: shape_line rejects newlines, and
+// replacing Unicode separators can change the number of UTF-8 bytes.
+fn single_line_text(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r', '\u{2028}', '\u{2029}'], " ")
+}
+
 /// How wide `text` is in the interface font at `size`, for sizing to content.
 pub fn text_width(window: &Window, text: &str, size: f32) -> Pixels {
     text_width_in(window, text, size, crate::theme::ui_font())
 }
 /// How wide `text` is in `family` at `size`.
 pub fn text_width_in(window: &Window, text: &str, size: f32, family: SharedString) -> Pixels {
+    let text = single_line_text(text);
     let mut run = window.text_style().to_run(text.len());
     run.font.family = family;
     window.text_system().shape_line(text.to_string().into(), px(size), &[run], None).width
+}
+
+#[cfg(test)]
+mod single_line_tests {
+    use super::single_line_text;
+
+    #[test]
+    fn flattens_line_breaks_and_preserves_unicode() {
+        assert_eq!(single_line_text("hello\r\n世界\n🙂\rnext\u{2028}line\u{2029}end"), "hello 世界 🙂 next line end");
+        assert_eq!(single_line_text(""), "");
+        assert_eq!(single_line_text("  café\t🙂  "), "  café\t🙂  ");
+    }
 }
 
 pub fn spinner(colors: Palette) -> Spinner {

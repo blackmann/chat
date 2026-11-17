@@ -1,5 +1,4 @@
-//! The right panel, tabbed by icon: what the agent has in context, the changes
-//! it has made, and the project's files.
+//! The right panel: agent context, Git changes, and the project's files.
 use super::ui::*;
 use super::*;
 use crate::{agent::Step, icons::Glyph, model::Touch};
@@ -173,50 +172,6 @@ impl Workspace {
             .when(!found.is_empty(), |s| s.child(section(colors, "Instructions", Some(found.len()))).child(instructions))
     }
 
-    fn changes_page(&self, cx: &mut Context<Self>) -> Div {
-        let colors = palette(cx);
-        let changes = self.current_thread().map(|t| t.changes()).unwrap_or_default();
-        if changes.is_empty() {
-            return empty(colors, Glyph::FileDiff, "No changes yet", "Files this thread's agent edits are listed here.").h(px(220.));
-        }
-        let open = match &self.tabs[self.active].kind {
-            TabKind::Diff(path) => Some(path.clone()),
-            _ => None,
-        };
-        let (adds, dels) = changes.iter().fold((0, 0), |(a, d), c| (a + c.adds, d + c.dels));
-        let mut list = col().py_1();
-        for (i, c) in changes.iter().enumerate() {
-            let active = open.as_ref() == Some(&c.path);
-            let path = c.path.clone();
-            list = list.child(
-                item(
-                    colors,
-                    status_mark(colors, c.old.is_none()),
-                    &self.current_project().relative(&c.path).to_string_lossy(),
-                    stat(colors, c.adds as u32, c.dels as u32),
-                )
-                .id(("change", i))
-                .cursor_pointer()
-                .when(active, |s| s.bg(rgb(colors.selected)))
-                .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
-                .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::Diff(path.clone()), cx))),
-            );
-        }
-        col()
-            .child(
-                row()
-                    .h(px(32.))
-                    .px_3()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(rgb(colors.row_border))
-                    .child(label(colors, format!("{} file{}", changes.len(), if changes.len() == 1 { "" } else { "s" })))
-                    .child(div().flex_1())
-                    .child(stat(colors, adds as u32, dels as u32)),
-            )
-            .child(list)
-    }
-
     /// The rows under `dir`, walking into every open folder.
     fn tree_rows(&self, dir: &Path, depth: usize, out: &mut Vec<(usize, Entry)>) {
         for entry in self.listings.get(dir).into_iter().flatten() {
@@ -289,7 +244,7 @@ impl Workspace {
 
     pub(super) fn side_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let has_changes = self.current_thread().is_some_and(|t| !t.changes().is_empty());
+        let has_changes = self.git_snapshot().is_some_and(|s| !s.entries.is_empty());
         let mut strip = row().h(px(BAR)).flex_shrink_0().bg(rgb(colors.chrome));
         for (i, side) in Side::ALL.into_iter().enumerate() {
             let active = self.side == side;
@@ -313,7 +268,7 @@ impl Workspace {
                     })
                     .child(icon(side_glyph(side)))
                     .when(side == Side::Changes && has_changes, |s| {
-                        // The agent has edited files in this thread.
+                        // The repository has staged or unstaged changes.
                         s.child(div().absolute().top(px(8.)).right(px(9.)).size(px(5.)).rounded_full().bg(rgb(colors.amber)))
                     })
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -332,6 +287,16 @@ impl Workspace {
                 .border_color(rgb(colors.border))
                 .child(label(colors, self.side.title())),
         );
+        if self.side == Side::Changes {
+            return col()
+                .size_full()
+                .bg(rgb(colors.chrome))
+                .border_l_1()
+                .border_color(rgb(colors.border))
+                .child(strip)
+                .child(self.changes_page(cx))
+                .into_any_element();
+        }
         let page = match self.side {
             Side::Context => self.context_page(cx),
             Side::Changes => self.changes_page(cx),

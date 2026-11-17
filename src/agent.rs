@@ -3,7 +3,7 @@
 //! only the plain commands and events below, so another transport could feed
 //! the same model.
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, Client, LineDirection,
+    AcpAgent, AcpAgentConfig, Agent, Client, LineDirection, UntypedMessage,
     schema::ProtocolVersion,
     v1::{
         ConnectionTo,
@@ -24,13 +24,16 @@ use futures::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
 
 /// How to start an agent that speaks ACP on its stdio.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,8 +55,16 @@ impl AgentSpec {
     pub fn defaults() -> Vec<Self> {
         vec![
             Self::new("Claude Code", "npx", &["-y", "@agentclientprotocol/claude-agent-acp"]),
-            Self::new("Codex", "npx", &["-y", "@agentclientprotocol/codex-acp"]),
+            Self::new("Codex", "npx", &["-y", CODEX_ACP_PACKAGE]),
         ]
+    }
+
+    fn uses_codex_adapter(&self) -> bool {
+        Path::new(&self.command).file_name() == Some(OsStr::new("codex-acp"))
+            || self.args.iter().any(|arg| {
+                arg == CODEX_ACP_PACKAGE
+                    || arg.strip_prefix(CODEX_ACP_PACKAGE).is_some_and(|suffix| suffix.starts_with('@'))
+            })
     }
 }
 
@@ -160,7 +171,7 @@ pub enum History {
 pub enum Event {
     /// The session is open and can take prompts. `session` is the agent's id
     /// for it, which reopens it later.
-    Ready { agent: String, session: String, history: History, settings: Vec<Setting> },
+    Ready { agent: String, session: String, history: History, settings: Vec<Setting>, supports_steering: bool },
     Text(String),
     Thought(String),
     Tool { id: String, patch: ToolPatch },
@@ -176,6 +187,8 @@ pub enum Event {
     Permission { id: u64, tool: String, title: String, answers: Vec<Answer> },
     /// The turn is over; `Err` carries why it failed.
     TurnEnded(Result<Stop, String>),
+    /// The steering request settled independently of the running turn.
+    SteerEnded(Result<SteerOutcome, String>),
     /// The connection is gone, with the reason if it wasn't asked for.
     Closed(Option<String>),
 }
@@ -189,9 +202,19 @@ pub enum Stop {
     Limit,
 }
 
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "outcome", rename_all = "camelCase")]
+pub enum SteerOutcome {
+    Injected,
+    PromptRequired,
+    StartedNewTurn,
+    Failed,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Prompt(String),
+    Steer(String),
     Cancel,
     Set { setting: String, choice: String },
     /// Answer a permission request; `None` dismisses it.
@@ -205,11 +228,12 @@ pub fn connect(
     spec: AgentSpec,
     cwd: PathBuf,
     previous: Option<String>,
+    picks: Vec<(String, String)>,
 ) -> (UnboundedSender<Command>, UnboundedReceiver<Event>, impl Future<Output = ()> + Send + 'static) {
     let (command_tx, command_rx) = unbounded();
     let (event_tx, event_rx) = unbounded();
     let run = async move {
-        let result = run(spec, cwd, previous, command_rx, event_tx.clone()).await;
+        let result = run(spec, cwd, previous, picks, command_rx, event_tx.clone()).await;
         let _ = event_tx.unbounded_send(Event::Closed(result.err().map(|e| e.to_string())));
     };
     (command_tx, event_rx, run)
@@ -219,12 +243,21 @@ async fn run(
     spec: AgentSpec,
     cwd: PathBuf,
     previous: Option<String>,
+    picks: Vec<(String, String)>,
     mut commands: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) -> Result<(), agent_client_protocol::Error> {
     let mut config = AcpAgentConfig::new(&spec.command).args(spec.args.iter().cloned());
     if let Some(path) = shell_path() {
         config = config.env("PATH", path);
+    }
+    // The adapter forwards CODEX_CONFIG with thread/resume. Restoring the model
+    // through session/set_config_option happens after Codex checks the rollout.
+    if previous.is_some() && spec.uses_codex_adapter() {
+        let inherited = std::env::var_os("CODEX_CONFIG");
+        if let Some(overrides) = codex_resume_config(inherited.as_deref(), &picks) {
+            config = config.env("CODEX_CONFIG", overrides);
+        }
     }
     let mut agent = AcpAgent::new(config);
     if std::env::var_os("CHAT_ACP_LOG").is_some() {
@@ -330,15 +363,20 @@ async fn run(
                 session: session_id.to_string(),
                 history,
                 settings: settings(options.unwrap_or_default(), modes),
+                supports_steering: ready.meta.as_ref()
+                    .and_then(|meta| meta.get("steering"))
+                    .and_then(|steering| steering["supported"].as_bool())
+                    .unwrap_or(false),
             });
             // Long requests run as tasks so commands (cancel above all) keep flowing.
             while let Some(command) = commands.next().await {
                 match command {
                     Command::Prompt(text) => {
                         let request = PromptRequest::new(session_id.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
-                        let (connection, events) = (connection.clone(), events.clone());
-                        connection.clone().spawn(async move {
-                            let result = connection.send_request(request).block_task().await;
+                        let response = connection.send_request(request);
+                        let events = events.clone();
+                        connection.spawn(async move {
+                            let result = response.block_task().await;
                             let _ = events.unbounded_send(Event::TurnEnded(match result {
                                 Ok(response) => Ok(match response.stop_reason {
                                     StopReason::EndTurn => Stop::Finished,
@@ -348,6 +386,22 @@ async fn run(
                                 }),
                                 Err(e) => Err(e.to_string()),
                             }));
+                            Ok(())
+                        })?;
+                    }
+                    Command::Steer(text) => {
+                        let params = serde_json::json!({
+                            "sessionId": session_id,
+                            "prompt": [ContentBlock::Text(TextContent::new(text))],
+                            "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+                        });
+                        let request = UntypedMessage::new("_session/steering", params)?;
+                        let response = connection.send_request(request);
+                        let events = events.clone();
+                        connection.spawn(async move {
+                            let result = response.block_task().await.map_err(|e| e.to_string())
+                                .and_then(|value| serde_json::from_value(value).map_err(|e| e.to_string()));
+                            let _ = events.unbounded_send(Event::SteerEnded(result));
                             Ok(())
                         })?;
                     }
@@ -390,6 +444,19 @@ async fn run(
 }
 
 const LEGACY_MODE: &str = "\0mode";
+
+fn codex_resume_config(inherited: Option<&OsStr>, picks: &[(String, String)]) -> Option<String> {
+    let (_, model) = picks.iter().find(|(id, value)| id == "model" && !value.is_empty())?;
+    let mut config: serde_json::Map<String, serde_json::Value> = match inherited {
+        Some(value) if !value.is_empty() => serde_json::from_str(value.to_str()?).ok()?,
+        _ => serde_json::Map::new(),
+    };
+    config.insert("model".into(), model.as_str().into());
+    if let Some((_, effort)) = picks.iter().find(|(id, value)| id == "reasoning_effort" && !value.is_empty()) {
+        config.insert("model_reasoning_effort".into(), effort.as_str().into());
+    }
+    Some(serde_json::Value::Object(config).to_string())
+}
 
 fn settings(options: Vec<SessionConfigOption>, modes: Option<SessionModeState>) -> Vec<Setting> {
     let mut out: Vec<Setting> = options
@@ -555,7 +622,28 @@ mod tests {
     use super::*;
     use futures::executor::block_on;
 
-    /// Drive the stand-in agent through a whole turn, including a mid-thread model switch.
+    #[test]
+    fn codex_resume_uses_the_saved_model_and_effort_with_existing_config() {
+        let picks = vec![
+            ("model".into(), "gpt-6.1-sol".into()),
+            ("reasoning_effort".into(), "high".into()),
+            ("mode".into(), "auto-review".into()),
+        ];
+        let inherited = OsStr::new(r#"{"model":"gpt-5.6-sol","model_reasoning_effort":"low","approval_policy":"on-request"}"#);
+        let config = codex_resume_config(Some(inherited), &picks).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&config).unwrap(),
+            serde_json::json!({
+                "model": "gpt-6.1-sol",
+                "model_reasoning_effort": "high",
+                "approval_policy": "on-request",
+            }),
+        );
+        assert!(codex_resume_config(None, &picks[1..]).is_none());
+        assert!(codex_resume_config(Some(OsStr::new("invalid JSON")), &picks).is_none());
+    }
+
+    /// Drive the stand-in agent through a model switch and a steer during a permission request.
     #[test]
     fn talks_to_the_mock_agent() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mock-agent.py");
@@ -563,17 +651,18 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), None);
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), None, Vec::new());
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
 
         // Commands can be announced as the session opens, before or after Ready.
-        let Event::Ready { agent, settings, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()
+        let Event::Ready { agent, settings, history, supports_steering, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()
         else {
             panic!("expected Ready first")
         };
         assert_eq!(history, History::New);
         assert_eq!(agent, "Mock Agent");
+        assert!(supports_steering);
         assert_eq!(settings.iter().map(|s| s.role).collect::<Vec<_>>(), [Role::Mode, Role::Model, Role::Effort]);
 
         commands.unbounded_send(Command::Set { setting: "model".into(), choice: "small".into() }).unwrap();
@@ -589,11 +678,18 @@ mod tests {
 
         commands.unbounded_send(Command::Prompt("hello".into())).unwrap();
         let (mut said, mut edited, mut planned) = (String::new(), false, false);
+        let mut permission = None;
         loop {
             match next() {
                 Event::Text(t) => said.push_str(&t),
                 Event::Permission { id, answers, .. } => {
                     let allow = answers.iter().find(|a| a.allow).unwrap().id.clone();
+                    permission = Some((id, allow));
+                    commands.unbounded_send(Command::Steer("keep the edit small".into())).unwrap();
+                }
+                Event::SteerEnded(result) => {
+                    assert_eq!(result, Ok(SteerOutcome::Injected));
+                    let (id, allow) = permission.take().expect("the turn should still be waiting");
                     commands.unbounded_send(Command::Answer { id, answer: Some(allow) }).unwrap();
                 }
                 Event::Tool { patch, .. } => edited |= patch.diffs.is_some_and(|d| !d.is_empty()),
@@ -607,7 +703,10 @@ mod tests {
             }
         }
         assert!(said.contains("Running on `small`"), "{said}");
+        assert!(said.contains("Steered: keep the edit small"), "{said}");
         assert!(edited && planned);
+        commands.unbounded_send(Command::Steer("arrived late".into())).unwrap();
+        assert_eq!(next(), Event::SteerEnded(Ok(SteerOutcome::PromptRequired)));
     }
 
     /// Reopening a session keeps it, and its replay never reaches the thread.
@@ -618,7 +717,7 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Some("mock-7".into()));
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Some("mock-7".into()), Vec::new());
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
         let Event::Ready { session, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()
