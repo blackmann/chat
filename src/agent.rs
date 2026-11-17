@@ -3,7 +3,7 @@
 //! only the plain commands and events below, so another transport could feed
 //! the same model.
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, Client, LineDirection, UntypedMessage,
+    AcpAgent, AcpAgentConfig, Agent, Client, ErrorCode, LineDirection, UntypedMessage,
     schema::ProtocolVersion,
     v1::{
         ConnectionTo,
@@ -72,6 +72,28 @@ impl AgentSpec {
             }
         }
         None
+    }
+
+    /// The command that signs this agent in from a terminal, for the adapters
+    /// Chat knows. Claude Code's adapter carries its own CLI; Codex has its own.
+    fn sign_in(&self) -> Option<String> {
+        if self.uses_claude_adapter() {
+            Some(format!("npx -y {CLAUDE_ACP_PACKAGE} --cli auth login"))
+        } else if self.uses_codex_adapter() {
+            Some("npx -y @openai/codex login".into())
+        } else {
+            None
+        }
+    }
+
+    /// An agent that needs signing in says only "Authentication required";
+    /// that one is told apart so the thread can say what to do about it.
+    fn failure(&self, error: agent_client_protocol::Error) -> Failure {
+        if error.code == ErrorCode::AUTH_REQUIRED {
+            Failure::SignedOut { agent: self.name.clone(), command: self.sign_in() }
+        } else {
+            Failure::Other(error.to_string())
+        }
     }
 
     fn uses_claude_adapter(&self) -> bool {
@@ -190,6 +212,14 @@ pub enum History {
     Lost,
 }
 
+/// Why a turn or a connection failed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Failure {
+    /// The agent isn't signed in. `command` signs it in from a terminal, when Chat knows one.
+    SignedOut { agent: String, command: Option<String> },
+    Other(String),
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Event {
     /// The session is open and can take prompts. `session` is the agent's id
@@ -209,11 +239,11 @@ pub enum Event {
     /// The agent wants a decision before it goes on.
     Permission { id: u64, tool: String, title: String, answers: Vec<Answer> },
     /// The turn is over; `Err` carries why it failed.
-    TurnEnded(Result<Stop, String>),
+    TurnEnded(Result<Stop, Failure>),
     /// The steering request settled independently of the running turn.
     SteerEnded(Result<SteerOutcome, String>),
     /// The connection is gone, with the reason if it wasn't asked for.
-    Closed(Option<String>),
+    Closed(Option<Failure>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,8 +287,8 @@ pub fn connect(
     let (command_tx, command_rx) = unbounded();
     let (event_tx, event_rx) = unbounded();
     let run = async move {
-        let result = run(spec, cwd, extra, previous, picks, command_rx, event_tx.clone()).await;
-        let _ = event_tx.unbounded_send(Event::Closed(result.err().map(|e| e.to_string())));
+        let result = run(spec.clone(), cwd, extra, previous, picks, command_rx, event_tx.clone()).await;
+        let _ = event_tx.unbounded_send(Event::Closed(result.err().map(|e| spec.failure(e))));
     };
     (command_tx, event_rx, run)
 }
@@ -389,7 +419,7 @@ async fn run(
                 }
             };
             let _ = events.unbounded_send(Event::Ready {
-                agent: ready.agent_info.map(|i| i.title.unwrap_or(i.name)).unwrap_or(spec.name),
+                agent: ready.agent_info.map(|i| i.title.unwrap_or(i.name)).unwrap_or_else(|| spec.name.clone()),
                 session: session_id.to_string(),
                 history,
                 settings: settings(options.unwrap_or_default(), modes),
@@ -404,7 +434,7 @@ async fn run(
                     Command::Prompt(text) => {
                         let request = PromptRequest::new(session_id.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
                         let response = connection.send_request(request);
-                        let events = events.clone();
+                        let (events, spec) = (events.clone(), spec.clone());
                         connection.spawn(async move {
                             let result = response.block_task().await;
                             let _ = events.unbounded_send(Event::TurnEnded(match result {
@@ -414,7 +444,7 @@ async fn run(
                                     StopReason::Refusal => Stop::Refused,
                                     _ => Stop::Limit,
                                 }),
-                                Err(e) => Err(e.to_string()),
+                                Err(e) => Err(spec.failure(e)),
                             }));
                             Ok(())
                         })?;
@@ -675,6 +705,19 @@ mod tests {
 
     /// Drive the stand-in agent through a model switch and a steer during a permission request.
     #[test]
+    fn a_signed_out_agent_is_told_apart_with_its_sign_in_command() {
+        let [claude, codex] = AgentSpec::defaults().try_into().unwrap();
+        let refused = || agent_client_protocol::Error::from(ErrorCode::AUTH_REQUIRED);
+        let Failure::SignedOut { agent, command } = claude.failure(refused()) else { panic!() };
+        assert_eq!((agent.as_str(), command.as_deref()), ("Claude Code", Some("npx -y @agentclientprotocol/claude-agent-acp --cli auth login")));
+        assert!(matches!(codex.failure(refused()), Failure::SignedOut { command: Some(c), .. } if c.contains("codex login")));
+        let other = AgentSpec::new("Mock", "python3", &["mock-agent.py"]);
+        assert_eq!(other.failure(refused()), Failure::SignedOut { agent: "Mock".into(), command: None });
+        let broken = agent_client_protocol::Error::from(ErrorCode::INTERNAL_ERROR);
+        assert!(matches!(claude.failure(broken), Failure::Other(_)));
+    }
+
+    #[test]
     fn talks_to_the_mock_agent() {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mock-agent.py");
         if std::process::Command::new("python3").arg("--version").output().is_err() {
@@ -737,6 +780,9 @@ mod tests {
         assert!(edited && planned);
         commands.unbounded_send(Command::Steer("arrived late".into())).unwrap();
         assert_eq!(next(), Event::SteerEnded(Ok(SteerOutcome::PromptRequired)));
+
+        commands.unbounded_send(Command::Prompt("sign in".into())).unwrap();
+        assert_eq!(next(), Event::TurnEnded(Err(Failure::SignedOut { agent: "Mock".into(), command: None })));
     }
 
     /// Reopening a session keeps it, and its replay never reaches the thread.

@@ -587,6 +587,41 @@ impl Workspace {
         )
     }
 
+    /// An agent that isn't signed in: what is wrong, and the command that fixes
+    /// it in a code block, so it can be copied.
+    fn sign_in_block(&self, colors: Palette, thread: usize, index: usize, agent: &str, command: Option<&str>) -> Div {
+        let steps = match command {
+            Some(_) => "Run this in a terminal (⌃ `), finish signing in in your browser, then send your message again.",
+            None => "Sign in with its own command-line tool, then send your message again.",
+        };
+        row()
+            .items_start()
+            .py(px(4.))
+            .gap_2()
+            .text_size(px(crate::theme::scaled_ui(12.5)))
+            .text_color(rgb(colors.muted))
+            .child(row().h(px(19.)).child(icon(IconName::Info).size(px(13.)).text_color(rgb(colors.quiet))))
+            .child(
+                col()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(6.))
+                    .child(div().line_height(relative(1.5)).child(format!("{agent} isn't signed in. {steps}")))
+                    .children(command.map(|command| {
+                        md::render(
+                            SharedString::from(format!("sign-in-{thread}-{index}")),
+                            &format!("```sh\n{command}\n```"),
+                            md::Breaks::Hard,
+                            colors,
+                            mono(),
+                            px(crate::theme::mono_size()),
+                            Some((self.selection.clone(), index)),
+                            None,
+                        )
+                    })),
+            )
+    }
+
     /// The agent asking before it acts: the question and one button per answer.
     fn permission_block(&self, colors: Palette, permission: &Permission, cx: &mut Context<Self>) -> Div {
         let id = permission.id;
@@ -880,6 +915,7 @@ impl Workspace {
                     .text_color(rgb(colors.muted))
                     .child(row().h(px(19.)).child(icon(IconName::Info).size(px(13.)).text_color(rgb(colors.quiet))))
                     .child(div().flex_1().min_w_0().line_height(relative(1.5)).child(text.clone())),
+                Block::SignIn { agent, command } => self.sign_in_block(colors, thread.id, i, agent, command.as_deref()),
             });
         }
         for (n, queued) in thread.queued.iter().enumerate() {
