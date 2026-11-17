@@ -16,6 +16,19 @@ pub enum FollowUpMode {
     Steer,
 }
 
+/// How a turn's thinking and tool calls show in the transcript.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActivityMode {
+    /// Never shown; edits that open a diff still are.
+    Hidden,
+    /// Shown while the turn runs, then folded into one line at its end.
+    #[default]
+    Summary,
+    /// Always shown in place.
+    Visible,
+}
+
 /// A project on the rail: its main folder (where agents run and threads are
 /// filed), the name it goes by, and any further folders it spans.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -66,6 +79,8 @@ pub struct Settings {
     pub mono_font_size: Option<f32>,
     /// How messages sent during a running turn are delivered.
     pub follow_up_mode: FollowUpMode,
+    /// How thinking and tool calls show in the transcript.
+    pub activity: ActivityMode,
     /// Columns per tab stop in code views; unset means the default (4).
     pub tab_width: Option<usize>,
     /// Whether code views draw indent guides; unset means they do.
@@ -128,6 +143,15 @@ mod tests {
     fn old_settings_default_to_queue_mode() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.follow_up_mode, FollowUpMode::Queue);
+    }
+
+    #[test]
+    fn activity_defaults_to_summary_and_round_trips() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.activity, ActivityMode::Summary);
+        let settings = Settings { activity: ActivityMode::Hidden, ..Default::default() };
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.activity, ActivityMode::Hidden);
     }
 
     #[test]

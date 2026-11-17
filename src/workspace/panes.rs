@@ -59,7 +59,8 @@ type Select<'a> = (&'a WeakEntity<Workspace>, &'a LineSource, Option<std::ops::R
 /// the rows it passes. Picked lines draw as one pill down the gutter with the
 /// `+` at its top, which adds them to the chat.
 fn code_row(colors: Palette, select: Option<&Select>, n: usize) -> Div {
-    let line = row().h(px(LINE)).group("code-line");
+    // Full width, so a flashed or selected line is tinted to the pane's edge.
+    let line = row().w_full().h(px(LINE)).group("code-line");
     let Some((this, source, picked)) = select else {
         return line;
     };

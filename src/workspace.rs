@@ -22,7 +22,7 @@ use crate::{
     store,
     menu::{self as popover, Menu},
     model::{Block, Project, Session, Thread, ThreadState, tilde},
-    settings::{FollowUpMode, Settings},
+    settings::{ActivityMode, FollowUpMode, Settings},
     theme::{Palette, mono, palette},
 };
 use futures::StreamExt;
@@ -199,6 +199,8 @@ pub struct Workspace {
     instructions: HashMap<Option<PathBuf>, Vec<(PathBuf, &'static str)>>,
     /// Tool calls opened to show their full command and output, by thread and block.
     open_tools: HashSet<(usize, usize)>,
+    /// Finished turns whose folded activity is shown, by thread and the turn's closing block.
+    open_summaries: HashSet<(usize, usize)>,
     /// The last thought line shown in each collapsed thought block. Entries are
     /// created only after hovering, so a growing block otherwise follows its
     /// newest line automatically.
@@ -349,6 +351,7 @@ impl Workspace {
             font_names: Rc::default(),
             instructions: HashMap::new(),
             open_tools: HashSet::new(),
+            open_summaries: HashSet::new(),
             thought_selection: HashMap::new(),
             live: Vec::new(),
             saving: false,

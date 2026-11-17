@@ -46,6 +46,10 @@ const SAMPLE: &str = "fn open(&mut self, kind: TabKind) -> usize {\n\t// Focus t
 /// Tab widths offered; anything 1–8 in the settings file is honoured.
 const TAB_WIDTHS: &[usize] = &[2, 4, 8];
 
+/// The choices for how thinking and tool calls show, as the select lists them.
+const ACTIVITY_MODES: &[(ActivityMode, &str)] =
+    &[(ActivityMode::Summary, "Summary"), (ActivityMode::Visible, "Visible"), (ActivityMode::Hidden, "Hidden")];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FontRole {
     Ui,
@@ -280,6 +284,36 @@ impl Workspace {
             )
     }
 
+    fn set_activity(&mut self, mode: ActivityMode, cx: &mut Context<Self>) {
+        self.settings.activity = mode;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    fn activity_picker(&self, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let label = ACTIVITY_MODES.iter().find(|(m, _)| *m == self.settings.activity).map_or("", |(_, n)| *n);
+        self.popover_trigger(
+            "pref-activity",
+            picker(colors, "pref-activity-button", crate::theme::ui_font(), label.into()),
+            Corner::TopRight,
+            CONTROL,
+            None,
+            |s, weak, _| {
+                ACTIVITY_MODES
+                    .iter()
+                    .map(|&(mode, name)| {
+                        let weak = weak.clone();
+                        MenuEntry::Item(Item::new(name).checked(s.settings.activity == mode).on_click(move |_, cx| {
+                            let _ = weak.update(cx, |s, cx| s.set_activity(mode, cx));
+                        }))
+                    })
+                    .collect()
+            },
+            cx,
+        )
+    }
+
     /// The menu for one font: a default, suggestions that are installed, then everything.
     fn font_menu(&self, role: FontRole, weak: WeakEntity<Workspace>, cx: &App) -> Vec<MenuEntry> {
         let names = self.font_names.get_or_init(|| {
@@ -452,6 +486,12 @@ impl Workspace {
                 "While the agent is working",
                 "Queue waits for the current turn to finish. Steer sends the message to the running turn when the agent supports it.",
                 self.follow_up_picker(cx),
+            ))
+            .child(setting(
+                colors,
+                "Thinking and tool calls",
+                "Summary shows them while the agent works, then folds them into one line at the end of the turn. Edits stay listed either way.",
+                self.activity_picker(cx),
             ));
         div()
             .id("prefs-scrim")
