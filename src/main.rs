@@ -1,5 +1,4 @@
 mod agent;
-mod avatar;
 mod icons;
 mod git;
 mod git_watch;

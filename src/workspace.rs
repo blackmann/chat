@@ -239,9 +239,6 @@ pub struct Workspace {
     mention_dismissed: bool,
     /// Code views scrolled sideways, by view: their line numbers stay put.
     sideways: Rc<RefCell<HashMap<SharedString, panes::Sideways>>>,
-    /// Avatar files known to be on disk, and those being downloaded.
-    avatars: HashSet<PathBuf>,
-    avatars_pending: HashSet<PathBuf>,
     /// While a project is dragged along the rail: which one, and the gap it
     /// would drop into, counted as the index of the project below that gap.
     drop_slot: Option<(usize, usize)>,
@@ -357,8 +354,6 @@ impl Workspace {
             mention_scroll: ScrollHandle::new(),
             mention_dismissed: false,
             sideways: Rc::default(),
-            avatars: HashSet::new(),
-            avatars_pending: HashSet::new(),
             drop_slot: None,
             _quit: None,
         };
@@ -373,10 +368,6 @@ impl Workspace {
             workspace.start_thread(cx);
         } else {
             workspace.select_thread(0, cx);
-        }
-        // Avatars picked earlier: fetched again if their files have gone.
-        for (path, avatar) in workspace.projects.iter().filter_map(|p| Some((p.path.clone()?, p.avatar))).collect::<Vec<_>>() {
-            workspace.ensure_avatar(avatar, &path, cx);
         }
         workspace.start_git_watch(window, cx);
         workspace.observe_command_draft(cx);
@@ -522,7 +513,7 @@ impl Workspace {
                     match s.projects.iter().position(|p| p.path.as_deref() == Some(&path)) {
                         Some(existing) => s.select_project(existing, cx),
                         None => {
-                            let entry = crate::settings::ProjectEntry { path, name: None, folders: Vec::new(), avatar: Default::default() };
+                            let entry = crate::settings::ProjectEntry { path, name: None, folders: Vec::new() };
                             let mut project = Project::open(entry);
                             // A folder added back keeps the threads it had.
                             project.threads = store::load(&project, &s.settings.agents, s.settings.agent, &mut s.next_thread);
@@ -578,46 +569,6 @@ impl Workspace {
         }
         self.save_projects();
         self.refresh_git(cx);
-        cx.notify();
-    }
-    /// The file a project's avatar is drawn from, once it is on disk.
-    fn avatar_file(&self, avatar: crate::settings::Avatar, path: &Path) -> Option<PathBuf> {
-        crate::avatar::file(avatar, path).filter(|f| self.avatars.contains(f))
-    }
-    /// Make sure the avatar is on disk, downloading it in the background if not.
-    fn ensure_avatar(&mut self, avatar: crate::settings::Avatar, path: &Path, cx: &mut Context<Self>) {
-        let Some(file) = crate::avatar::file(avatar, path) else { return };
-        if self.avatars.contains(&file) || self.avatars_pending.contains(&file) {
-            return;
-        }
-        if file.is_file() {
-            self.avatars.insert(file);
-            return;
-        }
-        self.avatars_pending.insert(file.clone());
-        let path = path.to_path_buf();
-        cx.spawn(async move |this, cx| {
-            let dest = file.clone();
-            let fetched = cx.background_executor().spawn(async move { crate::avatar::fetch(avatar, &path, &dest) }).await;
-            let _ = this.update(cx, |s, cx| {
-                s.avatars_pending.remove(&file);
-                match fetched {
-                    Ok(()) => {
-                        s.avatars.insert(file);
-                    }
-                    Err(e) => eprintln!("avatar: {e}"),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-    /// Show the project as `avatar` from now on.
-    fn set_avatar(&mut self, index: usize, avatar: crate::settings::Avatar, cx: &mut Context<Self>) {
-        let Some(path) = self.projects.get(index).and_then(|p| p.path.clone()) else { return };
-        self.projects[index].avatar = avatar;
-        self.ensure_avatar(avatar, &path, cx);
-        self.save_projects();
         cx.notify();
     }
     /// Move a project to another place on the rail. Chats stay first.

@@ -45,30 +45,32 @@ fn initials(name: &str) -> String {
     name.chars().take(2).collect::<String>().to_uppercase()
 }
 
-/// A project's colour, from the same seed as its avatar, so it stays put when
-/// projects move.
+/// A project's colour, from its parent folder and name, so it stays put when
+/// projects move. FNV-1a, so it doesn't change between Rust releases.
 fn project_hue(colors: Palette, path: &Path) -> u32 {
-    colors.lane(crate::avatar::hash(path) as usize)
+    let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let key = format!("{}/{}", path.parent().map(name).unwrap_or_default(), name(path));
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    colors.lane(hash as usize)
 }
 
-/// A project's face: its avatar where one is picked and on disk, else its
-/// initials on its colour.
-fn face(name: &str, hue: u32, file: Option<PathBuf>, size: f32, strong: bool) -> AnyElement {
-    match file {
-        Some(file) => img(file).size(px(size)).rounded_full().into_any_element(),
-        None => div()
-            .size(px(size))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(Hsla::from(rgb(hue)).opacity(if strong { 0.24 } else { 0.14 }))
-            .text_color(rgb(hue))
-            .text_size(px(size * 0.4))
-            .font_weight(FontWeight::SEMIBOLD)
-            .child(initials(name))
-            .into_any_element(),
-    }
+/// A project's initials on its colour.
+fn face(name: &str, hue: u32, size: f32) -> Div {
+    div()
+        .size(px(size))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(Hsla::from(rgb(hue)).opacity(0.24))
+        .text_color(rgb(hue))
+        .text_size(px(12.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(initials(name))
 }
 
 /// A project being dragged along the rail, to a new place.
@@ -77,11 +79,10 @@ struct DraggedProject {
     index: usize,
     name: String,
     hue: u32,
-    file: Option<PathBuf>,
 }
 impl Render for DraggedProject {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().opacity(0.85).child(face(&self.name, self.hue, self.file.clone(), 30., true))
+        div().opacity(0.85).child(face(&self.name, self.hue, 34.))
     }
 }
 
@@ -91,12 +92,6 @@ impl Workspace {
     }
     /// What a right-click on a project offers.
     fn project_menu(&mut self, index: usize, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        // The avatar choices are fetched as the menu opens, so they show as it does.
-        if let Some(path) = self.projects.get(index).and_then(|p| p.path.clone()) {
-            for avatar in crate::settings::Avatar::ALL {
-                self.ensure_avatar(avatar, &path, cx);
-            }
-        }
         let weak = cx.weak_entity();
         let build: crate::menu::Builder = Rc::new(move |cx: &App| {
             let Some(this) = weak.upgrade() else { return Vec::new() };
@@ -114,32 +109,6 @@ impl Workspace {
                     let _ = add.update(cx, |s, cx| s.add_folders(index, window, cx));
                 }),
             ));
-            // At the very bottom: how the project shows on the rail.
-            if let Some(path) = project.path.clone() {
-                let colors = palette(cx);
-                let hue = project_hue(colors, &path);
-                let workspace = this.read(cx);
-                let swatches = crate::settings::Avatar::ALL
-                    .into_iter()
-                    .map(|avatar| {
-                        let file = workspace.avatar_file(avatar, &path);
-                        let content = match (avatar.style(), file) {
-                            (None, _) => face(&project.name, hue, None, 24., true),
-                            (Some(_), Some(file)) => face(&project.name, hue, Some(file), 24., true),
-                            // Still downloading, or it couldn't be.
-                            (Some(_), None) => div().size(px(24.)).rounded_full().bg(rgb(colors.hover)).into_any_element(),
-                        };
-                        let pick = weak.clone();
-                        crate::menu::Swatch::new(avatar.label(), content).checked(project.avatar == avatar).on_click(
-                            move |_, cx| {
-                                let _ = pick.update(cx, |s, cx| s.set_avatar(index, avatar, cx));
-                            },
-                        )
-                    })
-                    .collect();
-                entries.push(crate::menu::Entry::Separator);
-                entries.push(crate::menu::Entry::Swatches(swatches));
-            }
             entries
         });
         self.open_popover("project-menu", position, Corner::TopLeft, 200., None, build, window, cx);
@@ -186,7 +155,6 @@ impl Workspace {
         for (i, p) in self.projects.iter().enumerate() {
             let active = self.project == i;
             let hue = p.path.as_deref().map_or(colors.muted, |path| project_hue(colors, path));
-            let file = p.path.as_deref().and_then(|path| self.avatar_file(p.avatar, path));
             // Where a dragged project would land: a dash above this one (gap `i`),
             // or below the last (gap `len`). Gaps either side of the dragged
             // project would leave it where it is, so they show nothing.
@@ -228,7 +196,6 @@ impl Workspace {
                     })
                     .child(
                         div()
-                            .id(("project-face", i))
                             .relative()
                             .size(px(34.))
                             .flex()
@@ -237,22 +204,14 @@ impl Workspace {
                             .rounded_full()
                             .border_2()
                             .border_color(if active { Hsla::from(rgb(colors.blue)) } else { transparent_black() })
+                            .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
                             .text_color(rgb(hue))
-                            .map(|s| match (&p.path, file.clone()) {
-                                // An avatar fills the ring; hovering lifts it a little.
-                                (Some(_), Some(file)) => {
-                                    s.when(!active, |s| s.opacity(0.9).hover(|s| s.opacity(1.))).child(face(&p.name, hue, Some(file), 30., active))
-                                }
-                                (Some(_), None) => s
-                                    .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
-                                    .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
-                                    .text_size(px(12.))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(initials(&p.name)),
-                                (None, _) => s
-                                    .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
-                                    .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
-                                    .child(icon(Glyph::Message).size(px(15.))),
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
+                            .map(|s| match p.path {
+                                Some(_) => s.child(initials(&p.name)),
+                                None => s.child(icon(Glyph::Message).size(px(15.))),
                             })
                             .when(running || review, |s| {
                                 s.child(
@@ -285,7 +244,7 @@ impl Workspace {
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                     .on_click(cx.listener(move |s, _, _, cx| s.select_project(i, cx)))
                     .when(p.path.is_some(), |s| {
-                        let dragged = DraggedProject { index: i, name: p.name.clone(), hue, file: file.clone() };
+                        let dragged = DraggedProject { index: i, name: p.name.clone(), hue };
                         s.on_mouse_down(MouseButton::Right, cx.listener(move |s, e: &MouseDownEvent, window, cx| {
                             s.project_menu(i, e.position, window, cx);
                         }))
