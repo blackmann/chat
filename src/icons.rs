@@ -23,13 +23,21 @@ pub enum Glyph {
     Pencil,
     Plug,
     Brain,
+    RotateCcw,
+    FolderPlus,
+    /// Agent marks, from Zed's icon set; drawn filled rather than stroked.
+    FileJson,
+    FileImage,
+    Braces,
+    Claude,
+    OpenAi,
 }
 
 const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 18] = [
+    pub const ALL: [Glyph; 25] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -48,6 +56,13 @@ impl Glyph {
         Self::Pencil,
         Self::Plug,
         Self::Brain,
+        Self::RotateCcw,
+        Self::FolderPlus,
+        Self::FileJson,
+        Self::FileImage,
+        Self::Braces,
+        Self::Claude,
+        Self::OpenAi,
     ];
     fn file(self) -> &'static str {
         match self {
@@ -69,6 +84,13 @@ impl Glyph {
             Self::Pencil => "pencil.svg",
             Self::Plug => "plug.svg",
             Self::Brain => "brain.svg",
+            Self::RotateCcw => "rotate-ccw.svg",
+            Self::FolderPlus => "folder-plus.svg",
+            Self::FileJson => "file-json.svg",
+            Self::FileImage => "file-image.svg",
+            Self::Braces => "braces.svg",
+            Self::Claude => "claude.svg",
+            Self::OpenAi => "openai.svg",
         }
     }
 }
@@ -125,6 +147,28 @@ fn svg(file: &str) -> Option<&'static str> {
         "brain.svg" => {
             r#"<path d="M12 18V5"/><path d="M15 13a4.17 4.17 0 0 1-3-4 4.17 4.17 0 0 1-3 4"/><path d="M17.598 6.5A3 3 0 1 0 12 5a3 3 0 1 0-5.598 1.5"/><path d="M17.997 5.125a4 4 0 0 1 2.526 5.77"/><path d="M18 18a4 4 0 0 0 2-7.464"/><path d="M19.967 17.483A4 4 0 1 1 12 18a4 4 0 1 1-7.967-.517"/><path d="M6 18a4 4 0 0 1-2-7.464"/><path d="M6.003 5.125a4 4 0 0 0-2.526 5.77"/>"#
         }
+        "rotate-ccw.svg" => r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>"#,
+        "folder-plus.svg" => {
+            r#"<path d="M12 10v6"/><path d="M9 13h6"/><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>"#
+        }
+        "file-json.svg" => {
+            r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 12a1 1 0 0 0-1 1v1a1 1 0 0 1-1 1 1 1 0 0 1 1 1v1a1 1 0 0 0 1 1"/><path d="M14 18a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1 1 1 0 0 1-1-1v-1a1 1 0 0 0-1-1"/>"#
+        }
+        "file-image.svg" => {
+            r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="12" r="2"/><path d="m20 17-1.296-1.296a2.41 2.41 0 0 0-3.408 0L9 22"/>"#
+        }
+        "braces.svg" => {
+            r#"<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1"/><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>"#
+        }
+        _ => return None,
+    })
+}
+
+/// Whole SVG files, served as they are.
+fn file(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "claude.svg" => include_bytes!("../assets/icons/ai_claude.svg"),
+        "openai.svg" => include_bytes!("../assets/icons/ai_open_ai.svg"),
         _ => return None,
     })
 }
@@ -134,6 +178,9 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if let Some(bytes) = path.strip_prefix(PREFIX).and_then(file) {
+            return Ok(Some(Cow::Borrowed(bytes)));
+        }
         if let Some(body) = path.strip_prefix(PREFIX).and_then(svg) {
             return Ok(Some(Cow::Owned(
                 format!(

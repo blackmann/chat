@@ -91,6 +91,8 @@ pub struct Thread {
     /// Setting choices (id, value) to put back once a reopened session is ready,
     /// so a thread keeps the model it was switched to.
     pub picks: Vec<(String, String)>,
+    /// What each setting was when the session opened: the agent's defaults.
+    pub defaults: Vec<(String, String)>,
     /// Index of the current turn's first block. Steering adds user blocks
     /// inside the turn, so the last user block no longer marks its start.
     turn_start: usize,
@@ -133,6 +135,7 @@ impl Thread {
             problem: None,
             session_id: None,
             picks: Vec::new(),
+            defaults: Vec::new(),
             turn_start: 0,
             pending_steer: None,
             queued: VecDeque::new(),
@@ -208,6 +211,7 @@ impl Thread {
             Event::Ready { settings, session, history, supports_steering, .. } => {
                 self.ready = true;
                 self.supports_steering = supports_steering;
+                self.defaults = settings.iter().map(|s| (s.id.clone(), s.current.clone())).collect();
                 self.settings = settings;
                 self.session_id = Some(session);
                 if history == History::Lost && !self.blocks.is_empty() {
@@ -451,35 +455,52 @@ pub struct Project {
     pub name: String,
     /// `None` for regular chats, which aren't tied to a folder.
     pub path: Option<PathBuf>,
-    pub branch: Option<String>,
+    /// Further folders the project spans, beside its main one.
+    pub folders: Vec<PathBuf>,
+    pub avatar: crate::settings::Avatar,
     pub threads: Vec<Thread>,
 }
 impl Project {
     pub fn chats() -> Self {
-        Self { name: "Chats".into(), path: None, branch: None, threads: Vec::new() }
+        Self { name: "Chats".into(), path: None, folders: Vec::new(), avatar: Default::default(), threads: Vec::new() }
     }
-    pub fn open(path: PathBuf) -> Self {
+    pub fn open(entry: crate::settings::ProjectEntry) -> Self {
         Self {
-            name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string()),
-            branch: branch(&path),
-            path: Some(path),
+            name: entry.name.unwrap_or_else(|| folder_name(&entry.path)),
+            path: Some(entry.path),
+            folders: entry.folders,
+            avatar: entry.avatar,
             threads: Vec::new(),
         }
     }
-    /// A path as the project sees it: relative to its root where it can be.
-    pub fn relative<'a>(&self, path: &'a Path) -> &'a Path {
-        self.path.as_deref().and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path)
+    /// How the project is saved; `None` for chats.
+    pub fn entry(&self) -> Option<crate::settings::ProjectEntry> {
+        let path = self.path.clone()?;
+        let name = (self.name != folder_name(&path)).then(|| self.name.clone());
+        Some(crate::settings::ProjectEntry { path, name, folders: self.folders.clone(), avatar: self.avatar })
+    }
+    /// Every folder the project spans, the main one first.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.path.iter().chain(&self.folders).cloned().collect()
+    }
+    /// A path as the project sees it: relative to the root it is under, where it is
+    /// under one. Paths in an added folder keep that folder's name in front.
+    pub fn relative<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        if let Some(rest) = self.path.as_deref().and_then(|root| path.strip_prefix(root).ok()) {
+            return rest.into();
+        }
+        for folder in &self.folders {
+            if let Ok(rest) = path.strip_prefix(folder) {
+                return Path::new(&folder_name(folder)).join(rest).into();
+            }
+        }
+        path.into()
     }
 }
 
-/// The checked-out branch, read straight from `.git/HEAD`.
-fn branch(root: &Path) -> Option<String> {
-    let head = std::fs::read_to_string(root.join(".git/HEAD")).ok()?;
-    let head = head.trim();
-    Some(match head.strip_prefix("ref: refs/heads/") {
-        Some(name) => name.to_string(),
-        None => head.get(..7)?.to_string(),
-    })
+/// A folder's last component, or the whole path when it has none.
+pub fn folder_name(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
 /// `~/…` for paths under the home directory.

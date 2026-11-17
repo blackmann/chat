@@ -25,8 +25,31 @@ struct Ctx {
     mono: SharedString,
     mono_size: Pixels,
     breaks: Breaks,
+    /// Where selections are tracked, and the block this text is.
+    select: Option<(super::select::Shared, usize)>,
+    segment: Cell<usize>,
+    on_link: Option<OnLink>,
 }
+
+/// What clicking a link does; without one, only web and mail links open.
+pub type OnLink = std::rc::Rc<dyn Fn(&str, &mut Window, &mut App)>;
+
+/// Whether `url` belongs in the browser (or mail client) rather than the app.
+pub fn is_web(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:")
+}
+
 impl Ctx {
+    /// Draw `styled` as `child`, selectable when the text is in the transcript.
+    fn selectable(&self, layout: TextLayout, text: SharedString, child: AnyElement) -> AnyElement {
+        let Some((state, block)) = &self.select else {
+            return child;
+        };
+        let n = self.segment.get();
+        self.segment.set(n + 1);
+        let color = Hsla::from(rgb(self.colors.blue)).opacity(0.28);
+        super::select::selectable(state, (*block, n), layout, text, child, color).into_any_element()
+    }
     fn id(&self, what: &str) -> ElementId {
         let n = self.next.get();
         self.next.set(n + 1);
@@ -41,6 +64,8 @@ struct Style {
     strike: bool,
     code: bool,
     link: Option<String>,
+    /// Part of a mention chip, which draws its own background and border.
+    chip: bool,
 }
 
 /// One paragraph's worth of styled text, with link ranges for click handling.
@@ -49,6 +74,8 @@ struct Inline {
     text: String,
     runs: Vec<(usize, Style)>,
     links: Vec<(Range<usize>, String)>,
+    /// Mentions drawn as chips: their range and icon.
+    chips: Vec<(Range<usize>, SharedString)>,
 }
 impl Inline {
     fn push(&mut self, s: &str, style: &Style) {
@@ -104,6 +131,17 @@ impl Inline {
                     },
                     breaks,
                 ),
+                // A mention from the composer: `[name](<chip:icon|sent>)`.
+                Node::Link(l) if l.url.starts_with("chip:") => {
+                    let icon = l.url["chip:".len()..].split('|').next().unwrap_or_default().to_string();
+                    let mut name = Inline::default();
+                    name.walk(&l.children, &Style::default(), Breaks::Soft);
+                    let start = self.text.len();
+                    let chip = Style { chip: true, ..Style::default() };
+                    let shown = name.text.replace(' ', "\u{a0}");
+                    self.push(&format!("{}{shown}{}", super::mentions::LEAD, super::mentions::TRAIL), &chip);
+                    self.chips.push((start..self.text.len(), icon.into()));
+                }
                 Node::Link(l) => self.walk(
                     &l.children,
                     &Style {
@@ -134,7 +172,7 @@ impl Inline {
             }
         }
     }
-    fn element(self, cx: &Ctx) -> AnyElement {
+    fn element(mut self, cx: &Ctx) -> AnyElement {
         let colors = cx.colors;
         let runs = self
             .runs
@@ -154,7 +192,7 @@ impl Inline {
                     colors.text
                 })
                 .into(),
-                background_color: s.code.then(|| rgb(colors.hover).into()),
+                background_color: (s.code || s.chip).then(|| rgb(colors.hover).into()),
                 underline: s.link.as_ref().map(|_| UnderlineStyle {
                     thickness: px(1.),
                     color: Some(Hsla::from(rgb(colors.blue)).opacity(0.4)),
@@ -166,27 +204,124 @@ impl Inline {
                 }),
             })
             .collect::<Vec<_>>();
-        let styled = StyledText::new(self.text).with_runs(runs);
+        let text = SharedString::from(self.text);
+        let styled = StyledText::new(text.clone()).with_runs(runs);
+        let layout = styled.layout().clone();
+        let chips = std::mem::take(&mut self.chips);
+        let wrap = |child: AnyElement| -> AnyElement {
+            if chips.is_empty() {
+                return child;
+            }
+            Chips { child, layout: layout.clone(), chips: chips.clone(), border: rgb(colors.border).into(), ink: rgb(colors.muted).into() }
+                .into_any_element()
+        };
         if self.links.is_empty() {
-            return styled.into_any_element();
+            return cx.selectable(layout.clone(), text, wrap(styled.into_any_element()));
         }
         let (ranges, urls): (Vec<_>, Vec<_>) = self.links.into_iter().unzip();
-        InteractiveText::new(cx.id("text"), styled)
-            .on_click(ranges, move |ix, _, cx| {
-                if let Some(url) = urls.get(ix)
-                    && (url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:"))
-                {
-                    cx.open_url(url);
+        let on_link = cx.on_link.clone();
+        let linked = InteractiveText::new(cx.id("text"), styled)
+            .on_click(ranges, move |ix, window, cx| {
+                let Some(url) = urls.get(ix) else { return };
+                match &on_link {
+                    Some(f) => f(url, window, cx),
+                    None if is_web(url) => cx.open_url(url),
+                    None => {}
                 }
             })
-            .into_any_element()
+            .into_any_element();
+        cx.selectable(layout.clone(), text, wrap(linked))
+    }
+}
+
+/// Text with mention chips drawn over it: a border around each mention and its
+/// file's icon in the space left before the name, as in the composer.
+struct Chips {
+    child: AnyElement,
+    layout: TextLayout,
+    chips: Vec<(Range<usize>, SharedString)>,
+    border: Hsla,
+    ink: Hsla,
+}
+
+impl IntoElement for Chips {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl Element for Chips {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+        (self.child.request_layout(window, cx), ())
+    }
+    fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), window: &mut Window, cx: &mut App) {
+        self.child.prepaint(window, cx);
+    }
+    fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), window: &mut Window, cx: &mut App) {
+        self.child.paint(window, cx);
+        let line = self.layout.line_height();
+        for (range, icon) in &self.chips {
+            let lead = range.start + super::mentions::LEAD.len();
+            let (Some(start), Some(end), Some(name)) = (
+                self.layout.position_for_index(range.start),
+                self.layout.position_for_index(range.end),
+                self.layout.position_for_index(lead),
+            ) else {
+                continue;
+            };
+            // A chip split across lines is left as highlighted text.
+            if start.y != end.y {
+                continue;
+            }
+            let chip = Bounds::from_corners(point(start.x, start.y + px(1.)), point(end.x, start.y + line - px(1.)));
+            window.paint_quad(quad(chip, px(4.), transparent_black(), px(1.), self.border, BorderStyle::Solid));
+            let room = name.x - start.x;
+            let size = px(12.).min(room - px(4.)).max(px(8.));
+            let at = point(start.x + (room - size) / 2., chip.center().y - size / 2.);
+            let _ = window.paint_svg(Bounds { origin: at, size: Size { width: size, height: size } }, icon.clone(), TransformationMatrix::unit(), self.ink, cx);
+        }
     }
 }
 
 fn inline(nodes: &[Node], cx: &Ctx) -> AnyElement {
+    inline_styled(nodes, &Style::default(), cx)
+}
+
+fn inline_styled(nodes: &[Node], style: &Style, cx: &Ctx) -> AnyElement {
     let mut i = Inline::default();
-    i.walk(nodes, &Style::default(), cx.breaks);
+    i.walk(nodes, style, cx.breaks);
     i.element(cx)
+}
+
+/// How wide each column of a table should be, as fractions of the whole: by
+/// its longest cell, within limits so short columns stay readable and long
+/// ones wrap instead of crowding the rest out.
+fn column_widths(t: &markdown::mdast::Table) -> Vec<f32> {
+    let mut longest: Vec<usize> = Vec::new();
+    for tr in &t.children {
+        let Node::TableRow(tr) = tr else { continue };
+        for (c, cell) in tr.children.iter().enumerate() {
+            let mut i = Inline::default();
+            i.walk(cell.children().map(Vec::as_slice).unwrap_or_default(), &Style::default(), Breaks::Soft);
+            let len = i.text.chars().count();
+            if c >= longest.len() {
+                longest.resize(c + 1, 0);
+            }
+            longest[c] = longest[c].max(len);
+        }
+    }
+    let weights: Vec<f32> = longest.iter().map(|&n| n.clamp(6, 40) as f32).collect();
+    let total: f32 = weights.iter().sum();
+    weights.iter().map(|w| w / total.max(1.)).collect()
 }
 
 /// Text inside HTML blocks (e.g. `<details>`), without the tags.
@@ -278,7 +413,7 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
                             d.style().restrict_scroll_to_axis = Some(true);
                             d
                         })
-                        .p(px(10.))
+                        .flex()
                         .rounded(px(6.))
                         .bg(rgb(colors.panel))
                         .border_1()
@@ -287,10 +422,13 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
                         .text_size(cx.mono_size)
                         .line_height(relative(1.5))
                         .text_color(rgb(colors.code))
-                        .children(lines.into_iter().enumerate().map(|(n, line)| {
+                        // Lines keep their full width, so long ones scroll rather than clip.
+                        .child(col().flex_shrink_0().p(px(10.)).children(lines.into_iter().enumerate().map(|(n, line)| {
                             let marks = styles.as_ref().and_then(|s| s.line(colors.dark, n)).cloned().unwrap_or_default();
-                            div().whitespace_nowrap().min_h(px(4.)).child(StyledText::new(line).with_highlights(marks))
-                        })),
+                            let styled = StyledText::new(line.clone()).with_highlights(marks);
+                            let layout = styled.layout().clone();
+                            div().whitespace_nowrap().min_h(px(4.)).child(cx.selectable(layout, line, styled.into_any_element()))
+                        }))),
                 )
                 .child(
                     div()
@@ -325,6 +463,7 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
             .into_any_element(),
         Node::ThematicBreak(_) => div().w_full().h(px(1.)).bg(rgb(colors.border)).into_any_element(),
         Node::Table(t) => {
+            let widths = column_widths(t);
             let mut table = col()
                 .w_full()
                 .rounded(px(6.))
@@ -333,27 +472,35 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
                 .overflow_hidden();
             for (r, tr) in t.children.iter().enumerate() {
                 let Node::TableRow(tr) = tr else { continue };
+                let header = r == 0;
+                let style = Style { bold: header, ..Style::default() };
                 let mut line = row()
                     .w_full()
-                    .when(r > 0, |d| d.border_t_1().border_color(rgb(colors.row_border)))
-                    .when(r == 0, |d| d.bg(rgb(colors.chrome)).font_weight(FontWeight::SEMIBOLD));
+                    .map(|mut d| {
+                        // Every cell as tall as the row, so the column rules run its full height.
+                        d.style().align_items = Some(AlignItems::Stretch);
+                        d
+                    })
+                    .when(!header, |d| d.border_t_1().border_color(rgb(colors.row_border)))
+                    .when(header, |d| d.bg(rgb(colors.chrome)));
                 for (c, cell) in tr.children.iter().enumerate() {
                     let Node::TableCell(cell) = cell else { continue };
                     let align = t.align.get(c).copied().unwrap_or(AlignKind::None);
                     line = line.child(
+                        // A block, not a flex row, so the text wraps to the cell's width.
                         div()
-                            .flex_1()
+                            .w(relative(widths.get(c).copied().unwrap_or(0.)))
+                            .flex_shrink_0()
                             .min_w_0()
                             .px_2()
                             .py(px(5.))
                             .when(c > 0, |d| d.border_l_1().border_color(rgb(colors.row_border)))
-                            .flex()
                             .map(|d| match align {
-                                AlignKind::Center => d.justify_center(),
-                                AlignKind::Right => d.justify_end(),
+                                AlignKind::Center => d.text_center(),
+                                AlignKind::Right => d.text_right(),
                                 _ => d,
                             })
-                            .child(inline(&cell.children, cx)),
+                            .child(inline_styled(&cell.children, &style, cx)),
                     );
                 }
                 table = table.child(line);
@@ -377,8 +524,18 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
 }
 
 /// Render Markdown text. Unparsable input falls back to plain text.
-pub fn render(id: SharedString, text: &str, breaks: Breaks, colors: Palette, mono: SharedString, mono_size: Pixels) -> AnyElement {
-    let cx = Ctx { id, next: Cell::new(0), colors, mono, mono_size, breaks };
+#[allow(clippy::too_many_arguments)]
+pub fn render(
+    id: SharedString,
+    text: &str,
+    breaks: Breaks,
+    colors: Palette,
+    mono: SharedString,
+    mono_size: Pixels,
+    select: Option<(super::select::Shared, usize)>,
+    on_link: Option<OnLink>,
+) -> AnyElement {
+    let cx = Ctx { id, next: Cell::new(0), colors, mono, mono_size, breaks, select, segment: Cell::new(0), on_link };
     match markdown::to_mdast(text, &markdown::ParseOptions::gfm()) {
         Ok(Node::Root(root)) => col()
             .w_full()
@@ -409,6 +566,14 @@ mod tests {
         assert_eq!(i.text, "Run cargo test or see the docs now");
         assert!(i.runs.iter().any(|(len, s)| s.code && *len == "cargo test".len()));
         assert_eq!(i.links, vec![(22..30, "https://x.dev".to_string())]);
+    }
+    #[test]
+    fn chip_links_become_chips() {
+        let i = flatten("see [my file.rs](<chip:app-icons/file-code.svg|@src/my file.rs>) now", Breaks::Hard);
+        assert_eq!(i.chips.len(), 1);
+        assert_eq!(i.chips[0].1.as_ref(), "app-icons/file-code.svg");
+        assert!(i.text[i.chips[0].0.clone()].contains("my\u{a0}file.rs"));
+        assert!(i.links.is_empty() && i.text.starts_with("see ") && i.text.ends_with(" now"));
     }
     #[test]
     fn soft_and_hard_breaks() {

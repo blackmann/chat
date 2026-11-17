@@ -1,4 +1,6 @@
-//! Staged / unstaged workflow modeled on Zed's Git panel, adapted to this app.
+//! The Changes page, after Zed's Git panel: changed files under Staged and
+//! Unstaged (a file staged in part is under both), each with a checkbox that
+//! moves it across, its line counts on that side, and a commit box underneath.
 use super::ui::*;
 use super::*;
 use crate::{
@@ -12,62 +14,149 @@ use gpui_component::{
     input::Input,
 };
 
-impl Workspace {
-    pub(super) fn git_snapshot(&self) -> Option<&git::Snapshot> {
-        self.git_snapshots
-            .get(self.current_project().path.as_ref()?)?
-            .as_ref()
-            .ok()
+/// A checkbox: on under Staged, off under Unstaged.
+fn tick(colors: Palette, id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div> {
+    row()
+        .id(id)
+        .size(px(14.))
+        .flex_shrink_0()
+        .justify_center()
+        .rounded(px(4.))
+        .map(|s| {
+            if on {
+                s.bg(rgb(colors.blue)).text_color(rgb(colors.primary_text)).child(icon(IconName::Check).size(px(11.)))
+            } else {
+                s.border_1().border_color(rgb(colors.quiet)).bg(rgb(colors.background))
+            }
+        })
+        .map(|s| if enabled { s.cursor_pointer() } else { s.opacity(0.5) })
+}
+
+/// A file's status letter in its change's colour.
+fn status_color(colors: Palette, status: u8) -> u32 {
+    match status {
+        b'A' | b'?' => colors.green,
+        b'D' | b'U' => colors.red,
+        b'R' | b'C' => colors.blue,
+        _ => colors.amber,
     }
-    pub(super) fn start_git_poll(&mut self, cx: &mut Context<Self>) {
-        self.refresh_git(cx);
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_secs(2)).await;
-                if this.update(cx, |s, cx| s.refresh_git(cx)).is_err() {
-                    break;
-                }
+}
+
+/// What a checkbox does: unstage what is under Staged, stage what is under Unstaged.
+fn toggle_operation(entries: &[&git::Entry], staged: bool) -> Operation {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        for path in if staged { entry.paths() } else { entry.stage_paths() } {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    if staged { Operation::Unstage(paths) } else { Operation::Stage(paths) }
+}
+
+impl Workspace {
+    /// The folder whose repository the Changes page shows.
+    pub(super) fn git_folder(&self) -> Option<PathBuf> {
+        let roots = self.current_project().roots();
+        self.git_repo.clone().filter(|r| roots.contains(r)).or_else(|| roots.into_iter().next())
+    }
+    pub(super) fn git_snapshot(&self) -> Option<&git::Snapshot> {
+        self.git_snapshots.get(&self.git_folder()?)?.as_ref().ok()
+    }
+    /// Keep the Changes page current: refresh when the file watcher sees
+    /// something `git status` would, and whenever the window comes forward, in
+    /// case an event was missed. Without a watcher, poll instead.
+    pub(super) fn start_git_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::git_watch::Watcher::new() {
+            Ok((watcher, mut changes)) => {
+                self.git_watch = Some(watcher);
+                cx.spawn(async move |this, cx| {
+                    while changes.next().await.is_some() {
+                        // A save, checkout or build is a burst of events: let it
+                        // settle a moment and refresh once for all of it.
+                        cx.background_executor().timer(Duration::from_millis(150)).await;
+                        while changes.try_recv().is_ok() {}
+                        if this.update(cx, |s, cx| s.refresh_git(cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            Err(_) => {
+                cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        if this.update(cx, |s, cx| s.refresh_git(cx)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+        cx.observe_window_activation(window, |s, window, cx| {
+            if window.is_window_active() {
+                s.refresh_git(cx);
             }
         })
         .detach();
+        self.refresh_git(cx);
     }
+    /// Watch the folders showing, and the repositories found in them.
+    fn sync_git_watch(&mut self) {
+        let folders = self.current_project().roots();
+        let repos = folders
+            .iter()
+            .filter_map(|f| self.git_snapshots.get(f)?.as_ref().ok())
+            .map(|s| (s.root.clone(), s.git_dir.clone()))
+            .collect();
+        if let Some(watch) = &mut self.git_watch {
+            watch.set(folders, repos);
+        }
+    }
+    /// Read every folder of the project again (each shows its branch), and the
+    /// diff in the open tab.
     pub(super) fn refresh_git(&mut self, cx: &mut Context<Self>) {
         if self.git_refreshing || self.git_busy {
+            self.git_queued = true;
             return;
         }
-        let Some(folder) = self.current_project().path.clone() else {
+        let roots = self.current_project().roots();
+        if roots.is_empty() {
+            self.sync_git_watch();
             return;
-        };
+        }
         self.git_refreshing = true;
+        self.git_queued = false;
         let revision = self.git_revision;
         let selected = match &self.tabs[self.active].kind {
             TabKind::GitDiff(path, staged) => Some((path.clone(), *staged)),
             _ => None,
         };
         cx.spawn(async move |this, cx| {
-            let work_folder = folder.clone();
-            let (snapshot, diff) = cx
+            let (snapshots, diff) = cx
                 .background_executor()
                 .spawn(async move {
-                    let snapshot = git::snapshot(&work_folder);
-                    let diff = selected.and_then(|(path, staged)| {
-                        let snapshot = snapshot.as_ref().ok()?;
-                        let result = snapshot
-                            .entries
-                            .iter()
-                            .find(|e| {
-                                snapshot.root.join(&e.path) == path
-                                    && if staged { e.staged() } else { e.unstaged() }
-                            })
-                            .map(|entry| git::diff(&snapshot.root, entry, staged))
-                            .unwrap_or_else(|| {
-                                Ok(git::Diff {
-                                    patch: "No changes in this section.".into(),
-                                })
-                            });
-                        Some(((path, staged), result))
+                    let snapshots: Vec<_> = roots.into_iter().map(|root| {
+                        let snapshot = git::snapshot(&root);
+                        (root, snapshot)
+                    }).collect();
+                    let diff = selected.map(|(path, staged)| {
+                        let found = snapshots.iter().filter_map(|(_, s)| s.as_ref().ok()).find_map(|s| {
+                            s.entries
+                                .iter()
+                                .find(|e| s.root.join(&e.path) == path && if staged { e.staged() } else { e.unstaged() })
+                                .map(|e| (s, e))
+                        });
+                        let result = match found {
+                            Some((snapshot, entry)) => git::diff(&snapshot.root, entry, staged),
+                            None => Err(format!("Nothing {} in this file now.", if staged { "staged" } else { "unstaged" })),
+                        };
+                        ((path, staged), result)
                     });
-                    (snapshot, diff)
+                    (snapshots, diff)
                 })
                 .await;
             let _ = this.update(cx, |s, cx| {
@@ -76,9 +165,13 @@ impl Workspace {
                     s.refresh_git(cx);
                     return;
                 }
-                s.git_snapshots.insert(folder, snapshot);
+                s.git_snapshots.extend(snapshots);
                 if let Some((key, diff)) = diff {
                     s.git_diffs.insert(key, diff);
+                }
+                s.sync_git_watch();
+                if s.git_queued {
+                    s.refresh_git(cx);
                 }
                 cx.notify();
             });
@@ -92,7 +185,7 @@ impl Workspace {
         let Some(root) = self.git_snapshot().map(|s| s.root.clone()) else {
             return;
         };
-        let Some(folder) = self.current_project().path.clone() else {
+        let Some(folder) = self.git_folder() else {
             return;
         };
         self.git_busy = true;
@@ -100,14 +193,11 @@ impl Workspace {
         self.git_errors.remove(&folder);
         cx.notify();
         let committed = match &operation {
-            Operation::Commit(message) => Some(message.clone()),
+            Operation::Commit(message) | Operation::CommitTracked(message) => Some(message.clone()),
             _ => None,
         };
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { git::operate(&root, operation) })
-                .await;
+            let result = cx.background_executor().spawn(async move { git::operate(&root, operation) }).await;
             let _ = this.update(cx, |s, cx| {
                 s.git_busy = false;
                 s.git_revision += 1;
@@ -115,9 +205,7 @@ impl Workspace {
                     Err(error) => {
                         s.git_errors.insert(folder, error);
                     }
-                    Ok(()) => {
-                        s.clear_commit_message = committed;
-                    }
+                    Ok(()) => s.clear_commit_message = committed,
                 }
                 s.git_diffs.clear();
                 s.refresh_git(cx);
@@ -126,6 +214,54 @@ impl Workspace {
         })
         .detach();
     }
+
+    /// With several folders, which repository to show; otherwise just the branch.
+    fn repo_picker(&self, colors: Palette, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> AnyElement {
+        let roots = self.current_project().roots();
+        if roots.len() < 2 {
+            return branch_chip(colors, snapshot.branch.clone()).into_any_element();
+        }
+        let folder = self.git_folder().map(|f| crate::model::folder_name(&f)).unwrap_or_default();
+        let trigger = row()
+            .id("repo-button")
+            .h(px(22.))
+            .px(px(6.))
+            .gap(px(5.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(colors.hover)))
+            .child(icon(IconName::Folder).size(px(13.)).text_color(rgb(colors.muted)))
+            .child(div().font_weight(FontWeight::MEDIUM).child(folder))
+            .child(icon(IconName::ChevronDown).size(px(11.)).text_color(rgb(colors.quiet)));
+        row()
+            .gap_2()
+            .min_w_0()
+            .child(self.popover_trigger("repo", trigger, Corner::TopLeft, 280., None, move |s, weak, _| {
+                let current = s.git_folder();
+                let mut entries = vec![crate::menu::Entry::Label("Repository".into())];
+                for root in s.current_project().roots() {
+                    let snapshot = s.git_snapshots.get(&root).and_then(|r| r.as_ref().ok());
+                    let mut item = crate::menu::Item::new(crate::model::folder_name(&root))
+                        .icon(IconName::Folder)
+                        .checked(current.as_ref() == Some(&root));
+                    if let Some(snapshot) = snapshot {
+                        let n = snapshot.entries.len();
+                        item = item.detail(if n == 0 { snapshot.branch.clone() } else { format!("{} · {n}", snapshot.branch) });
+                    }
+                    let weak = weak.clone();
+                    entries.push(crate::menu::Entry::Item(item.on_click(move |_, cx| {
+                        let _ = weak.update(cx, |s, cx| {
+                            s.git_repo = Some(root.clone());
+                            cx.notify();
+                        });
+                    })));
+                }
+                entries
+            }, cx))
+            .child(branch_chip(colors, snapshot.branch.clone()))
+            .into_any_element()
+    }
+
     pub(super) fn changes_page(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
         let mut page = col().flex_1().min_h_0();
@@ -147,175 +283,152 @@ impl Workspace {
                         })),
                 ),
         );
-        let Some(folder) = self.current_project().path.as_ref() else {
-            return page.child(empty(
-                colors,
-                Glyph::Branch,
-                "No project",
-                "Open a project to see Git changes.",
-            ));
+        let Some(folder) = self.git_folder() else {
+            return page.child(empty(colors, Glyph::Branch, "No project", "Open a project to see Git changes."));
         };
-        let Some(snapshot) = self.git_snapshots.get(folder) else {
+        let Some(snapshot) = self.git_snapshots.get(&folder) else {
             return page.child(label(colors, "Loading Git changes…").p_3());
         };
         let snapshot = match snapshot {
             Ok(s) => s,
-            Err(error) => {
-                return page.child(empty(
-                    colors,
-                    Glyph::Branch,
-                    "Git unavailable",
-                    error.clone(),
-                ));
-            }
+            Err(error) => return page.child(empty(colors, Glyph::Branch, "Git unavailable", error.clone())),
         };
+        let project = self.current_project();
         let touched: HashSet<_> = self
             .current_thread()
             .map(|t| {
                 t.files()
                     .into_iter()
                     .filter(|(_, touch)| *touch != crate::model::Touch::Read)
-                    .map(|(p, _)| if p.is_absolute() { p } else { folder.join(p) })
+                    .map(|(p, _)| match (&project.path, p.is_absolute()) {
+                        (Some(root), false) => root.join(p),
+                        _ => p,
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        let visible: Vec<_> = snapshot
+        let visible: Vec<&git::Entry> = snapshot
             .entries
             .iter()
-            .filter(|e| {
-                !self.thread_changes_only
-                    || e.paths()
-                        .iter()
-                        .any(|p| touched.contains(&snapshot.root.join(p)))
-            })
+            .filter(|e| !self.thread_changes_only || e.paths().iter().any(|p| touched.contains(&snapshot.root.join(p))))
             .collect();
+        // Each side's lines count once: a file staged in part shows both halves.
+        let (adds, dels) = visible
+            .iter()
+            .flat_map(|e| [e.staged_stat, e.unstaged_stat])
+            .flatten()
+            .fold((0, 0), |(a, d), (x, y)| (a + x, d + y));
         page = page.child(
             row()
                 .flex_shrink_0()
                 .h(px(34.))
-                .px_3()
+                .pl_3()
+                .pr_1()
                 .gap_2()
-                .child(branch_chip(colors, snapshot.branch.clone()))
+                .child(self.repo_picker(colors, snapshot, cx))
                 .child(div().flex_1())
-                .child(
-                    icon_button("refresh-git", IconName::Redo, "Refresh changes")
-                        .disabled(self.git_busy || self.git_refreshing)
-                        .on_click(cx.listener(|s, _, _, cx| s.refresh_git(cx))),
-                ),
+                .when(!visible.is_empty(), |s| {
+                    s.child(label(colors, format!("{} change{}", visible.len(), if visible.len() == 1 { "" } else { "s" })))
+                        .child(stat(colors, adds, dels))
+                }),
         );
-        if let Some(error) = self.git_errors.get(folder) {
-            page = page.child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_size(px(12.))
-                    .text_color(rgb(colors.red))
-                    .child(error.clone()),
-            );
+        if let Some(error) = self.git_errors.get(&folder) {
+            page = page.child(div().px_3().py_2().text_size(px(12.)).text_color(rgb(colors.red)).child(error.clone()));
         }
-        let mut list = col();
-        for staged in [true, false] {
-            let entries: Vec<_> = visible
-                .iter()
-                .filter(|e| if staged { e.staged() } else { e.unstaged() })
-                .collect();
-            let paths: Vec<_> = entries
-                .iter()
-                .flat_map(|e| if staged { e.paths() } else { e.stage_paths() })
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
-            let operation = if staged {
-                Operation::Unstage(paths)
-            } else {
-                Operation::Stage(paths)
-            };
+
+        // Conflicts are settled in the editor first, then staged from Unstaged.
+        let sections: [(&str, bool, Vec<&git::Entry>); 3] = [
+            ("Conflicts", false, visible.iter().copied().filter(|e| e.conflict()).collect()),
+            ("Staged", true, visible.iter().copied().filter(|e| e.staged()).collect()),
+            ("Unstaged", false, visible.iter().copied().filter(|e| e.unstaged() && !e.conflict()).collect()),
+        ];
+        let open = match &self.tabs[self.active].kind {
+            TabKind::GitDiff(path, staged) => Some((path.clone(), *staged)),
+            _ => None,
+        };
+        let mut list = col().pb_2();
+        for (n, (title, staged, entries)) in sections.iter().enumerate() {
+            let (title, staged) = (*title, *staged);
+            if entries.is_empty() {
+                continue;
+            }
+            let conflicts = title == "Conflicts";
+            let can_toggle = !self.git_busy && !conflicts;
+            let operation = toggle_operation(entries, staged);
+            let group_tip = if staged { "Unstage all" } else { "Stage all" };
+            let (adds, dels) = entries.iter().filter_map(|e| e.stat(staged)).fold((0, 0), |(a, d), (x, y)| (a + x, d + y));
             list = list.child(
                 row()
-                    .h(px(32.))
+                    .h(px(30.))
                     .px_3()
                     .gap_2()
-                    .child(label(colors, if staged { "Staged" } else { "Unstaged" }))
-                    .child(count_badge(colors, entries.len()))
-                    .child(div().flex_1())
                     .child(
-                        Button::new(if staged { "unstage-all" } else { "stage-all" })
-                            .ghost()
-                            .xsmall()
-                            .label(if self.thread_changes_only {
-                                if staged {
-                                    "Unstage shown"
-                                } else {
-                                    "Stage shown"
-                                }
-                            } else if staged {
-                                "Unstage all"
-                            } else {
-                                "Stage all"
-                            })
-                            .disabled(self.git_busy || entries.is_empty())
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.git_operation(operation.clone(), cx)
-                            })),
-                    ),
+                        tick(colors, ("section-tick", n), staged, can_toggle)
+                            .when(can_toggle, |s| {
+                                s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(group_tip).build(w, cx))
+                                    .on_click(cx.listener(move |s, _, _, cx| s.git_operation(operation.clone(), cx)))
+                            }),
+                    )
+                    .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(if conflicts { colors.red } else { colors.muted })).child(title))
+                    .child(count_badge(colors, entries.len()))
+                    .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border)))
+                    .when(!conflicts, |s| s.child(stat(colors, adds, dels))),
             );
             for (i, entry) in entries.iter().enumerate() {
                 let path = snapshot.root.join(&entry.path);
-                let status = if entry.conflict() {
-                    "!".into()
-                } else {
-                    char::from(if staged { entry.index } else { entry.worktree }).to_string()
-                };
-                let operation = if staged {
-                    Operation::Unstage(entry.paths())
-                } else {
-                    Operation::Stage(entry.stage_paths())
-                };
-                let active = self.tabs[self.active].kind == TabKind::GitDiff(path.clone(), staged);
+                let status = entry.status(staged);
+                let hue = status_color(colors, status);
+                let relative = entry.path.to_string_lossy().into_owned();
+                let (name, dir) = split_path(&relative);
+                let active = open.as_ref() == Some(&(path.clone(), staged));
+                let operation = toggle_operation(&[*entry], staged);
+                let tip = if staged { "Unstage" } else { "Stage" };
                 list = list.child(
                     row()
+                        .id(SharedString::from(format!("git-{n}-{i}")))
+                        .h(px(26.))
                         .mx_1()
+                        .px_2()
+                        .gap_2()
                         .rounded(px(5.))
+                        .cursor_pointer()
                         .when(active, |s| s.bg(rgb(colors.selected)))
-                        .child(
-                            row()
-                                .id(SharedString::from(format!("git-{staged}-{i}")))
-                                .flex_1()
-                                .min_w_0()
-                                .h(px(28.))
-                                .px_2()
-                                .gap_2()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(colors.hover)))
-                                .child(label(colors, status).text_color(rgb(if entry.conflict() {
-                                    colors.red
-                                } else {
-                                    colors.amber
-                                })))
-                                .child(
-                                    one_line(entry.path.to_string_lossy().into_owned(), 18.)
-                                        .flex_1()
-                                        .min_w_0(),
-                                )
+                        .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                        .child(tick(colors, SharedString::from(format!("tick-{n}-{i}")), staged, can_toggle).when(can_toggle, |s| {
+                            s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip).build(w, cx))
                                 .on_click(cx.listener(move |s, _, _, cx| {
-                                    s.open(TabKind::GitDiff(path.clone(), staged), cx)
-                                })),
-                        )
+                                    // The row behind opens the diff; the box only stages.
+                                    cx.stop_propagation();
+                                    s.git_operation(operation.clone(), cx)
+                                }))
+                        }))
                         .child(
-                            icon_button(
-                                SharedString::from(format!("stage-{staged}-{i}")),
-                                if staged {
-                                    IconName::Minus
-                                } else {
-                                    IconName::Plus
-                                },
-                                if staged { "Unstage file" } else { "Stage file" },
+                            line_with_detail(
+                                name.to_string(),
+                                (!dir.is_empty()).then(|| (SharedString::from(dir.to_string()), Hsla::from(rgb(colors.quiet)))),
+                                18.,
                             )
-                            .disabled(self.git_busy)
-                            .on_click(cx.listener(
-                                move |s, _, _, cx| s.git_operation(operation.clone(), cx),
-                            )),
-                        ),
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(rgb(if status == b'D' { colors.muted } else { colors.text })),
+                        )
+                        .map(|s| match entry.stat(staged) {
+                            Some((adds, dels)) => s.child(stat(colors, adds, dels)),
+                            None if status == b'D' || conflicts => s,
+                            None => s.child(label(colors, "binary").text_size(px(11.))),
+                        })
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .flex_shrink_0()
+                                .text_center()
+                                .font_family(mono())
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(hue))
+                                .child(if status == b'?' { "U".to_string() } else { char::from(status).to_string() }),
+                        )
+                        .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::GitDiff(path.clone(), staged), cx))),
                 );
             }
         }
@@ -323,27 +436,19 @@ impl Workspace {
             list = list.child(empty(
                 colors,
                 Glyph::FileDiff,
-                if self.thread_changes_only {
-                    "No changes from this thread"
-                } else {
-                    "Working tree clean"
-                },
+                if self.thread_changes_only { "No changes from this thread" } else { "Working tree clean" },
                 "Git changes appear here as files are edited.",
             ));
         }
-        page = page.child(
-            div()
-                .id("git-changes-list")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(list),
-        );
-        let staged_count = snapshot.entries.iter().filter(|e| e.staged()).count();
-        let can_commit = !self.git_busy
-            && staged_count > 0
-            && !self.commit_message.read(cx).value().trim().is_empty()
-            && !snapshot.entries.iter().any(|e| e.conflict());
+        page = page.child(div().id("git-changes-list").flex_1().min_h_0().overflow_y_scroll().child(list));
+
+        let staged = snapshot.entries.iter().filter(|e| e.staged()).count();
+        let tracked = snapshot.entries.iter().any(|e| !e.untracked() && !e.conflict());
+        let message = !self.commit_message.read(cx).value().trim().is_empty();
+        let conflicted = snapshot.entries.iter().any(|e| e.conflict());
+        // As in Zed: with nothing staged, commit every tracked change.
+        let all_tracked = staged == 0;
+        let can_commit = !self.git_busy && message && !conflicted && (staged > 0 || tracked);
         page.child(
             col()
                 .flex_shrink_0()
@@ -353,59 +458,54 @@ impl Workspace {
                 .gap_2()
                 .child(Input::new(&self.commit_message))
                 .child(
-                    Button::new("commit-staged")
-                        .primary()
-                        .small()
-                        .label(if self.git_busy {
-                            "Working…".to_owned()
-                        } else {
-                            format!(
-                                "Commit {staged_count} staged file{}",
-                                if staged_count == 1 { "" } else { "s" }
+                    row()
+                        .gap_2()
+                        .child(
+                            label(
+                                colors,
+                                if all_tracked {
+                                    "Nothing staged: commits every tracked change".to_string()
+                                } else {
+                                    format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })
+                                },
                             )
-                        })
-                        .disabled(!can_commit)
-                        .on_click(cx.listener(|s, _, _, cx| {
-                            let message = s.commit_message.read(cx).value().to_string();
-                            s.git_operation(Operation::Commit(message), cx);
-                        })),
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                        )
+                        .child(
+                            Button::new("commit")
+                                .primary()
+                                .small()
+                                .label(if self.git_busy {
+                                    "Working…"
+                                } else if all_tracked {
+                                    "Commit Tracked"
+                                } else {
+                                    "Commit"
+                                })
+                                .disabled(!can_commit)
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    let message = s.commit_message.read(cx).value().to_string();
+                                    let operation = if all_tracked { Operation::CommitTracked(message) } else { Operation::Commit(message) };
+                                    s.git_operation(operation, cx);
+                                })),
+                        ),
                 ),
         )
     }
-    pub(super) fn git_diff_view(
-        &self,
-        path: &Path,
-        staged: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+
+    pub(super) fn git_diff_view(&self, path: &Path, staged: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let text = match self.git_diffs.get(&(path.to_owned(), staged)) {
-            Some(Ok(diff)) => diff.patch.clone(),
-            Some(Err(error)) => error.clone(),
-            None => "Loading diff…".into(),
+        let id = SharedString::from(format!("git-diff-{staged}-{}", path.display()));
+        let body = match self.git_diffs.get(&(path.to_owned(), staged)) {
+            Some(Ok(git::Diff::Text { old, new })) => self.diff_pane(id, super::panes::LineSource::GitDiff(path.to_owned(), staged), old, new, window, cx),
+            Some(Ok(git::Diff::Binary)) => empty(colors, Glyph::FileDiff, "Binary file", "Its change can't be shown as text.").into_any_element(),
+            Some(Ok(git::Diff::Large)) => empty(colors, Glyph::FileDiff, "Large file", "This file is too large to diff here.").into_any_element(),
+            Some(Err(error)) => empty(colors, Glyph::FileDiff, "No diff", error.clone()).into_any_element(),
+            None => label(colors, "Loading diff…").p_3().into_any_element(),
         };
-        let mut lines = col()
-            .font_family(mono())
-            .text_size(px(crate::theme::MONO_SIZE));
-        for line in text.lines() {
-            let (fg, bg) = if line.starts_with('+') && !line.starts_with("+++") {
-                (colors.green, Some(colors.green_tint))
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                (colors.red, Some(colors.red_tint))
-            } else if line.starts_with("@@") {
-                (colors.blue, Some(colors.blue_tint))
-            } else {
-                (colors.code, None)
-            };
-            lines = lines.child(
-                div()
-                    .min_h(px(20.))
-                    .px_3()
-                    .text_color(rgb(fg))
-                    .when_some(bg, |s, bg| s.bg(rgb(bg)))
-                    .child(line.replace('\t', "    ")),
-            );
-        }
+        let entry = self.git_snapshots.values().filter_map(|s| s.as_ref().ok()).find_map(|s| s.entries.iter().find(|e| s.root.join(&e.path) == path));
         col()
             .size_full()
             .child(
@@ -414,34 +514,19 @@ impl Workspace {
                     .h(px(32.))
                     .px_3()
                     .gap_2()
-                    .child(label(
-                        colors,
-                        if staged {
-                            "Staged · HEAD → Index"
-                        } else {
-                            "Unstaged · Index → Working tree"
-                        },
-                    ))
+                    .border_b_1()
+                    .border_color(rgb(colors.row_border))
+                    .child(label(colors, if staged { "Staged · HEAD → Index" } else { "Unstaged · Index → Working tree" }))
+                    .when_some(entry.and_then(|e| e.stat(staged)), |s, (adds, dels)| s.child(stat(colors, adds, dels)))
                     .child(div().flex_1())
                     .child(
-                        Button::new("git-view-file")
-                            .ghost()
-                            .xsmall()
-                            .label("Open file")
-                            .on_click(cx.listener({
-                                let path = path.to_owned();
-                                move |s, _, _, cx| s.open(TabKind::File(path.clone()), cx)
-                            })),
+                        Button::new("git-view-file").ghost().xsmall().label("Open file").on_click(cx.listener({
+                            let path = path.to_owned();
+                            move |s, _, _, cx| s.open(TabKind::File(path.clone()), cx)
+                        })),
                     ),
             )
-            .child(
-                div()
-                    .id("git-diff-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_scroll()
-                    .child(lines),
-            )
+            .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
     }
 }

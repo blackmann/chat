@@ -16,10 +16,80 @@ pub enum FollowUpMode {
     Steer,
 }
 
+/// How a project shows on the rail: its initials, or a DiceBear avatar drawn
+/// from its folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Avatar {
+    #[default]
+    Initials,
+    Waves,
+    Blobs,
+}
+impl Avatar {
+    pub const ALL: [Avatar; 3] = [Avatar::Initials, Avatar::Waves, Avatar::Blobs];
+    /// The DiceBear style it is fetched in; `None` for initials, drawn here.
+    pub fn style(self) -> Option<&'static str> {
+        match self {
+            Avatar::Initials => None,
+            Avatar::Waves => Some("waves"),
+            Avatar::Blobs => Some("blobs"),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Avatar::Initials => "Initials",
+            Avatar::Waves => "Waves",
+            Avatar::Blobs => "Blobs",
+        }
+    }
+    fn is_initials(&self) -> bool {
+        *self == Avatar::Initials
+    }
+}
+
+/// A project on the rail: its main folder (where agents run and threads are
+/// filed), the name it goes by, and any further folders it spans.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedEntry")]
+pub struct ProjectEntry {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Avatar::is_initials")]
+    pub avatar: Avatar,
+}
+
+/// Earlier settings listed projects as bare paths.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedEntry {
+    Path(PathBuf),
+    Full {
+        path: PathBuf,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        folders: Vec<PathBuf>,
+        #[serde(default)]
+        avatar: Avatar,
+    },
+}
+impl From<SavedEntry> for ProjectEntry {
+    fn from(saved: SavedEntry) -> Self {
+        match saved {
+            SavedEntry::Path(path) => Self { path, name: None, folders: Vec::new(), avatar: Avatar::Initials },
+            SavedEntry::Full { path, name, folders, avatar } => Self { path, name, folders, avatar },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    pub projects: Vec<PathBuf>,
+    pub projects: Vec<ProjectEntry>,
     /// Any command that speaks ACP on stdio can be listed here.
     pub agents: Vec<AgentSpec>,
     /// The agent new threads start with: the last one picked.
@@ -78,6 +148,28 @@ mod tests {
     fn old_settings_default_to_queue_mode() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.follow_up_mode, FollowUpMode::Queue);
+    }
+
+    #[test]
+    fn projects_read_bare_paths_and_full_entries() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"projects": ["/a", {"path": "/b", "name": "Bee", "folders": ["/c"]}]}"#).unwrap();
+        assert_eq!(settings.projects[0], ProjectEntry { path: "/a".into(), name: None, folders: vec![], avatar: Avatar::Initials });
+        assert_eq!(settings.projects[1].name.as_deref(), Some("Bee"));
+        assert_eq!(settings.projects[1].folders, [PathBuf::from("/c")]);
+        let again: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(again.projects, settings.projects);
+    }
+
+    #[test]
+    fn avatars_round_trip_and_default_to_initials() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"projects": [{"path": "/a"}, {"path": "/b", "avatar": "waves"}]}"#).unwrap();
+        assert_eq!(settings.projects[0].avatar, Avatar::Initials);
+        assert_eq!(settings.projects[1].avatar, Avatar::Waves);
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(text.contains(r#""avatar":"waves""#));
+        assert_eq!(text.matches("avatar").count(), 1);
     }
 
     #[test]

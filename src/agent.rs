@@ -59,6 +59,20 @@ impl AgentSpec {
         ]
     }
 
+    /// Which known agent this is, by its name or the adapter it runs, for its icon.
+    pub fn brand(&self) -> Option<crate::icons::Glyph> {
+        let hay = std::iter::once(&self.name).chain(std::iter::once(&self.command)).chain(&self.args).map(|s| s.to_lowercase());
+        for s in hay {
+            if s.contains("claude") {
+                return Some(crate::icons::Glyph::Claude);
+            }
+            if s.contains("codex") || s.contains("openai") {
+                return Some(crate::icons::Glyph::OpenAi);
+            }
+        }
+        None
+    }
+
     fn uses_codex_adapter(&self) -> bool {
         Path::new(&self.command).file_name() == Some(OsStr::new("codex-acp"))
             || self.args.iter().any(|arg| {
@@ -227,13 +241,14 @@ pub enum Command {
 pub fn connect(
     spec: AgentSpec,
     cwd: PathBuf,
+    extra: Vec<PathBuf>,
     previous: Option<String>,
     picks: Vec<(String, String)>,
 ) -> (UnboundedSender<Command>, UnboundedReceiver<Event>, impl Future<Output = ()> + Send + 'static) {
     let (command_tx, command_rx) = unbounded();
     let (event_tx, event_rx) = unbounded();
     let run = async move {
-        let result = run(spec, cwd, previous, picks, command_rx, event_tx.clone()).await;
+        let result = run(spec, cwd, extra, previous, picks, command_rx, event_tx.clone()).await;
         let _ = event_tx.unbounded_send(Event::Closed(result.err().map(|e| e.to_string())));
     };
     (command_tx, event_rx, run)
@@ -242,6 +257,7 @@ pub fn connect(
 async fn run(
     spec: AgentSpec,
     cwd: PathBuf,
+    extra: Vec<PathBuf>,
     previous: Option<String>,
     picks: Vec<(String, String)>,
     mut commands: UnboundedReceiver<Command>,
@@ -337,14 +353,14 @@ async fn run(
             // quietly, load replays it.
             let reopened = match previous.clone() {
                 Some(id) if capabilities.session_capabilities.resume.is_some() => connection
-                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()))
+                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()))
                     .block_task()
                     .await
                     .ok()
                     .map(|r| (id, r.config_options, r.modes)),
                 Some(id) if capabilities.load_session => {
                     replaying.store(true, Ordering::SeqCst);
-                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone())).block_task().await;
+                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone())).block_task().await;
                     replaying.store(false, Ordering::SeqCst);
                     loaded.ok().map(|r| (id, r.config_options, r.modes))
                 }
@@ -353,7 +369,7 @@ async fn run(
             let (session_id, options, modes, history) = match reopened {
                 Some((id, options, modes)) => (id.into(), options, modes, History::Kept),
                 None => {
-                    let session = connection.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+                    let session = connection.send_request(NewSessionRequest::new(cwd).additional_directories(extra)).block_task().await?;
                     let history = if previous.is_some() { History::Lost } else { History::New };
                     (session.session_id, session.config_options, session.modes, history)
                 }
@@ -651,7 +667,7 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), None, Vec::new());
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), None, Vec::new());
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
 
@@ -717,7 +733,7 @@ mod tests {
             return;
         }
         let spec = AgentSpec::new("Mock", "python3", &[script]);
-        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Some("mock-7".into()), Vec::new());
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), Some("mock-7".into()), Vec::new());
         std::thread::spawn(move || block_on(run));
         let mut next = move || block_on(events.next()).expect("connection closed early");
         let Event::Ready { session, history, .. } = (0..10).map(|_| next()).find(|e| !matches!(e, Event::Commands(_))).unwrap()

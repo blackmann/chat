@@ -79,12 +79,35 @@ impl Item {
     }
 }
 
+/// One of a row of small choices, such as a project's avatar styles.
+pub struct Swatch {
+    content: AnyElement,
+    label: SharedString,
+    checked: bool,
+    handler: Option<Handler>,
+}
+impl Swatch {
+    pub fn new(label: impl Into<SharedString>, content: impl IntoElement) -> Self {
+        Self { content: content.into_any_element(), label: label.into(), checked: false, handler: None }
+    }
+    pub fn checked(mut self, checked: bool) -> Self {
+        self.checked = checked;
+        self
+    }
+    pub fn on_click(mut self, f: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.handler = Some(Rc::new(f));
+        self
+    }
+}
+
 // Entries are rebuilt per render and short-lived; boxing items would only add noise.
 #[allow(clippy::large_enum_variant)]
 pub enum Entry {
     Label(SharedString),
     Separator,
     Item(Item),
+    /// A row of small choices; picking one closes the menu.
+    Swatches(Vec<Swatch>),
 }
 
 pub type Builder = Rc<dyn Fn(&App) -> Vec<Entry>>;
@@ -251,6 +274,7 @@ impl Render for Menu {
         for (i, entry) in entries.into_iter().enumerate() {
             list = list.child(match entry {
                 Entry::Label(text) => div()
+                    .flex_shrink_0()
                     .px(px(8.))
                     .pt(px(if i == 0 { 2. } else { 6. }))
                     .pb(px(3.))
@@ -264,10 +288,38 @@ impl Render for Menu {
                     .h(px(1.))
                     .bg(rgb(colors.popover_border))
                     .into_any_element(),
+                Entry::Swatches(swatches) => {
+                    let mut row = div().flex_shrink_0().flex().items_center().gap(px(6.)).px(px(6.)).py(px(4.));
+                    for (n, swatch) in swatches.into_iter().enumerate() {
+                        let handler = swatch.handler;
+                        let label = swatch.label;
+                        row = row.child(
+                            div()
+                                .id(("menu-swatch", i * 16 + n))
+                                .p(px(2.))
+                                .rounded_full()
+                                .border_2()
+                                .border_color(if swatch.checked { Hsla::from(rgb(colors.blue)) } else { transparent_black() })
+                                .when(!swatch.checked, |s| s.hover(|s| s.border_color(rgb(colors.popover_border))))
+                                .cursor_pointer()
+                                .child(swatch.content)
+                                .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(w, cx))
+                                .on_click(cx.listener(move |_, _, w, cx| {
+                                    if let Some(handler) = handler.clone() {
+                                        handler(w, cx);
+                                    }
+                                    cx.emit(DismissEvent);
+                                })),
+                        );
+                    }
+                    row.into_any_element()
+                }
                 Entry::Item(item) => {
                     let highlighted = self.highlighted == Some(i);
                     div()
                         .id(("menu-item", i))
+                        // The list scrolls; rows keep their height rather than squeeze.
+                        .flex_shrink_0()
                         .flex()
                         .items_center()
                         .gap(px(8.))

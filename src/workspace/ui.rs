@@ -172,20 +172,6 @@ pub fn stat(colors: Palette, adds: u32, dels: u32) -> Div {
         .when(adds > 0, |s| s.child(div().text_color(rgb(colors.green)).child(format!("+{adds}"))))
         .when(dels > 0, |s| s.child(div().text_color(rgb(colors.red)).child(format!("−{dels}"))))
 }
-/// A file's change as a letter and a color: added or modified.
-pub fn status_mark(colors: Palette, added: bool) -> Div {
-    let (letter, color) = if added { ("A", colors.green) } else { ("M", colors.amber) };
-    div()
-        .w(px(12.))
-        .flex_shrink_0()
-        .text_center()
-        .font_family(mono())
-        .text_size(px(11.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(color))
-        .child(letter)
-}
-
 /// A centered placeholder for empty states.
 pub fn empty(colors: Palette, glyph: impl Into<Icon>, title: impl Into<SharedString>, detail: impl Into<SharedString>) -> Div {
     col()

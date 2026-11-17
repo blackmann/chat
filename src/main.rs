@@ -1,6 +1,8 @@
 mod agent;
+mod avatar;
 mod icons;
 mod git;
+mod git_watch;
 mod menu;
 mod model;
 mod settings;
@@ -37,6 +39,7 @@ fn main() {
                 Some("Composer > Input"),
             ),
             KeyBinding::new("cmd-,", OpenPreferences, None),
+            KeyBinding::new("cmd-l", AddToChat, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());

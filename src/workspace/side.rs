@@ -2,13 +2,35 @@
 use super::ui::*;
 use super::*;
 use crate::{agent::Step, icons::Glyph, model::Touch};
-use gpui_component::{Icon, IconName, tooltip::Tooltip};
+use gpui_component::{Icon, IconName, Sizable, tooltip::Tooltip};
 
 fn side_glyph(side: Side) -> Icon {
     match side {
         Side::Context => IconName::Asterisk.into(),
         Side::Changes => Glyph::Branch.into(),
         Side::Files => Glyph::Files.into(),
+    }
+}
+
+/// A change's status letter as shown, and its colour.
+fn change_mark(colors: Palette, status: u8) -> (char, u32) {
+    match status {
+        b'?' => ('U', colors.green),
+        b'A' => ('A', colors.green),
+        b'D' => ('D', colors.red),
+        b'U' => ('!', colors.red),
+        b'R' | b'C' => ('R', colors.blue),
+        _ => ('M', colors.amber),
+    }
+}
+
+/// Which change a folder shows when it holds several: conflicts first, then
+/// edits, then new files.
+fn weight(status: u8) -> u8 {
+    match status {
+        b'U' => 3,
+        b'?' | b'A' => 1,
+        _ => 2,
     }
 }
 
@@ -47,6 +69,65 @@ fn item(colors: Palette, lead: impl IntoElement, name: &str, note: impl IntoElem
 }
 
 impl Workspace {
+    /// The folders the project spans, each with the branch it has checked out.
+    fn folders_section(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let colors = palette(cx);
+        let project = self.current_project();
+        project.path.as_ref()?;
+        let index = self.project;
+        let roots = project.roots();
+        let mut rows = col();
+        for (i, root) in roots.iter().enumerate() {
+            let branch = self.git_snapshots.get(root).and_then(|s| s.as_ref().ok()).map(|s| s.branch.clone());
+            let group = SharedString::from(format!("folder-{i}"));
+            let folder = root.clone();
+            rows = rows.child(
+                item(
+                    colors,
+                    icon(IconName::Folder).text_color(rgb(colors.muted)),
+                    &tilde(root),
+                    row()
+                        .gap_1()
+                        .when_some(branch, |s, branch| s.child(branch_chip(colors, branch).max_w(px(120.))))
+                        .when(i > 0, |s| {
+                            // Only added folders can go; the main one is the project.
+                            s.child(
+                                div().opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)).child(
+                                    icon_button(("remove-folder", i), IconName::Close, "Remove from project")
+                                        .xsmall()
+                                        .on_click(cx.listener(move |s, _, _, cx| s.remove_folder(index, &folder, cx))),
+                                ),
+                            )
+                        }),
+                )
+                .id(("folder", i))
+                .group(group)
+                .hover(|s| s.bg(rgb(colors.hover))),
+            );
+        }
+        Some(
+            col()
+                .child(
+                    row()
+                        .h(px(30.))
+                        .pl_3()
+                        .pr_1()
+                        .gap_2()
+                        .text_size(px(12.))
+                        .text_color(rgb(colors.muted))
+                        .child("Folders")
+                        .child(count_badge(colors, roots.len()))
+                        .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border)))
+                        .child(
+                            icon_button("add-folder", Glyph::FolderPlus, "Add a folder to this project")
+                                .xsmall()
+                                .on_click(cx.listener(move |s, _, window, cx| s.add_folders(index, window, cx))),
+                        ),
+                )
+                .child(rows),
+        )
+    }
+
     fn context_page(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
         let Some(thread) = self.current_thread() else {
@@ -158,8 +239,10 @@ impl Workspace {
                     .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::File(path.clone()), cx))),
             );
         }
+        let folders = self.folders_section(cx);
         col()
             .pb_3()
+            .children(folders)
             .when(thread.usage.is_some_and(|(_, size)| size > 0), |s| {
                 s.child(col().px_3().pt_3().pb_2().child(meter))
             })
@@ -184,21 +267,53 @@ impl Workspace {
 
     fn files_page(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
-        let Some(root) = self.current_project().path.clone() else {
+        let roots = self.current_project().roots();
+        if roots.is_empty() {
             return empty(colors, Glyph::Files, "No folder", "Chats aren't tied to a project. Add one from the rail to browse its files.").h(px(220.));
-        };
+        }
         let open = match &self.tabs[self.active].kind {
             TabKind::File(path) => Some(path.clone()),
             _ => None,
         };
-        let changed: Vec<PathBuf> = self.current_thread().map(|t| t.changes().into_iter().map(|c| c.path).collect()).unwrap_or_default();
+        // Git's view of every folder in the project, by absolute path. Files the
+        // agent edited outside any repository count as modified.
+        let mut changed: HashMap<PathBuf, u8> = HashMap::new();
+        for root in &roots {
+            if let Some(Ok(snapshot)) = self.git_snapshots.get(root) {
+                for e in &snapshot.entries {
+                    let status = if e.unstaged() { e.status(false) } else { e.status(true) };
+                    changed.insert(snapshot.root.join(&e.path), status);
+                }
+            }
+        }
+        if let Some(thread) = self.current_thread() {
+            for change in thread.changes() {
+                changed.entry(change.path).or_insert(if change.old.is_none() { b'A' } else { b'M' });
+            }
+        }
+        // A folder shows the weightiest change anywhere beneath it.
+        let inside = |folder: &Path| {
+            changed.iter().filter(|(p, _)| p.starts_with(folder) && p.as_path() != folder).map(|(_, s)| *s).max_by_key(|s| weight(*s))
+        };
         let mut rows = Vec::new();
-        self.tree_rows(&root, 0, &mut rows);
+        if let [root] = roots.as_slice() {
+            self.tree_rows(root, 0, &mut rows);
+        } else {
+            // Several folders: each is a top-level folder of its own.
+            for root in &roots {
+                let name = crate::model::folder_name(root);
+                rows.push((0, Entry { name: name.into(), path: root.clone(), dir: true }));
+                if self.expanded.contains(root) {
+                    self.tree_rows(root, 1, &mut rows);
+                }
+            }
+        }
         let mut list = col().py_1();
         for (i, (depth, entry)) in rows.into_iter().enumerate() {
             let expanded = self.expanded.contains(&entry.path);
             let active = open.as_ref() == Some(&entry.path);
-            let edited = changed.contains(&entry.path);
+            let status = if entry.dir { inside(&entry.path) } else { changed.get(&entry.path).copied() };
+            let mark = status.map(|s| change_mark(colors, s));
             let (path, dir) = (entry.path.clone(), entry.dir);
             list = list.child(
                 row()
@@ -228,8 +343,24 @@ impl Workspace {
                         })
                         .text_color(rgb(colors.muted)),
                     )
-                    .child(one_line(entry.name.clone(), 18.).flex_1().min_w_0().when(edited, |s| s.text_color(rgb(colors.amber))))
-                    .when(edited, |s| s.child(status_mark(colors, false)))
+                    .child(one_line(entry.name.clone(), 18.).flex_1().min_w_0().when_some(mark, |s, (_, hue)| s.text_color(rgb(hue))))
+                    .when_some(mark, |s, (letter, hue)| {
+                        s.child(if dir {
+                            // Folders get a dot: the letters are for the files inside.
+                            div().size(px(6.)).mr(px(3.)).flex_shrink_0().rounded_full().bg(rgb(hue)).into_any_element()
+                        } else {
+                            div()
+                                .w(px(12.))
+                                .flex_shrink_0()
+                                .text_center()
+                                .font_family(mono())
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(hue))
+                                .child(letter.to_string())
+                                .into_any_element()
+                        })
+                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if dir {
                             s.toggle_folder(&path, cx)

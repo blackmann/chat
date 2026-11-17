@@ -170,6 +170,7 @@ impl Workspace {
                         .absolute()
                         .bottom_full()
                         .left_0()
+                        .ml_2()
                         .mb_2()
                         .w_full()
                         .max_w(px(460.))

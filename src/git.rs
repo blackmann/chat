@@ -12,12 +12,34 @@ pub struct Entry {
     pub original: Option<PathBuf>,
     pub index: u8,
     pub worktree: u8,
+    /// Lines added and removed in the index (HEAD → index) and in the working
+    /// tree (index → working tree); `None` for binaries or no change on that side.
+    pub staged_stat: Option<(u32, u32)>,
+    pub unstaged_stat: Option<(u32, u32)>,
 }
 impl Entry {
     pub fn conflict(&self) -> bool {
         self.index == b'U'
             || self.worktree == b'U'
             || matches!((self.index, self.worktree), (b'A', b'A') | (b'D', b'D'))
+    }
+    pub fn untracked(&self) -> bool {
+        self.index == b'?'
+    }
+    /// The file's change on one side: the index's letter, or the working tree's.
+    pub fn status(&self, staged: bool) -> u8 {
+        if self.conflict() {
+            b'U'
+        } else if self.untracked() {
+            b'?'
+        } else if staged {
+            self.index
+        } else {
+            self.worktree
+        }
+    }
+    pub fn stat(&self, staged: bool) -> Option<(u32, u32)> {
+        if staged { self.staged_stat } else { self.unstaged_stat }
     }
     pub fn staged(&self) -> bool {
         !self.conflict() && !matches!(self.index, b' ' | b'?')
@@ -44,18 +66,26 @@ impl Entry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub root: PathBuf,
+    /// Where the repository keeps its index and refs: `.git`, or elsewhere for a worktree.
+    pub git_dir: PathBuf,
     pub branch: String,
     pub entries: Vec<Entry>,
 }
 #[derive(Clone, Debug)]
-pub struct Diff {
-    pub patch: String,
+pub enum Diff {
+    /// Both sides in full, for the view to diff and colour: an absent side is empty.
+    Text { old: String, new: String },
+    Binary,
+    /// Too large to show.
+    Large,
 }
 #[derive(Clone)]
 pub enum Operation {
     Stage(Vec<PathBuf>),
     Unstage(Vec<PathBuf>),
     Commit(String),
+    /// Commit every change to tracked files, staged or not, as `git commit -a` does.
+    CommitTracked(String),
 }
 
 fn command(root: &Path) -> Command {
@@ -86,70 +116,166 @@ fn path(bytes: &[u8]) -> PathBuf {
 fn path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
 }
-fn parse_status(bytes: &[u8]) -> Vec<Entry> {
+/// `status --porcelain=v2 --branch -z`: the branch headers, then one record per
+/// changed file (a rename's record is followed by its old path).
+fn parse_status(bytes: &[u8]) -> (String, Vec<Entry>) {
     let mut records = bytes.split(|b| *b == 0).filter(|r| !r.is_empty());
+    let (mut head, mut oid) = (None, None);
     let mut entries = Vec::new();
     while let Some(record) = records.next() {
-        if record.len() < 4 {
+        // Fields before the path: ordinary 8, renamed or copied 9, unmerged 10.
+        let fields = match record[0] {
+            b'#' => {
+                let text = String::from_utf8_lossy(record);
+                if let Some(name) = text.strip_prefix("# branch.head ") {
+                    head = Some(name.to_owned());
+                } else if let Some(sha) = text.strip_prefix("# branch.oid ") {
+                    oid = Some(sha.to_owned());
+                }
+                continue;
+            }
+            b'?' => {
+                entries.push(Entry {
+                    path: path(&record[2.min(record.len())..]),
+                    original: None,
+                    index: b'?',
+                    worktree: b'?',
+                    staged_stat: None,
+                    unstaged_stat: None,
+                });
+                continue;
+            }
+            b'1' => 8,
+            b'2' => 9,
+            b'u' => 10,
+            _ => continue,
+        };
+        let mut parts = record.splitn(fields + 1, |b| *b == b' ');
+        let xy = parts.nth(1).unwrap_or_default();
+        let Some(name) = parts.nth(fields - 2) else { continue };
+        if xy.len() != 2 {
             continue;
         }
-        let original = if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
-            records.next().map(path)
-        } else {
-            None
-        };
+        // v2 marks an unchanged side with '.', v1 (and the rest of the app) with ' '.
+        let letter = |b: u8| if b == b'.' { b' ' } else { b };
         entries.push(Entry {
-            path: path(&record[3..]),
-            original,
-            index: record[0],
-            worktree: record[1],
+            path: path(name),
+            original: if record[0] == b'2' { records.next().map(path) } else { None },
+            index: letter(xy[0]),
+            worktree: letter(xy[1]),
+            staged_stat: None,
+            unstaged_stat: None,
         });
     }
-    entries
+    // Detached: the commit, shortened as `rev-parse --short` would.
+    let branch = match head.as_deref() {
+        Some("(detached)") | None => oid.map(|o| o.chars().take(7).collect()).unwrap_or_default(),
+        Some(name) => name.to_owned(),
+    };
+    (branch, entries)
 }
 pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
-    let root = run(folder, &["rev-parse", "--show-toplevel"])?;
-    let root = path(root.strip_suffix(b"\n").unwrap_or(&root));
-    let branch = run(&root, &["symbolic-ref", "--short", "HEAD"])
-        .or_else(|_| run(&root, &["rev-parse", "--short", "HEAD"]))?;
-    let entries = parse_status(&run(
+    let dirs = run(folder, &["rev-parse", "--show-toplevel", "--absolute-git-dir"])?;
+    let mut dirs = dirs.split(|b| *b == b'\n');
+    let (Some(root), Some(git_dir)) = (dirs.next().map(path), dirs.next().map(path)) else {
+        return Err("Not a working tree.".into());
+    };
+    let (branch, mut entries) = parse_status(&run(
         &root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
     )?);
-    Ok(Snapshot {
-        root,
-        branch: String::from_utf8_lossy(&branch).trim().into(),
-        entries,
-    })
-}
-pub fn diff(root: &Path, entry: &Entry, staged: bool) -> Result<Diff, String> {
-    let mut cmd = command(root);
-    if entry.index == b'?' {
-        // --no-index handles binary files and symlinks, and returns 1 for a diff.
-        cmd.args([
-            "diff",
-            "--no-index",
-            "--no-color",
-            "--no-ext-diff",
-            "--",
-            "/dev/null",
-        ])
-        .arg(root.join(&entry.path));
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        if !matches!(out.status.code(), Some(0 | 1)) {
-            return Err(String::from_utf8_lossy(&out.stderr).into());
+    let numstat = |cached: bool| {
+        let mut args = vec!["diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv"];
+        if cached {
+            args.push("--cached");
         }
-        return Ok(Diff {
-            patch: String::from_utf8_lossy(&out.stdout).into(),
-        });
+        run(&root, &args).map(|out| parse_numstat(&out)).unwrap_or_default()
+    };
+    let (staged, unstaged) = (numstat(true), numstat(false));
+    let find = |stats: &[(PathBuf, Option<(u32, u32)>)], path: &Path| {
+        stats.iter().find(|(p, _)| p == path).and_then(|(_, stat)| *stat)
+    };
+    for entry in &mut entries {
+        if entry.untracked() {
+            entry.unstaged_stat = line_count(&root.join(&entry.path)).map(|n| (n, 0));
+        } else {
+            entry.staged_stat = find(&staged, &entry.path);
+            entry.unstaged_stat = find(&unstaged, &entry.path);
+        }
     }
-    cmd.args(["diff", "--no-color", "--no-ext-diff", "--no-textconv"]);
-    if staged {
-        cmd.arg("--cached");
+    Ok(Snapshot { root, git_dir, branch, entries })
+}
+/// `--numstat -z` records: counts and a path, or counts, nothing, and two paths for a rename.
+fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
+    let mut fields = bytes.split(|b| *b == 0);
+    let mut out = Vec::new();
+    while let Some(record) = fields.next() {
+        let mut parts = record.splitn(3, |b| *b == b'\t');
+        let (Some(adds), Some(dels), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let number = |b: &[u8]| std::str::from_utf8(b).ok()?.parse::<u32>().ok();
+        let stat = number(adds).zip(number(dels));
+        let name = if name.is_empty() {
+            // A rename: the old path, then the new one.
+            let _ = fields.next();
+            match fields.next() {
+                Some(new) => new,
+                None => break,
+            }
+        } else {
+            name
+        };
+        out.push((path(name), stat));
     }
-    cmd.arg("--").args(entry.paths());
-    Ok(Diff {
-        patch: String::from_utf8_lossy(&checked(cmd.output())?).into(),
+    out
+}
+
+/// Lines in an untracked file, when it is small enough and text.
+fn line_count(file: &Path) -> Option<u32> {
+    if std::fs::metadata(file).ok()?.len() > 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(file).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    let lines = bytes.iter().filter(|b| **b == b'\n').count() + usize::from(bytes.last().is_some_and(|b| *b != b'\n'));
+    Some(lines as u32)
+}
+
+/// One side of a file's change: HEAD → index when `staged`, index → working tree otherwise.
+/// Files past this size aren't diffed in the view.
+const MAX_DIFF: usize = 2 * 1024 * 1024;
+
+/// A blob from the object store, as `git show` prints it: `HEAD:path` or `:path`.
+fn blob(root: &Path, spec: &Path, staged_side: &str) -> Option<Vec<u8>> {
+    let mut arg = OsString::from(staged_side);
+    arg.push(spec.as_os_str());
+    command(root).arg("show").arg(arg).output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+}
+
+/// One side of a file's change: HEAD → index when `staged`, index → working tree
+/// otherwise, as the two texts.
+pub fn diff(root: &Path, entry: &Entry, staged: bool) -> Result<Diff, String> {
+    // A rename's old side lives at its old path.
+    let before_path = entry.original.as_deref().unwrap_or(&entry.path);
+    let (old, new) = if staged {
+        (blob(root, before_path, "HEAD:"), blob(root, &entry.path, ":"))
+    } else if entry.untracked() {
+        (None, std::fs::read(root.join(&entry.path)).ok())
+    } else {
+        let index = if matches!(entry.index, b'R' | b'C') { &entry.path } else { before_path };
+        (blob(root, index, ":"), std::fs::read(root.join(&entry.path)).ok())
+    };
+    let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
+    if old.len() > MAX_DIFF || new.len() > MAX_DIFF {
+        return Ok(Diff::Large);
+    }
+    let text = |bytes: Vec<u8>| (!bytes.contains(&0)).then(|| String::from_utf8(bytes).ok()).flatten();
+    Ok(match (text(old), text(new)) {
+        (Some(old), Some(new)) => Diff::Text { old, new },
+        _ => Diff::Binary,
     })
 }
 pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
@@ -168,17 +294,14 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
             }
             checked(cmd.args(paths).output())?;
         }
+        Operation::Commit(message) | Operation::CommitTracked(message) if message.trim().is_empty() => {
+            return Err("Enter a commit message.".into());
+        }
         Operation::Commit(message) => {
-            if message.trim().is_empty() {
-                return Err("Enter a commit message.".into());
-            }
-            checked(
-                command(root)
-                    .arg("commit")
-                    .arg("-m")
-                    .arg(OsString::from(message))
-                    .output(),
-            )?;
+            checked(command(root).arg("commit").arg("-m").arg(OsString::from(message)).output())?;
+        }
+        Operation::CommitTracked(message) => {
+            checked(command(root).arg("commit").arg("-a").arg("-m").arg(OsString::from(message)).output())?;
         }
     }
     Ok(())
@@ -190,9 +313,12 @@ mod tests {
     struct Repo(PathBuf);
     impl Repo {
         fn new() -> Self {
+            // The clock is too coarse to tell tests started together apart.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let root = std::env::temp_dir().join(format!(
-                "chat-git-{}-{}",
+                "chat-git-{}-{}-{}",
                 std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -232,8 +358,13 @@ mod tests {
         let s = snapshot(&r.0).unwrap();
         let e = &s.entries[0];
         assert!(e.staged() && e.unstaged());
-        assert!(diff(&r.0, e, true).unwrap().patch.contains("+index"));
-        assert!(diff(&r.0, e, false).unwrap().patch.contains("+worktree"));
+        assert_eq!((e.staged_stat, e.unstaged_stat), (Some((1, 1)), Some((1, 1))));
+        let sides = |staged| match diff(&r.0, e, staged).unwrap() {
+            Diff::Text { old, new } => (old, new),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(sides(true), ("base\n".into(), "index\n".into()));
+        assert_eq!(sides(false), ("index\n".into(), "worktree\n".into()));
         r.commit();
         assert_eq!(
             std::fs::read_to_string(r.0.join("a")).unwrap(),
@@ -285,12 +416,7 @@ mod tests {
         r.commit();
         std::fs::remove_file(r.0.join("a")).unwrap();
         let s = snapshot(&r.0).unwrap();
-        assert!(
-            diff(&r.0, &s.entries[0], false)
-                .unwrap()
-                .patch
-                .contains("-base")
-        );
+        assert!(matches!(diff(&r.0, &s.entries[0], false).unwrap(), Diff::Text { old, new } if old == "base\n" && new.is_empty()));
         std::fs::write(r.0.join("binary"), [0, 1, 2]).unwrap();
         let s = snapshot(&r.0).unwrap();
         let e = s
@@ -298,6 +424,46 @@ mod tests {
             .iter()
             .find(|e| e.path == Path::new("binary"))
             .unwrap();
-        assert!(diff(&r.0, e, false).unwrap().patch.contains("Binary files"));
+        assert!(matches!(diff(&r.0, e, false).unwrap(), Diff::Binary));
+        assert_eq!(e.unstaged_stat, None);
+    }
+    #[test]
+    fn stats_before_the_first_commit_and_for_untracked_files() {
+        let r = Repo::new();
+        r.write("staged", "one\ntwo\n");
+        r.stage("staged");
+        r.write("loose", "a\nb\nc");
+        let s = snapshot(&r.0).unwrap();
+        let entry = |name: &str| s.entries.iter().find(|e| e.path == Path::new(name)).unwrap();
+        assert_eq!(entry("staged").staged_stat, Some((2, 0)));
+        assert_eq!(entry("loose").unstaged_stat, Some((3, 0)));
+    }
+    #[test]
+    fn branch_unborn_named_and_detached() {
+        let r = Repo::new();
+        run(&r.0, &["checkout", "-q", "-b", "topic"]).unwrap();
+        assert_eq!(snapshot(&r.0).unwrap().branch, "topic");
+        r.write("a", "base\n");
+        r.stage("a");
+        r.commit();
+        assert_eq!(snapshot(&r.0).unwrap().branch, "topic");
+        run(&r.0, &["checkout", "-q", "--detach"]).unwrap();
+        let short = run(&r.0, &["rev-parse", "--short=7", "HEAD"]).unwrap();
+        assert_eq!(snapshot(&r.0).unwrap().branch.as_bytes(), short.trim_ascii());
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.git_dir.ends_with(".git"));
+    }
+    #[test]
+    fn commit_tracked_leaves_untracked_files() {
+        let r = Repo::new();
+        r.write("a", "base\n");
+        r.stage("a");
+        r.commit();
+        r.write("a", "edited\n");
+        r.write("new", "x\n");
+        operate(&r.0, Operation::CommitTracked("tracked".into())).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert!(s.entries[0].untracked());
     }
 }

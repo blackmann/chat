@@ -14,9 +14,84 @@ use lsp_types::{Color, ColorInformation, Position, Range};
 const COLUMN: f32 = 760.;
 /// How much of a tool's output an opened tool call shows: the end, where results are.
 const TOOL_OUTPUT_LINES: usize = 200;
-/// Word joiner is zero-width but survives ordinary editing and copying, so it
-/// can bind a visible basename to its full path without showing that path.
-const FILE_MARKER: &str = "\u{2060}";
+use super::mentions::MARKER as FILE_MARKER;
+
+/// The file a link points at, and the 1-based lines it names, if any:
+/// `file://` URLs and paths, absolute or relative to `root`, ending in
+/// `:12`, `:12:3`, `:12-20`, `#L12` or `#L12-L20`.
+fn link_path(url: &str, root: Option<&Path>) -> Option<(PathBuf, Option<(usize, usize)>)> {
+    let raw = url.strip_prefix("file://").unwrap_or(url);
+    let (raw, anchor) = match raw.split_once('#') {
+        Some((p, a)) => (p, Some(a)),
+        None => (raw, None),
+    };
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let raw = percent_decode(raw);
+    if raw.is_empty() || raw.contains("://") {
+        return None;
+    }
+    let resolve = |p: &str| -> PathBuf {
+        let p = Path::new(p);
+        match root {
+            Some(root) if p.is_relative() => root.join(p),
+            _ => p.to_path_buf(),
+        }
+    };
+    let mut lines = anchor.and_then(anchor_lines);
+    // A trailing `:line`, `:line:col` or `:line-line`, unless it's the file's name.
+    let mut candidate = raw.as_str();
+    let mut suffix = Vec::new();
+    for _ in 0..2 {
+        if resolve(candidate).exists() {
+            break;
+        }
+        match candidate.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit() || b == b'-') => {
+                suffix.insert(0, tail);
+                candidate = head;
+            }
+            _ => break,
+        }
+    }
+    if lines.is_none()
+        && let Some(first) = suffix.first()
+    {
+        lines = line_range(first);
+    }
+    Some((resolve(candidate), lines))
+}
+
+/// `12` or `12-20` as a range of lines.
+fn line_range(s: &str) -> Option<(usize, usize)> {
+    let (a, b) = s.split_once('-').unwrap_or((s, s));
+    let a: usize = a.parse().ok().filter(|&n| n > 0)?;
+    let b = b.parse::<usize>().unwrap_or(a).max(a);
+    Some((a, b))
+}
+
+/// GitHub's `L12` or `L12-L20` anchors.
+fn anchor_lines(anchor: &str) -> Option<(usize, usize)> {
+    let a = anchor.strip_prefix('L')?;
+    line_range(&a.replace("-L", "-"))
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(b) = s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
 
 /// Agent thought updates often arrive as short lines separated by blank lines.
 /// Empty lines are spacing, not another selectable update.
@@ -30,23 +105,8 @@ fn thought_lines(text: &str) -> Vec<SharedString> {
     if lines.is_empty() { vec![SharedString::default()] } else { lines }
 }
 
-fn dropped_path(path: &Path, root: Option<&Path>) -> String {
-    let shown = root
-        .and_then(|root| path.strip_prefix(root).ok())
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(path);
-    format!("@{}", shown.to_string_lossy())
-}
-
-fn file_mention(path: &Path, root: Option<&Path>) -> FileMention {
-    let label = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
-    // Non-breaking spaces supply the horizontal padding inside the highlight.
-    let token = format!("{FILE_MARKER}\u{a0}{label}\u{a0}{FILE_MARKER}");
-    FileMention { token, label, path: dropped_path(path, root) }
-}
-
 fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>) -> String {
-    let added = paths.paths().iter().map(|path| file_mention(path, root)).collect::<Vec<_>>();
+    let added = paths.paths().iter().map(|path| super::mentions::path_mention(path, root)).collect::<Vec<_>>();
     let mut text = added.iter().map(|mention| mention.token.as_str()).collect::<Vec<_>>().join(" ");
     mentions.extend(added);
     if !text.is_empty() {
@@ -55,16 +115,43 @@ fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<
     text
 }
 
-pub(super) fn replace_file_mentions(text: &str, mentions: &[FileMention], paths: bool) -> String {
+/// What a mention becomes when the composer's text leaves it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mentions {
+    /// Its name, as in a thread's title.
+    Names,
+    /// Its path, so the agent knows where the file is.
+    Paths,
+    /// A chip link the transcript draws as it looked in the composer.
+    Chips,
+}
+
+/// Backslash-escape what Markdown would otherwise read as syntax.
+fn escape_markdown(text: &str) -> String {
+    text.chars().fold(String::new(), |mut out, c| {
+        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '<' | '>') {
+            out.push('\\');
+        }
+        out.push(c);
+        out
+    })
+}
+
+pub(super) fn replace_file_mentions(text: &str, mentions: &[FileMention], mode: Mentions) -> String {
     let mut text = text.to_string();
     for mention in mentions {
-        text = text.replacen(&mention.token, if paths { &mention.path } else { &mention.label }, 1);
+        let with = match mode {
+            Mentions::Names => mention.label.clone(),
+            Mentions::Paths => mention.sent.clone(),
+            Mentions::Chips => format!("[{}](<chip:{}|{}>)", escape_markdown(&mention.label), mention.icon, mention.reference.replace(['<', '>', '\n'], "")),
+        };
+        text = text.replacen(&mention.token, &with, 1);
     }
     // If a token was partially edited, do not leak its invisible delimiters.
     text.replace(FILE_MARKER, "")
 }
 
-fn position(text: &str, offset: usize) -> Position {
+pub(super) fn lsp_position(text: &str, offset: usize) -> Position {
     let before = &text[..offset];
     let line = before.bytes().filter(|byte| *byte == b'\n').count() as u32;
     let column = before.rsplit_once('\n').map_or(before, |(_, line)| line).encode_utf16().count() as u32;
@@ -100,7 +187,7 @@ impl DocumentColorProvider for FileMentionColors {
             for (start, _) in text.match_indices(&mention.token) {
                 let start = start + FILE_MARKER.len();
                 let end = start + mention.token.len() - FILE_MARKER.len() * 2;
-                colors.push(ColorInformation { range: Range::new(position(&text, start), position(&text, end)), color });
+                colors.push(ColorInformation { range: Range::new(lsp_position(&text, start), lsp_position(&text, end)), color });
             }
         }
         Task::ready(Ok(colors))
@@ -126,14 +213,15 @@ fn option(colors: Palette, id: &'static str, glyph: impl Into<Icon>, text: impl 
 }
 
 /// A menu of everything a session setting can be, the current value checked.
-fn choices(setting: &Setting, weak: WeakEntity<Workspace>) -> Vec<Entry> {
+/// Descriptions are left out where the names say enough, as for models.
+pub(super) fn choices(setting: &Setting, weak: WeakEntity<Workspace>, describe: bool) -> Vec<Entry> {
     let mut entries = vec![Entry::Label(setting.name.clone().into())];
     for choice in &setting.choices {
         let (weak, id, value) = (weak.clone(), setting.id.clone(), choice.id.clone());
         let mut item = Item::new(choice.name.clone()).checked(choice.id == setting.current).on_click(move |_, cx| {
             let _ = weak.update(cx, |s, cx| s.set_setting(id.clone(), value.clone(), cx));
         });
-        if let Some(detail) = &choice.detail {
+        if describe && let Some(detail) = &choice.detail {
             item = item.description(detail.clone());
         }
         entries.push(Entry::Item(item));
@@ -155,7 +243,69 @@ impl Workspace {
         });
     }
 
-    fn user_block(&self, colors: Palette, text: &SharedString) -> Div {
+    /// Put a snippet's chip at the composer's caret, on the chat tab.
+    pub(super) fn insert_mention(&mut self, mut added: FileMention, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            // Snippets with the same label would share a token and could swap places when sent.
+            let mentions = self.file_mentions.borrow();
+            let label = added.label.clone();
+            let mut n = 2;
+            while mentions.iter().any(|m| m.token == added.token && m.sent != added.sent) {
+                added = super::mentions::relabel(&added, &format!("{label} ({n})"));
+                n += 1;
+            }
+        }
+        let token = format!("{} ", added.token);
+        self.file_mentions.borrow_mut().push(added);
+        self.active = 0;
+        self.composer.update(cx, |input, cx| {
+            input.replace_text_in_range(None, &token, window, cx);
+            input.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// ⌘ L: add the selected lines of a file or diff, or else the transcript's
+    /// selected text, to the message being written.
+    pub(super) fn add_to_chat(&mut self, _: &AddToChat, window: &mut Window, cx: &mut Context<Self>) {
+        let added = match self.line_selection.take() {
+            Some(lines) => self.lines_mention(&lines),
+            None => self.selection.borrow().text().filter(|t| !t.trim().is_empty()).map(|t| super::mentions::quote_mention(&t)),
+        };
+        self.selection.borrow_mut().clear();
+        match added {
+            Some(added) => self.insert_mention(added, window, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// The floating "Add to chat" button over a selection.
+    pub(super) fn add_to_chat_button(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        let colors = palette(cx);
+        row()
+            .id(id)
+            .occlude()
+            .h(px(26.))
+            .px_2()
+            .gap_2()
+            .rounded(px(6.))
+            .bg(rgb(colors.popover))
+            .border_1()
+            .border_color(rgb(colors.popover_border))
+            .shadow_md()
+            .cursor_pointer()
+            .font_family(crate::theme::ui_font())
+            .text_size(px(12.))
+            .hover(|s| s.bg(rgb(colors.hover)))
+            .child(icon(IconName::Plus).size(px(12.)))
+            .child("Add to chat")
+            .child(div().text_color(rgb(colors.quiet)).child("⌘ L"))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|s, _, window, cx| s.add_to_chat(&AddToChat, window, cx)))
+    }
+
+    /// What you sent, rendered as Markdown with mentions as chips, as it looked when typed.
+    fn user_block(&self, colors: Palette, thread: usize, block: usize, text: &SharedString, on_link: &md::OnLink) -> Div {
         div()
             .mt_2()
             .px_3()
@@ -164,11 +314,19 @@ impl Workspace {
             .border_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.panel))
-            .line_height(relative(1.5))
-            .child(text.clone())
+            .child(md::render(
+                SharedString::from(format!("user-{thread}-{block}")),
+                text,
+                md::Breaks::Hard,
+                colors,
+                mono(),
+                px(crate::theme::MONO_SIZE),
+                Some((self.selection.clone(), block)),
+                Some(on_link.clone()),
+            ))
     }
 
-    fn queued_block(&self, colors: Palette, text: &SharedString) -> Div {
+    fn queued_block(&self, colors: Palette, n: usize, text: &SharedString) -> Div {
         col()
             .mt_2()
             .px_3()
@@ -179,7 +337,7 @@ impl Workspace {
             .border_color(rgb(colors.border))
             .bg(rgb(colors.panel))
             .child(div().text_size(px(11.)).text_color(rgb(colors.quiet)).child("Queued"))
-            .child(div().line_height(relative(1.5)).child(text.clone()))
+            .child(md::render(SharedString::from(format!("queued-{n}")), text, md::Breaks::Hard, colors, mono(), px(crate::theme::MONO_SIZE), None, None))
     }
 
     /// Thought progress stays one row tall. Each short vertical marker stands
@@ -475,7 +633,7 @@ impl Workspace {
         // The composer sits low in the window, so its menus open upward.
         let agent = self.popover_trigger(
             "agent",
-            option(colors, "agent-button", IconName::Bot, self.agent_name(thread).to_string(), "Agent"),
+            option(colors, "agent-button", self.agent_glyph(thread.agent), self.agent_name(thread).to_string(), "Agent"),
             Corner::BottomRight,
             260.,
             None,
@@ -488,6 +646,7 @@ impl Workspace {
                     let weak = weak.clone();
                     entries.push(Entry::Item(
                         Item::new(spec.name.clone())
+                            .icon(super::chrome::agent_glyph(Some(spec)))
                             .checked(current == Some(i))
                             .disabled(started && current != Some(i))
                             .on_click(move |_, cx| {
@@ -500,7 +659,7 @@ impl Workspace {
             cx,
         );
         // Whatever the agent lets a session change shows up here, and applies mid-thread.
-        let setting = |role: Role, anchor: &'static str, button: &'static str, glyph: Icon, corner: Corner, tip: &'static str, cx: &mut Context<Self>| {
+        let setting = |role: Role, anchor: &'static str, button: &'static str, glyph: Icon, corner: Corner, tip: &'static str, describe: bool, cx: &mut Context<Self>| {
             let setting = thread.settings.iter().find(|s| s.role == role)?;
             Some(self.popover_trigger(
                 anchor,
@@ -508,13 +667,27 @@ impl Workspace {
                 corner,
                 300.,
                 None,
-                move |s, weak, _| s.setting(role).map(|setting| choices(setting, weak)).unwrap_or_default(),
+                move |s, weak, _| s.setting(role).map(|setting| choices(setting, weak, describe)).unwrap_or_default(),
                 cx,
             ))
         };
-        let mode = setting(Role::Mode, "mode", "mode-button", Glyph::ShieldCheck.into(), Corner::BottomLeft, "How much the agent may do before asking", cx);
-        let model = setting(Role::Model, "model", "model-button", Glyph::Sparkle.into(), Corner::BottomRight, "Model", cx);
-        let effort = setting(Role::Effort, "effort", "effort-button", Glyph::Gauge.into(), Corner::BottomRight, "Reasoning effort", cx);
+        let mode = setting(Role::Mode, "mode", "mode-button", Glyph::ShieldCheck.into(), Corner::BottomLeft, "How much the agent may do before asking", true, cx);
+        let model = setting(Role::Model, "model", "model-button", Glyph::Sparkle.into(), Corner::BottomRight, "Model", false, cx);
+        // Effort is a scale, so it gets a slider rather than a list.
+        let effort = thread.settings.iter().find(|s| s.role == Role::Effort).map(|setting| {
+            self.anchor(
+                "effort",
+                option(colors, "effort-button", Glyph::Gauge, setting.current_name().to_string(), "Reasoning effort")
+                    .when(self.effort_open, |s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        if s.dismissed.take().is_some_and(|(a, at)| a == "effort" && at.elapsed() < Duration::from_millis(400)) {
+                            return;
+                        }
+                        s.effort_open = !s.effort_open;
+                        cx.notify();
+                    })),
+            )
+        });
         let follow_up = self.settings.follow_up_mode;
         let supports_steering = thread.supports_steering;
         let stop = busy.then(|| {
@@ -558,20 +731,27 @@ impl Workspace {
                 Tooltip::new(tip).build(w, cx)
             })
             .on_click(cx.listener(|s, _, w, cx| s.submit(&Submit, w, cx)));
+        // Docked across the bottom of the chat, edge to edge, under a single rule.
         let composer = col()
-            .rounded(px(10.))
-            .border_1()
+            .w_full()
+            .min_h(px(112.))
+            .border_t_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.panel))
-            .drag_over::<ExternalPaths>(move |s, _, _, _| s.border_color(rgb(colors.blue)))
+            .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(rgb(colors.blue_tint)).border_color(rgb(colors.blue)))
             .on_drop(cx.listener(|s, paths: &ExternalPaths, window, cx| {
                 s.insert_dropped_paths(paths, window, cx);
             }))
-            .child(div().key_context("Composer").px_1().pt_1().child(Input::new(&self.composer).appearance(false)))
+            .child(
+                div().key_context("Composer").flex_1().px(px(14.)).pt(px(12.)).pb(px(6.)).child(
+                    // No padding of its own, so its text starts at its top-left and chips land true.
+                    div().relative().child(Input::new(&self.composer).appearance(false).p_0()).child(self.chip_overlay(colors)),
+                ),
+            )
             .child(
                 row()
                     .h(px(36.))
-                    .px(px(6.))
+                    .px(px(8.))
                     .gap(px(2.))
                     .children(mode)
                     .when(thread.session.is_some() && !thread.ready, |s| {
@@ -584,7 +764,30 @@ impl Workspace {
                     .children(stop)
                     .child(send),
             );
-        self.with_command_menu(composer, colors, window, cx)
+        let composer = self.with_command_menu(composer, colors, window, cx);
+        self.with_mention_menu(composer, colors, window, cx)
+    }
+
+    /// Clicking a link in the transcript: web links go to the browser, paths to
+    /// the project's files (agents link them as `src/x.rs`, `src/x.rs:12` or
+    /// `file:///…`), opened in a tab beside the chat.
+    fn link_opener(&self, cx: &mut Context<Self>) -> md::OnLink {
+        let root = self.current_project().path.clone();
+        let this = cx.entity().downgrade();
+        std::rc::Rc::new(move |url: &str, _window: &mut Window, cx: &mut App| {
+            if md::is_web(url) {
+                return cx.open_url(url);
+            }
+            match link_path(url, root.as_deref()) {
+                Some((path, lines)) if path.is_file() => {
+                    this.update(cx, |s, cx| s.open_at(path, lines, cx)).ok();
+                }
+                Some((path, _)) if path.exists() => cx.reveal_path(&path),
+                // Some other app's scheme, such as `vscode://` or `zed://`.
+                _ if url.contains("://") => cx.open_url(url),
+                _ => {}
+            }
+        })
     }
 
     pub(super) fn chat_view(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -596,12 +799,20 @@ impl Workspace {
         // percentage width GPUI sized the column before its text had wrapped, so the
         // scroll range stopped short of the last lines.
         let available = self.transcript.bounds().size.width;
+        // Where the selection was last painted, for its "Add to chat" button,
+        // before text records where it lands this time.
+        let selection_ends = {
+            let selection = self.selection.borrow();
+            (!selection.is_empty() && !selection.dragging).then(|| selection.ends())
+        };
+        self.selection.borrow_mut().forget_layout();
         let mut list = col().px_5().pt_3().pb_5().gap(px(6.)).map(|s| {
             if available > px(0.) { s.w(available.min(px(COLUMN))) } else { s.w_full().max_w(px(COLUMN)) }
         });
+        let on_link = self.link_opener(cx);
         for (i, block) in thread.blocks.iter().enumerate() {
             list = list.child(match block {
-                Block::User(text) => self.user_block(colors, text),
+                Block::User(text) => self.user_block(colors, thread.id, i, text, &on_link),
                 Block::Text(text) => div().py(px(5.)).child(md::render(
                     SharedString::from(format!("md-{}-{i}", thread.id)),
                     text.trim(),
@@ -609,6 +820,8 @@ impl Workspace {
                     colors,
                     mono(),
                     px(crate::theme::MONO_SIZE),
+                    Some((self.selection.clone(), i)),
+                    Some(on_link.clone()),
                 )),
                 Block::Thought(text) => self.thought_block(colors, thread.id, i, text, cx),
                 Block::Tool(tool) => self.tool_block(window, colors, thread.id, i, tool, cx),
@@ -623,8 +836,8 @@ impl Workspace {
                     .child(div().flex_1().min_w_0().line_height(relative(1.5)).child(text.clone())),
             });
         }
-        for queued in &thread.queued {
-            list = list.child(self.queued_block(colors, &queued.shown));
+        for (n, queued) in thread.queued.iter().enumerate() {
+            list = list.child(self.queued_block(colors, n, &queued.shown));
         }
         if thread.state == ThreadState::Running {
             list = list.child(
@@ -674,39 +887,109 @@ impl Workspace {
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.transcript)
+                // Any scroll up lets go of the end; reaching it again takes hold.
+                .on_scroll_wheel(cx.listener(|s, e: &ScrollWheelEvent, _, _| {
+                    let dy = e.delta.pixel_delta(px(16.)).y;
+                    if dy > px(0.) {
+                        s.follow = false;
+                    } else if dy < px(0.) {
+                        let end = -s.transcript.max_offset().height;
+                        s.follow = s.transcript.offset().y + dy <= end + px(2.);
+                    }
+                }))
+                // Dragging over text selects it; ⌘ C copies it.
+                .on_mouse_down(MouseButton::Left, cx.listener(|s, e: &MouseDownEvent, window, cx| {
+                    s.line_selection = None;
+                    if s.selection.borrow_mut().press(e.position, e.click_count, e.modifiers.shift) {
+                        // Away from the composer, so ⌘ C reaches the transcript.
+                        s.focus.focus(window);
+                    }
+                    cx.notify();
+                }))
+                .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
+                    if e.pressed_button == Some(MouseButton::Left) && s.selection.borrow_mut().drag(e.position) {
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(MouseButton::Left, cx.listener(|s, _, _, cx| {
+                    s.selection.borrow_mut().dragging = false;
+                    cx.notify();
+                }))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, cx| {
+                    s.selection.borrow_mut().dragging = false;
+                    cx.notify();
+                }))
                 .child(list.mx_auto())
                 .into_any_element()
         };
         col()
             .size_full()
-            .child(div().flex_1().min_h_0().child(transcript))
-            .child(
-                row().flex_shrink_0().justify_center().px_5().pb_4().child(
-                    div().w_full().max_w(px(COLUMN - 40.)).child(self.composer_view(colors, thread, window, cx)),
-                ),
-            )
+            .child(div().flex_1().min_h_0().child(transcript).when_some(selection_ends, |s, (start, end)| {
+                // Below the selection's last line; above its first when the end is
+                // scrolled away; in the transcript's corner when both are.
+                let view = self.transcript.bounds();
+                let visible = |p: &Point<Pixels>| p.y >= view.top() && p.y <= view.bottom();
+                let (corner, at) = match (end.filter(visible), start.filter(visible)) {
+                    (Some(end), _) => (Corner::TopLeft, point(end.x, end.y + px(6.))),
+                    (None, Some(start)) => (Corner::BottomLeft, point(start.x, start.y - px(6.))),
+                    (None, None) => (Corner::BottomRight, view.bottom_right() - point(px(16.), px(12.))),
+                };
+                s.child(
+                    deferred(
+                        anchored()
+                            .anchor(corner)
+                            .position(at)
+                            .snap_to_window_with_margin(px(8.))
+                            .child(self.add_to_chat_button("add-selection", cx)),
+                    )
+                    .with_priority(1),
+                )
+            }))
+            .child(div().flex_shrink_0().w_full().child(self.composer_view(colors, thread, window, cx)))
             .into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{file_mention, replace_file_mentions, thought_lines};
+    use super::{Mentions, replace_file_mentions, thought_lines};
+    use super::super::mentions::path_mention as file_mention;
     use std::path::Path;
 
+    #[test]
+    fn file_links_resolve_against_the_project() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let md = root.join("src/workspace/md.rs");
+        for (url, lines) in [
+            ("src/workspace/md.rs", None),
+            ("src/workspace/md.rs:12", Some((12, 12))),
+            ("src/workspace/md.rs:12:4", Some((12, 12))),
+            ("src/workspace/md.rs:12-20", Some((12, 20))),
+            ("src/workspace/md.rs#L12", Some((12, 12))),
+            ("src/workspace/md.rs#L12-L20", Some((12, 20))),
+        ] {
+            assert_eq!(super::link_path(url, Some(root)), Some((md.clone(), lines)), "{url}");
+        }
+        let file_url = format!("file://{}#L3", md.display());
+        assert_eq!(super::link_path(&file_url, None), Some((md.clone(), Some((3, 3)))));
+        assert_eq!(super::link_path("/tmp/a%20b.txt", None), Some((std::path::PathBuf::from("/tmp/a b.txt"), None)));
+        assert_eq!(super::link_path("zed://file", Some(root)), None);
+    }
     #[test]
     fn dropped_project_file_shows_only_its_name_and_sends_its_path() {
         let mention = file_mention(Path::new("/project/src/main.rs"), Some(Path::new("/project")));
         assert!(!mention.token.contains("src/"));
         assert!(mention.token.contains("main.rs"));
-        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], false), "main.rs");
-        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], true), "@src/main.rs");
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], Mentions::Names), "main.rs");
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], Mentions::Paths), "@src/main.rs");
+        let chip = replace_file_mentions(&mention.token, &[mention.clone()], Mentions::Chips);
+        assert!(chip.starts_with("[main.rs](<chip:") && chip.ends_with("|@src/main.rs>)"));
     }
 
     #[test]
     fn dropped_external_file_sends_its_absolute_path() {
         let mention = file_mention(Path::new("/tmp/example.txt"), Some(Path::new("/project")));
-        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], true), "@/tmp/example.txt");
+        assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], Mentions::Paths), "@/tmp/example.txt");
     }
 
     #[test]
