@@ -158,6 +158,10 @@ pub struct Workspace {
     files: HashMap<PathBuf, Result<Rc<FileView>, SharedString>>,
     /// Where each open file is scrolled, so a link can jump to a line.
     file_scroll: HashMap<PathBuf, UniformListScrollHandle>,
+    /// Each open file's changes since HEAD and blame, read in the background.
+    file_git: HashMap<PathBuf, Rc<crate::git::FileInfo>>,
+    /// File views show who last changed each line.
+    show_blame: bool,
     /// Lines a link jumped to, lit briefly so the eye finds them.
     flash: Option<Flash>,
     terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
@@ -323,6 +327,8 @@ impl Workspace {
             listings: HashMap::new(),
             files: HashMap::new(),
             file_scroll: HashMap::new(),
+            file_git: HashMap::new(),
+            show_blame: true,
             flash: None,
             terminal: None,
             views: HashMap::new(),
@@ -898,6 +904,7 @@ impl Workspace {
         if let TabKind::File(path) = &kind {
             self.files.insert(path.clone(), read_lines(path));
             self.file_scroll.entry(path.clone()).or_default();
+            self.load_file_git(path.clone(), cx);
         }
         self.active = match self.tabs.iter().position(|t| t.kind == kind) {
             Some(i) => i,
@@ -910,6 +917,25 @@ impl Workspace {
         self.refresh_git(cx);
         self.focus_terminal(cx);
         cx.notify();
+    }
+    /// Read an open file's gutter marks and blame off the main thread.
+    pub(super) fn load_file_git(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let read = path.clone();
+            let info = cx.background_executor().spawn(async move { crate::git::file_info(&read) }).await;
+            let _ = this.update(cx, |s, cx| {
+                // The tab may have closed meanwhile.
+                if !s.files.contains_key(&path) {
+                    return;
+                }
+                match info {
+                    Some(info) => s.file_git.insert(path, Rc::new(info)),
+                    None => s.file_git.remove(&path),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
     /// Open `path` in a tab and, given 1-based `lines`, scroll them into view
     /// and light them up for a moment.
@@ -939,6 +965,7 @@ impl Workspace {
         if let TabKind::File(path) = self.tabs.remove(index).kind {
             self.files.remove(&path);
             self.file_scroll.remove(&path);
+            self.file_git.remove(&path);
         }
         if self.active >= index {
             self.active = self.active.saturating_sub(1);
