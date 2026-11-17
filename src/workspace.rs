@@ -22,7 +22,7 @@ use crate::{
     store,
     menu::{self as popover, Menu},
     model::{Block, Project, Session, Thread, ThreadState, tilde},
-    settings::{FollowUpMode, Settings},
+    settings::{ActivityMode, FollowUpMode, Settings},
     theme::{Palette, mono, palette},
 };
 use futures::StreamExt;
@@ -131,6 +131,9 @@ const MAX_FILE: u64 = 2 * 1024 * 1024;
 
 pub struct Workspace {
     focus: FocusHandle,
+    /// Whether the window has focus: a thread that finishes while it doesn't
+    /// hasn't been seen, even if it's the one showing.
+    window_active: bool,
     settings: Settings,
     projects: Vec<Project>,
     project: usize,
@@ -140,6 +143,10 @@ pub struct Workspace {
     tabs: Vec<Tab>,
     active: usize,
     next_tab: usize,
+    /// The tab strip's scroll, and the tab it last brought into view (by id),
+    /// so a newly active tab scrolls in once without fighting the wheel after.
+    tabs_scroll: ScrollHandle,
+    tab_in_view: std::cell::Cell<Option<usize>>,
     side: Side,
     threads_open: bool,
     side_open: bool,
@@ -163,6 +170,7 @@ pub struct Workspace {
     file_mentions: Rc<RefCell<Vec<FileMention>>>,
     command_index: usize,
     command_scroll: ScrollHandle,
+    thread_scroll: ScrollHandle,
     commands_dismissed: bool,
     /// Empty the composer on the next render, outside the action that sent it.
     clear_composer: bool,
@@ -192,6 +200,8 @@ pub struct Workspace {
     instructions: HashMap<Option<PathBuf>, Vec<(PathBuf, &'static str)>>,
     /// Tool calls opened to show their full command and output, by thread and block.
     open_tools: HashSet<(usize, usize)>,
+    /// Finished turns whose folded activity is shown, by thread and the turn's closing block.
+    open_summaries: HashSet<(usize, usize)>,
     /// The last thought line shown in each collapsed thought block. Entries are
     /// created only after hovering, so a growing block otherwise follows its
     /// newest line automatically.
@@ -212,6 +222,10 @@ pub struct Workspace {
     thread_changes_only: bool,
     commit_message: Entity<InputState>,
     clear_commit_message: Option<String>,
+    /// An undone commit's message, to put back in an empty commit box.
+    restore_commit_message: Option<String>,
+    /// Which Git operation is running, so its button can say so.
+    git_running: Option<GitRunning>,
     /// The repository the Changes page shows, when a project spans several folders.
     git_repo: Option<PathBuf>,
     /// Text selected in the transcript.
@@ -243,10 +257,22 @@ pub struct Workspace {
     mention_dismissed: bool,
     /// Code views scrolled sideways, by view: their line numbers stay put.
     sideways: Rc<RefCell<HashMap<SharedString, panes::Sideways>>>,
+    /// The commit box was resized and the new height isn't saved yet; it is
+    /// when the drag ends.
+    commit_height_unsaved: bool,
     /// While a project is dragged along the rail: which one, and the gap it
     /// would drop into, counted as the index of the project below that gap.
     drop_slot: Option<(usize, usize)>,
     _quit: Option<Subscription>,
+}
+
+/// A Git operation in progress, as far as the commit box cares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitRunning {
+    Commit,
+    Push,
+    Undo,
+    Other,
 }
 
 impl Workspace {
@@ -265,8 +291,6 @@ impl Workspace {
         });
         cx.observe(&thread_search, |_, _, cx| cx.notify()).detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
-        let commit_message = cx.new(|cx| InputState::new(window, cx).multi_line(true).auto_grow(2, 5).placeholder("Commit message…"));
-        cx.observe(&commit_message, |_, _, cx| cx.notify()).detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         cx.subscribe_in(&rename_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
             if let gpui_component::input::InputEvent::PressEnter { .. } = e {
@@ -275,6 +299,7 @@ impl Workspace {
         })
         .detach();
         let settings = Settings::load();
+        let commit_message = git_panel::commit_input(settings.commit_box_height.is_some(), window, cx);
         let mut projects = vec![Project::chats()];
         projects.extend(settings.projects.iter().filter(|p| p.path.is_dir()).cloned().map(Project::open));
         let mut next_thread = 0;
@@ -306,7 +331,10 @@ impl Workspace {
             composer,
             file_mentions,
             command_index: 0,
+            tabs_scroll: ScrollHandle::new(),
+            tab_in_view: std::cell::Cell::new(None),
             command_scroll: ScrollHandle::new(),
+            thread_scroll: ScrollHandle::new(),
             commands_dismissed: false,
             clear_composer: false,
             transcript: ScrollHandle::new(),
@@ -325,6 +353,7 @@ impl Workspace {
             font_names: Rc::default(),
             instructions: HashMap::new(),
             open_tools: HashSet::new(),
+            open_summaries: HashSet::new(),
             thought_selection: HashMap::new(),
             live: Vec::new(),
             saving: false,
@@ -339,6 +368,8 @@ impl Workspace {
             thread_changes_only: false,
             commit_message,
             clear_commit_message: None,
+            restore_commit_message: None,
+            git_running: None,
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
@@ -360,6 +391,8 @@ impl Workspace {
             mention_dismissed: false,
             sideways: Rc::default(),
             drop_slot: None,
+            commit_height_unsaved: false,
+            window_active: window.is_window_active(),
             _quit: None,
         };
         // Whatever hasn't been written yet is written on the way out.
@@ -374,6 +407,10 @@ impl Workspace {
             workspace.settings.mono_font_size,
             cx,
         );
+        syntax::set_indentation(
+            workspace.settings.tab_width.unwrap_or(syntax::DEFAULT_TAB_WIDTH),
+            workspace.settings.indent_guides.unwrap_or(true),
+        );
         // Reopen where things were left: the project's latest thread.
         if workspace.current_project().threads.is_empty() {
             workspace.start_thread(cx);
@@ -381,6 +418,16 @@ impl Workspace {
             workspace.select_thread(0, cx);
         }
         workspace.start_git_watch(window, cx);
+        cx.observe_window_activation(window, |s, window, cx| {
+            s.window_active = window.is_window_active();
+            // Coming back to the window is seeing the thread on show.
+            if s.window_active && let Some(t) = s.current_thread_mut() && t.unread {
+                t.unread = false;
+                s.save_soon(cx);
+                cx.notify();
+            }
+        })
+        .detach();
         workspace.observe_command_draft(cx);
         workspace.observe_mention_draft(cx);
         workspace.composer.update(cx, |s, cx| s.focus(window, cx));
@@ -479,6 +526,9 @@ impl Workspace {
         self.active = 0;
         self.follow = true;
         self.transcript.scroll_to_bottom();
+        if let Some(t) = self.current_thread_mut() {
+            t.unread = false;
+        }
         if let Some(t) = self.current_thread() {
             let id = t.id;
             if t.session.is_none() && t.problem.is_none() {
@@ -729,13 +779,19 @@ impl Workspace {
         }
     }
     fn on_event(&mut self, id: usize, event: Event, cx: &mut Context<Self>) {
+        let seen = self.window_active && self.current_thread().is_some_and(|t| t.id == id);
         let current = self.current_thread().is_some_and(|t| t.id == id);
         let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == id) else {
             return;
         };
         // A connection that fails before it opens usually means the agent isn't installed or signed in.
         let failed_to_open = matches!(&event, Event::Closed(Some(_))) && !thread.ready;
+        let was_busy = thread.state.busy();
         thread.apply(event);
+        // A turn that finishes out of sight waits to be read.
+        if was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed) && !seen {
+            thread.unread = true;
+        }
         if failed_to_open && let Some(problem) = &mut thread.problem {
             let name = self.settings.agents.get(thread.agent).map_or("the agent", |a| a.name.as_str());
             problem.push_str(&format!("\nCheck that {name} is installed and signed in, then send your message again."));
@@ -1076,6 +1132,11 @@ impl Render for Workspace {
             let (commit, search) = self.project_inputs.remove(&self.project).unwrap_or_default();
             self.commit_message.update(cx, |s, cx| s.set_value(commit, window, cx));
             self.thread_search.update(cx, |s, cx| s.set_value(search, window, cx));
+        }
+        if let Some(message) = self.restore_commit_message.take() {
+            if self.commit_message.read(cx).value().trim().is_empty() {
+                self.commit_message.update(cx, |s, cx| s.set_value(message, window, cx));
+            }
         }
         if let Some(committed) = self.clear_commit_message.take() {
             if self.commit_message.read(cx).value().as_ref() == committed {

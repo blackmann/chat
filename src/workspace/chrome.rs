@@ -7,6 +7,7 @@ use gpui_component::{
     Icon, IconName, Sizable, TitleBar,
     button::{Button, ButtonVariants},
     input::Input,
+    scroll::ScrollableElement,
     tooltip::Tooltip,
 };
 
@@ -28,7 +29,7 @@ pub fn agent_glyph(spec: Option<&crate::settings::AgentSpec>) -> Icon {
 }
 
 /// A thread's state as a small leading mark.
-fn state_mark(colors: Palette, state: ThreadState) -> AnyElement {
+fn state_mark(colors: Palette, state: ThreadState, unread: bool) -> AnyElement {
     match state {
         ThreadState::Running => spinner(colors).into_any_element(),
         ThreadState::Waiting => icon(Glyph::CircleDot).size(px(13.)).text_color(rgb(colors.blue)).into_any_element(),
@@ -37,10 +38,13 @@ fn state_mark(colors: Palette, state: ThreadState) -> AnyElement {
             .flex()
             .items_center()
             .justify_center()
-            .child(div().size(px(6.)).rounded_full().bg(rgb(colors.quiet)))
+            .child(div().size(px(6.)).rounded_full().bg(rgb(if unread { colors.blue } else { colors.quiet })))
             .into_any_element(),
         ThreadState::Idle => icon(Glyph::CircleDashed).size(px(13.)).text_color(rgb(colors.quiet)).into_any_element(),
-        ThreadState::Failed => icon(IconName::TriangleAlert).size(px(13.)).text_color(rgb(colors.red)).into_any_element(),
+        ThreadState::Failed => icon(IconName::TriangleAlert)
+            .size(px(13.))
+            .text_color(rgb(if unread { colors.red } else { colors.quiet }))
+            .into_any_element(),
     }
 }
 
@@ -367,7 +371,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |s| s.bg(rgb(colors.selected)))
                     .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
-                    .child(row().w(px(14.)).flex_shrink_0().justify_center().child(state_mark(colors, t.state)))
+                    .child(row().w(px(14.)).flex_shrink_0().justify_center().child(state_mark(colors, t.state, t.unread)))
                     .child(one_line(t.title.clone(), 18.).flex_1().min_w_0())
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                     .on_click(cx.listener(move |s, _, _, cx| s.select_thread(i, cx))),
@@ -403,7 +407,14 @@ impl Workspace {
                             .on_click(cx.listener(|s, _, w, cx| s.new_thread(&NewThread, w, cx))),
                     ),
             )
-            .child(div().id("thread-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(div().id("thread-list").size_full().overflow_y_scroll().track_scroll(&self.thread_scroll).child(list))
+                    .vertical_scrollbar(&self.thread_scroll),
+            )
             .into_any_element()
     }
 
@@ -411,10 +422,19 @@ impl Workspace {
         let colors = palette(cx);
         // The chat stays put at the start; the other tabs scroll behind it.
         let mut pinned_tab = None;
-        let mut tabs = row().id("tabs-scroll").h_full().overflow_x_scroll();
+        let mut tabs = row().id("tabs-scroll").h_full().overflow_x_scroll().track_scroll(&self.tabs_scroll);
+        // Bring the active tab into view when it changes. Children of the strip
+        // are the unpinned tabs, so count those that come before it.
+        if let Some(active) = self.tabs.get(self.active) {
+            if self.tab_in_view.replace(Some(active.id)) != Some(active.id) && active.kind != TabKind::Chat {
+                let index = self.tabs[..self.active].iter().filter(|t| t.kind != TabKind::Chat).count();
+                self.tabs_scroll.scroll_to_item(index);
+            }
+        }
         for (i, t) in self.tabs.iter().enumerate() {
             let active = self.active == i;
             let pinned = t.kind == TabKind::Chat;
+            let stale = self.stale(&t.kind).is_some();
             let group = SharedString::from(format!("tab-{}", t.id));
             let (name, detail) = match &t.kind {
                 TabKind::Chat => ("Chat".to_string(), String::new()),
@@ -466,8 +486,10 @@ impl Workspace {
                         let shown = if detail.is_empty() { name.clone() } else { format!("{name}  {detail}") };
                         let width = (text_width(window, &shown, 13.) + px(2.)).min(px(TAB_LABEL));
                         let detail = (!detail.is_empty()).then(|| (SharedString::from(detail), Hsla::from(rgb(colors.quiet))));
-                        line_with_detail(name, detail, 18.).w(width).flex_shrink_0()
+                        // A stale tab's name is struck through (its text style reaches the label's runs).
+                        line_with_detail(name, detail, 18.).w(width).flex_shrink_0().when(stale, |s| s.line_through())
                     })
+                    .when(stale, |s| s.tooltip(move |window, cx| Tooltip::new("Out of date — open it to see why").build(window, cx)))
                     .child(if pinned {
                         // The chat can't be closed: a pin sits where the close button would.
                         row()
@@ -527,14 +549,66 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// Why a tab no longer shows anything current — its file is gone, or the
+    /// change it shows has been undone or committed — if it doesn't.
+    pub(super) fn stale(&self, kind: &TabKind) -> Option<&'static str> {
+        match kind {
+            TabKind::File(path) => (!path.exists()).then_some("This file has been deleted. Showing it as it was when opened."),
+            TabKind::Diff(path) => {
+                let changed = self.current_thread().is_some_and(|t| t.changes().iter().any(|c| &c.path == path));
+                (!changed).then_some("This thread hasn't changed this file.")
+            }
+            TabKind::GitDiff(path, staged) => {
+                // Only once the file's repository has been read; until then it's unknown.
+                let snapshot = self.git_snapshots.values().filter_map(|s| s.as_ref().ok()).find(|s| path.starts_with(&s.root))?;
+                let current = snapshot
+                    .entries
+                    .iter()
+                    .any(|e| snapshot.root.join(&e.path) == *path && if *staged { e.staged() } else { e.unstaged() });
+                (!current).then_some(if *staged {
+                    "Nothing is staged in this file anymore. This diff is out of date."
+                } else {
+                    "Nothing is unstaged in this file anymore. This diff is out of date."
+                })
+            }
+            TabKind::Chat | TabKind::Terminal => None,
+        }
+    }
+
     pub(super) fn content(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        match &self.tabs[self.active].kind {
+        let kind = &self.tabs[self.active].kind;
+        let body = match kind {
             TabKind::Chat => self.chat_view(window, cx),
             TabKind::File(path) => self.file_view(path.clone(), window, cx),
-            TabKind::Diff(path) => self.diff_view(path.clone(), window, cx),
+            // With no change to show, the page itself already says why.
+            TabKind::Diff(path) => return self.diff_view(path.clone(), window, cx),
             TabKind::GitDiff(path, staged) => self.git_diff_view(path, *staged, window, cx),
-            TabKind::Terminal => self.terminal_view(cx),
-        }
+            TabKind::Terminal => return self.terminal_view(cx),
+        };
+        // A Git diff that failed to load already says why in its place.
+        let explained = match kind {
+            TabKind::GitDiff(path, staged) => matches!(self.git_diffs.get(&(path.clone(), *staged)), Some(Err(_))),
+            _ => false,
+        };
+        let Some(reason) = self.stale(kind).filter(|_| !explained) else { return body };
+        let colors = palette(cx);
+        col()
+            .size_full()
+            .child(
+                row()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py(px(6.))
+                    .gap(px(6.))
+                    .bg(rgb(colors.amber_tint))
+                    .border_b_1()
+                    .border_color(rgb(colors.row_border))
+                    .text_size(px(crate::theme::scaled_ui(12.)))
+                    .child(icon(IconName::TriangleAlert).size(px(13.)).text_color(rgb(colors.amber)))
+                    .child(div().text_color(rgb(colors.text)).child(reason)),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
     }
 
     pub(super) fn status(&self, cx: &mut Context<Self>) -> AnyElement {

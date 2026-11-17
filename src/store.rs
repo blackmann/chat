@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize, Deserialize)]
 struct SavedProject {
     path: Option<PathBuf>,
+    /// When this was written, in ms since the epoch.
+    #[serde(default)]
+    saved_at: Option<i64>,
     threads: Vec<SavedThread>,
 }
 
@@ -21,6 +24,8 @@ struct SavedThread {
     /// By name, since the configured list can change between runs.
     agent: String,
     state: ThreadState,
+    #[serde(default)]
+    unread: bool,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -32,6 +37,9 @@ struct SavedThread {
     usage: Option<(u64, u64)>,
     #[serde(default)]
     cost: Option<(f64, String)>,
+    /// When a turn still running at the save began.
+    #[serde(default)]
+    turn_began: Option<i64>,
 }
 
 /// FNV-1a: a file name that stays the same for a path across runs and builds,
@@ -58,6 +66,7 @@ pub fn load(project: &Project, agents: &[AgentSpec], default_agent: usize, next_
     let Some(saved) = saved else {
         return Vec::new();
     };
+    let saved_at = saved.saved_at;
     saved
         .threads
         .into_iter()
@@ -67,13 +76,15 @@ pub fn load(project: &Project, agents: &[AgentSpec], default_agent: usize, next_
             let mut thread = Thread::new(*next_id, agent);
             thread.title = s.title.into();
             thread.state = s.state;
+            thread.unread = s.unread;
             thread.session_id = s.session;
             thread.picks = s.picks;
             thread.blocks = s.blocks;
             thread.plan = s.plan;
             thread.usage = s.usage;
             thread.cost = s.cost;
-            thread.settle();
+            thread.turn_began = s.turn_began;
+            thread.settle(saved_at);
             thread
         })
         .collect()
@@ -83,6 +94,7 @@ pub fn load(project: &Project, agents: &[AgentSpec], default_agent: usize, next_
 #[derive(Serialize)]
 struct ProjectOut<'a> {
     path: &'a Option<PathBuf>,
+    saved_at: i64,
     threads: Vec<ThreadOut<'a>>,
 }
 #[derive(Serialize)]
@@ -90,12 +102,14 @@ struct ThreadOut<'a> {
     title: &'a str,
     agent: &'a str,
     state: ThreadState,
+    unread: bool,
     session: &'a Option<String>,
     picks: Vec<(String, String)>,
     blocks: &'a [Block],
     plan: &'a [(Step, String)],
     usage: Option<(u64, u64)>,
     cost: &'a Option<(f64, String)>,
+    turn_began: Option<i64>,
 }
 
 /// The project as it should be written. Threads with nothing in them are left out.
@@ -108,15 +122,17 @@ pub fn snapshot(project: &Project, agents: &[AgentSpec]) -> Option<(PathBuf, Vec
             title: &t.title,
             agent: agents.get(t.agent).map_or("", |a| a.name.as_str()),
             state: t.state,
+            unread: t.unread,
             session: &t.session_id,
             picks: t.current_picks(),
             blocks: &t.blocks,
             plan: &t.plan,
             usage: t.usage,
             cost: &t.cost,
+            turn_began: t.turn_began,
         })
         .collect();
-    let bytes = serde_json::to_vec(&ProjectOut { path: &project.path, threads }).ok()?;
+    let bytes = serde_json::to_vec(&ProjectOut { path: &project.path, saved_at: crate::model::now_ms(), threads }).ok()?;
     Some((file(project.path.as_deref())?, bytes))
 }
 
@@ -146,6 +162,7 @@ mod tests {
         thread.blocks.push(Block::User(crate::model::Message::now("add a greeting")));
         thread.apply(Event::Text("Done.".into()));
         thread.state = ThreadState::Running;
+        thread.turn_began = Some(crate::model::now_ms() - 5_000);
         thread.session_id = Some("s-1".into());
         thread.picks = vec![("model".into(), "small".into())];
         project.threads.push(thread);
@@ -160,8 +177,14 @@ mod tests {
         let mut restored = Thread::new(9, 0);
         restored.blocks = saved.threads[0].blocks.iter().map(|b| serde_json::from_value(serde_json::to_value(b).unwrap()).unwrap()).collect();
         restored.state = saved.threads[0].state;
-        restored.settle();
+        restored.turn_began = saved.threads[0].turn_began;
+        restored.settle(saved.saved_at);
         assert!(restored.state == ThreadState::Idle, "a turn cut off by quitting comes back stopped");
+        assert!(matches!(&restored.blocks[0], Block::User(m) if m.at.is_some()), "a message keeps its time");
+        assert!(
+            matches!(restored.blocks.last(), Some(Block::TurnEnded { worked_ms, .. }) if (5_000..60_000).contains(worked_ms)),
+            "a cut-off turn says how long it ran, up to the last save"
+        );
         assert!(matches!(&restored.blocks[1], Block::Text(t) if t == "Done."));
         assert_eq!(saved.threads[0].picks, [("model".to_string(), "small".to_string())]);
         assert_eq!(saved.threads[0].session.as_deref(), Some("s-1"));

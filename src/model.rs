@@ -108,6 +108,8 @@ pub struct Thread {
     pub id: usize,
     pub title: SharedString,
     pub state: ThreadState,
+    /// Finished while not being looked at, and not opened since.
+    pub unread: bool,
     pub blocks: Vec<Block>,
     /// Index into the configured agents.
     pub agent: usize,
@@ -138,7 +140,8 @@ pub struct Thread {
     /// inside the turn, so the last user block no longer marks its start.
     turn_start: usize,
     /// When the running turn began, to tell how long it worked once it ends.
-    turn_began: Option<i64>,
+    /// Saved, so a turn cut off by quitting can still say how long it ran.
+    pub turn_began: Option<i64>,
     /// One steer awaits a reply before the next follow-up can be dispatched.
     pending_steer: Option<(usize, QueuedMessage)>,
     pub queued: VecDeque<QueuedMessage>,
@@ -165,6 +168,7 @@ impl Thread {
             id,
             title: "New thread".into(),
             state: ThreadState::Idle,
+            unread: false,
             blocks: Vec::new(),
             agent,
             session: None,
@@ -242,8 +246,10 @@ impl Thread {
     }
     /// Close the running turn with when it ended and how long it took.
     fn stamp_turn(&mut self) {
+        self.stamp_turn_at(now_ms());
+    }
+    fn stamp_turn_at(&mut self, at: i64) {
         if let Some(began) = self.turn_began.take() {
-            let at = now_ms();
             self.blocks.push(Block::TurnEnded { at, worked_ms: (at - began).max(0) as u64 });
         }
     }
@@ -430,14 +436,20 @@ impl Thread {
         self.settings.iter().map(|s| (s.id.clone(), s.current.clone())).collect()
     }
     /// Bring a thread read from disk to rest: nothing can still be running in a
-    /// process that is gone.
-    pub fn settle(&mut self) {
+    /// process that is gone. `saved_at` is when it was last written, about when
+    /// the agent last did anything, so a cut-off turn's work ends there.
+    pub fn settle(&mut self, saved_at: Option<i64>) {
         if self.state.busy() {
             self.dismiss_permissions();
             self.settle_tools();
             self.notice("Interrupted when Chat closed.");
+            match saved_at {
+                Some(at) => self.stamp_turn_at(at),
+                None => self.turn_began = None,
+            }
             self.state = ThreadState::Idle;
         }
+        self.turn_began = None;
         self.turn_start = self.blocks.len();
     }
 
@@ -736,3 +748,4 @@ mod tests {
         assert!(matches!(t.blocks.last(), Some(Block::SignIn { .. })) && t.problem.is_none());
     }
 }
+

@@ -8,7 +8,7 @@ use gpui_component::{
     highlighter::{HighlightTheme, SyntaxHighlighter},
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
@@ -103,10 +103,54 @@ pub fn highlight(lang: &str, lines: &[SharedString]) -> Option<Highlights> {
     })
 }
 
-/// A text as the lines views draw: no line endings, tabs as four spaces (a tab
-/// has no width of its own in a text run).
+pub const DEFAULT_TAB_WIDTH: usize = 4;
+
+thread_local! {
+    /// How code is indented on screen: columns per tab stop, and whether indent
+    /// guides are drawn. Kept here, like the fonts, because views read them deep
+    /// inside list closures; everything that draws runs on the one UI thread.
+    static INDENTATION: Cell<(usize, bool)> = const { Cell::new((DEFAULT_TAB_WIDTH, true)) };
+}
+
+/// Set the tab width (clamped to 1–8) and whether indent guides show.
+pub fn set_indentation(tab_width: usize, guides: bool) {
+    INDENTATION.set((tab_width.clamp(1, 8), guides));
+}
+pub fn tab_width() -> usize {
+    INDENTATION.get().0
+}
+pub fn show_guides() -> bool {
+    INDENTATION.get().1
+}
+
+/// A line with its tabs expanded to spaces, up to the next tab stop (a tab has
+/// no width of its own in a text run).
+pub fn expand_tabs(line: &str) -> String {
+    expand_tabs_to(line, tab_width())
+}
+
+fn expand_tabs_to(line: &str, width: usize) -> String {
+    if !line.contains('\t') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len() + width * 2);
+    let mut column = 0;
+    for c in line.chars() {
+        if c == '\t' {
+            let pad = width - column % width;
+            out.extend(std::iter::repeat_n(' ', pad));
+            column += pad;
+        } else {
+            out.push(c);
+            column += 1;
+        }
+    }
+    out
+}
+
+/// A text as the lines views draw: no line endings, tabs expanded.
 pub fn lines(text: &str) -> Vec<SharedString> {
-    text.lines().map(|l| l.replace('\t', "    ").into()).collect()
+    text.lines().map(|l| expand_tabs(l).into()).collect()
 }
 
 /// Where vertical indent guides fall in a run of lines (as `lines` makes them):
@@ -163,7 +207,8 @@ pub fn cached(name: &str, text: &str) -> Option<Rc<Highlights>> {
     }
     let lang = language(name)?;
     let mut hasher = DefaultHasher::new();
-    (lang, text).hash(&mut hasher);
+    // Ranges index the tab-expanded lines, so the width is part of the key.
+    (lang, tab_width(), text).hash(&mut hasher);
     let key = hasher.finish();
     SEEN.with_borrow_mut(|seen| {
         if let Some(hit) = seen.get(&key) {
@@ -297,7 +342,7 @@ fn per_line(styles: &[(Range<usize>, HighlightStyle)], starts: &[usize], lines: 
 
 #[cfg(test)]
 mod tests {
-    use super::{cached, highlight, indent_guides, language, lines};
+    use super::{cached, expand_tabs_to, highlight, indent_guides, language, lines};
     use gpui::SharedString;
     #[test]
     fn picks_languages_by_name() {
@@ -335,5 +380,14 @@ mod tests {
         assert_eq!(levels, [0, 1, 2, 2, 2, 1, 0, 0]);
         assert_eq!(indent_guides(&["a", "    b"]).0, 4);
         assert_eq!(indent_guides::<&str>(&[]).1, Vec::<u16>::new());
+    }
+
+    #[test]
+    fn tabs_expand_to_the_next_stop() {
+        assert_eq!(expand_tabs_to("\tx", 4), "    x");
+        assert_eq!(expand_tabs_to("ab\tc", 4), "ab  c");
+        assert_eq!(expand_tabs_to("\t\tx", 2), "    x");
+        assert_eq!(expand_tabs_to("abcd\te", 4), "abcd    e");
+        assert_eq!(expand_tabs_to("no tabs", 8), "no tabs");
     }
 }

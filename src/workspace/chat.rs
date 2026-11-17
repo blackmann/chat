@@ -138,6 +138,96 @@ fn thought_lines(text: &str) -> Vec<SharedString> {
     if lines.is_empty() { vec![SharedString::default()] } else { lines }
 }
 
+/// Thinking and tool calls: what the activity setting folds or hides. Edits
+/// that carry a diff are results, so they stay.
+fn is_activity(block: &Block) -> bool {
+    match block {
+        Block::Thought(_) => true,
+        Block::Tool(tool) => tool.diffs.is_empty(),
+        _ => false,
+    }
+}
+
+/// Each run of consecutive activity blocks, as `start..end`.
+fn activity_runs(blocks: &[Block]) -> Vec<std::ops::Range<usize>> {
+    let mut runs = Vec::new();
+    let mut start = None;
+    for (i, block) in blocks.iter().enumerate() {
+        match (is_activity(block), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                runs.push(s..i);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        runs.push(s..blocks.len());
+    }
+    runs
+}
+
+/// One line for a run of activity, in the order things first happened:
+/// "Ran 5 commands, read 4 files", "Read md.rs, ran 8 commands, 1 failed".
+fn activity_summary(blocks: &[Block]) -> String {
+    #[derive(PartialEq)]
+    enum Part {
+        Thought,
+        Tool(Kind),
+    }
+    let mut parts: Vec<(Part, usize)> = Vec::new();
+    let mut read: Option<String> = None;
+    let mut failed = 0;
+    for block in blocks {
+        let part = match block {
+            Block::Thought(_) => Part::Thought,
+            Block::Tool(tool) => {
+                if tool.status == Status::Failed {
+                    failed += 1;
+                }
+                match tool.kind {
+                    Kind::Think => Part::Thought,
+                    Kind::Read => {
+                        read = tool.locations.first().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+                        Part::Tool(Kind::Read)
+                    }
+                    Kind::Search | Kind::Execute | Kind::Fetch => Part::Tool(tool.kind),
+                    _ => Part::Tool(Kind::Other),
+                }
+            }
+            _ => continue,
+        };
+        match parts.iter_mut().find(|(p, _)| *p == part) {
+            Some((_, n)) => *n += 1,
+            None => parts.push((part, 1)),
+        }
+    }
+    let count = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut words: Vec<String> = parts
+        .into_iter()
+        .map(|(part, n)| match part {
+            Part::Thought => "thought".to_string(),
+            Part::Tool(Kind::Read) => match (n, &read) {
+                (1, Some(name)) => format!("read {name}"),
+                _ => format!("read {}", count(n, "file", "files")),
+            },
+            Part::Tool(Kind::Search) => format!("ran {}", count(n, "search", "searches")),
+            Part::Tool(Kind::Execute) => format!("ran {}", count(n, "command", "commands")),
+            Part::Tool(Kind::Fetch) => format!("fetched {}", count(n, "page", "pages")),
+            Part::Tool(_) => format!("used {}", count(n, "tool", "tools")),
+        })
+        .collect();
+    if failed > 0 {
+        words.push(format!("{failed} failed"));
+    }
+    let mut line = words.join(", ");
+    if let Some(first) = line.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    line
+}
+
 fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>, window: &Window) -> String {
     let added = paths
         .paths()
@@ -542,7 +632,7 @@ impl Workspace {
             return div().child(line);
         }
         // Opened: the whole command, wrapped, and what it printed.
-        let mut lines = output.lines().map(|l| l.replace('\t', "    ")).collect::<Vec<_>>();
+        let mut lines = output.lines().map(super::syntax::expand_tabs).collect::<Vec<_>>();
         let hidden = lines.len().saturating_sub(TOOL_OUTPUT_LINES);
         lines.drain(..hidden);
         col().child(line).child(
@@ -620,6 +710,31 @@ impl Workspace {
                         )
                     })),
             )
+    }
+
+    /// A run of thinking and tool calls folded into one line; clicking it
+    /// shows them in place.
+    fn summary_line(&self, colors: Palette, thread: usize, start: usize, line: String, cx: &mut Context<Self>) -> Div {
+        let key = (thread, start);
+        let open = self.open_summaries.contains(&key);
+        div().child(
+            row()
+                .id(SharedString::from(format!("summary-{thread}-{start}")))
+                .h(px(26.))
+                .gap(px(4.))
+                .text_size(px(crate::theme::scaled_ui(13.)))
+                .text_color(rgb(colors.muted))
+                .cursor_pointer()
+                .hover(|s| s.text_color(rgb(colors.text)))
+                .child(div().whitespace_nowrap().child(line))
+                .child(icon(if open { IconName::ChevronDown } else { IconName::ChevronRight }).size(px(12.)).flex_shrink_0())
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    if !s.open_summaries.remove(&key) {
+                        s.open_summaries.insert(key);
+                    }
+                    cx.notify();
+                })),
+        )
     }
 
     /// The agent asking before it acts: the question and one button per answer.
@@ -888,7 +1003,34 @@ impl Workspace {
         });
         let on_link = self.link_opener(cx);
         let now = chrono::Local::now();
+        let mode = self.settings.activity;
+        // Runs of thinking and tool calls fold away once something follows
+        // them; the run the agent is still in stays live.
+        let mut folds: HashMap<usize, usize> = HashMap::new();
+        if mode != ActivityMode::Visible {
+            for run in activity_runs(&thread.blocks) {
+                if run.end < thread.blocks.len() || !thread.is_active() || mode == ActivityMode::Hidden {
+                    folds.insert(run.start, run.end);
+                }
+            }
+        }
+        let mut skip_until = 0;
         for (i, block) in thread.blocks.iter().enumerate() {
+            if i < skip_until {
+                continue;
+            }
+            if let Some(&end) = folds.get(&i) {
+                if mode == ActivityMode::Hidden {
+                    skip_until = end;
+                    continue;
+                }
+                let line = activity_summary(&thread.blocks[i..end]);
+                list = list.child(self.summary_line(colors, thread.id, i, line, cx));
+                if !self.open_summaries.contains(&(thread.id, i)) {
+                    skip_until = end;
+                    continue;
+                }
+            }
             list = list.child(match block {
                 Block::User(message) => self.user_block(colors, thread.id, i, message, now, &on_link),
                 Block::TurnEnded { at, worked_ms } => {
@@ -1063,7 +1205,44 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mentions, replace_file_mentions, thought_lines};
+    use super::{Mentions, activity_runs, activity_summary, replace_file_mentions, thought_lines};
+    use crate::{agent::{Kind, Status}, model::{Block, ToolCall}};
+
+    fn tool(kind: Kind, status: Status, file: Option<&str>) -> Block {
+        Block::Tool(ToolCall {
+            id: String::new(),
+            title: "t".into(),
+            kind,
+            status,
+            diffs: vec![],
+            output: String::new(),
+            locations: file.map(|f| vec![f.into()]).unwrap_or_default(),
+        })
+    }
+
+    #[test]
+    fn activity_runs_split_at_prose() {
+        let blocks = vec![
+            Block::Thought("Planning".into()),
+            tool(Kind::Read, Status::Done, None),
+            Block::Text("Found it".into()),
+            tool(Kind::Execute, Status::Done, None),
+        ];
+        assert_eq!(activity_runs(&blocks), [0..2, 3..4]);
+    }
+
+    #[test]
+    fn summaries_read_like_a_sentence() {
+        let run = vec![
+            tool(Kind::Execute, Status::Done, None),
+            tool(Kind::Read, Status::Done, Some("/a/b.rs")),
+            tool(Kind::Read, Status::Done, Some("/a/c.rs")),
+            tool(Kind::Execute, Status::Failed, None),
+        ];
+        assert_eq!(activity_summary(&run), "Ran 2 commands, read 2 files, 1 failed");
+        assert_eq!(activity_summary(&run[1..2]), "Read b.rs");
+        assert_eq!(activity_summary(&[Block::Thought("x".into())]), "Thought");
+    }
     use super::super::mentions::path_mention as file_mention;
     use std::path::Path;
 
