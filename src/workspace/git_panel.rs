@@ -10,7 +10,6 @@ use crate::{
 use gpui_component::{
     Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
-    checkbox::Checkbox,
     input::{Input, InputState},
 };
 
@@ -83,6 +82,11 @@ fn status_color(colors: Palette, status: u8) -> u32 {
     }
 }
 
+/// Whether two paths name the same folder, however they are spelled.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || std::fs::canonicalize(a).ok().zip(std::fs::canonicalize(b).ok()).is_some_and(|(a, b)| a == b)
+}
+
 /// What a checkbox does: unstage what is under Staged, stage what is under Unstaged.
 fn toggle_operation(entries: &[&git::Entry], staged: bool) -> Operation {
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -102,8 +106,35 @@ impl Workspace {
         let roots = self.current_project().roots();
         self.git_repo.clone().filter(|r| roots.contains(r)).or_else(|| roots.into_iter().next())
     }
+    /// The checkout the Changes page shows for a project folder: one picked
+    /// here, else the worktree the thread's agent reported, else the folder.
+    pub(super) fn git_tree_for(&self, folder: &Path) -> PathBuf {
+        let thread = self.current_thread();
+        let key = (thread.map(|t| t.id), folder.to_path_buf());
+        self.git_picks
+            .get(&key)
+            .or_else(|| thread?.worktrees.get(folder))
+            // A worktree removed since falls back to the folder.
+            .filter(|tree| tree.is_dir())
+            .cloned()
+            .unwrap_or_else(|| folder.to_path_buf())
+    }
+    pub(super) fn git_tree(&self) -> Option<PathBuf> {
+        self.git_folder().map(|f| self.git_tree_for(&f))
+    }
+    /// Every checkout the Changes page may show: the project's folders and the worktrees chosen for them.
+    fn git_trees(&self) -> Vec<PathBuf> {
+        let mut trees = self.current_project().roots();
+        for folder in trees.clone() {
+            let tree = self.git_tree_for(&folder);
+            if !trees.contains(&tree) {
+                trees.push(tree);
+            }
+        }
+        trees
+    }
     pub(super) fn git_snapshot(&self) -> Option<&git::Snapshot> {
-        self.git_snapshots.get(&self.git_folder()?)?.as_ref().ok()
+        self.git_snapshots.get(&self.git_tree()?)?.as_ref().ok()
     }
     /// Keep the Changes page current: refresh when the file watcher sees
     /// something `git status` would, and whenever the window comes forward, in
@@ -147,7 +178,7 @@ impl Workspace {
     }
     /// Watch the folders showing, and the repositories found in them.
     fn sync_git_watch(&mut self) {
-        let folders = self.current_project().roots();
+        let folders = self.git_trees();
         let repos = folders
             .iter()
             .filter_map(|f| self.git_snapshots.get(f)?.as_ref().ok())
@@ -166,7 +197,7 @@ impl Workspace {
             self.git_queued = true;
             return;
         }
-        let roots = self.current_project().roots();
+        let roots = self.git_trees();
         if roots.is_empty() {
             self.sync_git_watch();
             return;
@@ -213,6 +244,10 @@ impl Workspace {
                     s.git_diffs.insert(key, diff);
                 }
                 s.sync_git_watch();
+                // Commits and edits move open files' marks and blame.
+                for path in s.files.keys().cloned().collect::<Vec<_>>() {
+                    s.load_file_git(path, cx);
+                }
                 if s.git_queued {
                     s.refresh_git(cx);
                 }
@@ -228,7 +263,7 @@ impl Workspace {
         let Some(root) = self.git_snapshot().map(|s| s.root.clone()) else {
             return;
         };
-        let Some(folder) = self.git_folder() else {
+        let Some(folder) = self.git_tree() else {
             return;
         };
         self.git_busy = true;
@@ -271,11 +306,11 @@ impl Workspace {
         .detach();
     }
 
-    /// With several folders, which repository to show; otherwise just the branch.
-    fn repo_picker(&self, colors: Palette, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> AnyElement {
+    /// With several folders, which one the Changes page shows.
+    fn folder_picker(&self, colors: Palette, cx: &mut Context<Self>) -> Option<Div> {
         let roots = self.current_project().roots();
         if roots.len() < 2 {
-            return branch_chip(colors, snapshot.branch.clone()).into_any_element();
+            return None;
         }
         let folder = self.git_folder().map(|f| crate::model::folder_name(&f)).unwrap_or_default();
         let trigger = row()
@@ -289,33 +324,87 @@ impl Workspace {
             .child(icon(IconName::Folder).size(px(13.)).text_color(rgb(colors.muted)))
             .child(div().font_weight(FontWeight::MEDIUM).child(folder))
             .child(icon(IconName::ChevronDown).size(px(11.)).text_color(rgb(colors.quiet)));
-        row()
-            .gap_2()
-            .min_w_0()
-            .child(self.popover_trigger("repo", trigger, Corner::TopLeft, 280., None, move |s, weak, _| {
-                let current = s.git_folder();
-                let mut entries = vec![crate::menu::Entry::Label("Repository".into())];
-                for root in s.current_project().roots() {
-                    let snapshot = s.git_snapshots.get(&root).and_then(|r| r.as_ref().ok());
-                    let mut item = crate::menu::Item::new(crate::model::folder_name(&root))
-                        .icon(IconName::Folder)
-                        .checked(current.as_ref() == Some(&root));
-                    if let Some(snapshot) = snapshot {
-                        let n = snapshot.entries.len();
-                        item = item.detail(if n == 0 { snapshot.branch.clone() } else { format!("{} · {n}", snapshot.branch) });
-                    }
-                    let weak = weak.clone();
-                    entries.push(crate::menu::Entry::Item(item.on_click(move |_, cx| {
+        Some(self.popover_trigger("repo", trigger, Corner::TopLeft, 280., None, move |s, weak, _| {
+            let current = s.git_folder();
+            let mut entries = vec![crate::menu::Entry::Label("Repository".into())];
+            for root in s.current_project().roots() {
+                let snapshot = s.git_snapshots.get(&s.git_tree_for(&root)).and_then(|r| r.as_ref().ok());
+                let mut item = crate::menu::Item::new(crate::model::folder_name(&root))
+                    .icon(IconName::Folder)
+                    .checked(current.as_ref() == Some(&root));
+                if let Some(snapshot) = snapshot {
+                    let n = snapshot.entries.len();
+                    item = item.detail(if n == 0 { snapshot.branch.clone() } else { format!("{} · {n}", snapshot.branch) });
+                }
+                let weak = weak.clone();
+                entries.push(crate::menu::Entry::Item(item.on_click(move |_, cx| {
+                    let _ = weak.update(cx, |s, cx| {
+                        s.git_repo = Some(root.clone());
+                        s.refresh_git(cx);
+                        cx.notify();
+                    });
+                })));
+            }
+            entries
+        }, cx))
+    }
+
+    /// Which checkout of the folder's repository to show. The thread's agent
+    /// moves this when it reports working in another worktree.
+    fn worktree_picker(&self, colors: Palette, folder: &Path, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> Div {
+        let reported = self.current_thread().and_then(|t| t.worktrees.get(folder)).cloned();
+        let main = snapshot.worktrees.first().is_none_or(|w| w.path == snapshot.root);
+        let name = if main { "Main worktree".to_string() } else { crate::model::folder_name(&snapshot.root) };
+        let following = reported.as_ref().is_some_and(|r| same_dir(r, &snapshot.root));
+        let trigger = row()
+            .id("worktree-button")
+            .h(px(22.))
+            .px(px(6.))
+            .gap(px(5.))
+            .rounded(px(5.))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(colors.hover)))
+            .child(icon(Glyph::Branch).size(px(13.)).text_color(rgb(if main { colors.muted } else { colors.blue })))
+            .child(div().font_weight(FontWeight::MEDIUM).text_color(rgb(if main { colors.text } else { colors.blue })).child(name))
+            .when(following, |s| s.child(label(colors, "· this thread").text_size(px(crate::theme::scaled_ui(11.)))))
+            .child(icon(IconName::ChevronDown).size(px(11.)).text_color(rgb(colors.quiet)));
+        let folder = folder.to_path_buf();
+        self.popover_trigger("worktree", trigger, Corner::TopRight, 300., None, move |s, weak, _| {
+            let Some(snapshot) = s.git_snapshots.get(&s.git_tree_for(&folder)).and_then(|r| r.as_ref().ok()) else {
+                return Vec::new();
+            };
+            let thread = s.current_thread().map(|t| t.id);
+            let reported = s.current_thread().and_then(|t| t.worktrees.get(&folder)).cloned();
+            let mut entries = vec![crate::menu::Entry::Label("Worktrees".into())];
+            for (i, tree) in snapshot.worktrees.iter().enumerate() {
+                let theirs = reported.as_ref().is_some_and(|r| same_dir(r, &tree.path)) || (i == 0 && reported.is_none());
+                let branch = tree.branch.clone().unwrap_or_else(|| "detached".into());
+                let detail = if theirs && reported.is_some() { format!("{branch} · this thread") } else { branch };
+                let title = if i == 0 { "Main worktree".to_string() } else { crate::model::folder_name(&tree.path) };
+                // The main checkout is the folder itself, keyed as the project knows it.
+                let target = if i == 0 { folder.clone() } else { tree.path.clone() };
+                let (weak, folder) = (weak.clone(), folder.clone());
+                let item = crate::menu::Item::new(title)
+                    .icon(Glyph::Branch)
+                    .detail(detail)
+                    .checked(same_dir(&tree.path, &snapshot.root))
+                    .on_click(move |_, cx| {
                         let _ = weak.update(cx, |s, cx| {
-                            s.git_repo = Some(root.clone());
+                            // Picking what the thread would show anyway drops the pick.
+                            let default = s.current_thread().and_then(|t| t.worktrees.get(&folder)).cloned().unwrap_or_else(|| folder.clone());
+                            if same_dir(&default, &target) {
+                                s.git_picks.remove(&(thread, folder.clone()));
+                            } else {
+                                s.git_picks.insert((thread, folder.clone()), target.clone());
+                            }
+                            s.refresh_git(cx);
                             cx.notify();
                         });
-                    })));
-                }
-                entries
-            }, cx))
-            .child(branch_chip(colors, snapshot.branch.clone()))
-            .into_any_element()
+                    });
+                entries.push(crate::menu::Entry::Item(item));
+            }
+            entries
+        }, cx)
     }
 
     /// Give the commit box a height (`None` lets it grow with its text again),
@@ -346,53 +435,20 @@ impl Workspace {
     pub(super) fn changes_page(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
         let mut page = col().flex_1().min_h_0();
-        page = page.child(
-            row()
-                .flex_shrink_0()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(colors.row_border))
-                .child(
-                    Checkbox::new("thread-changes-only")
-                        .small()
-                        .label("Show only changes from this thread")
-                        .checked(self.thread_changes_only)
-                        .on_click(cx.listener(|s, checked, _, cx| {
-                            s.thread_changes_only = *checked;
-                            cx.notify();
-                        })),
-                ),
-        );
         let Some(folder) = self.git_folder() else {
             return page.child(empty(colors, Glyph::Branch, "No project", "Open a project to see Git changes."));
         };
-        let Some(snapshot) = self.git_snapshots.get(&folder) else {
-            return page.child(label(colors, "Loading Git changes…").p_3());
+        let tree = self.git_tree_for(&folder);
+        let snapshot = match self.git_snapshots.get(&tree) {
+            None => return page.child(row().h(px(34.)).pl_3().pr_1().children(self.folder_picker(colors, cx))).child(label(colors, "Loading Git changes…").p_3()),
+            Some(Err(error)) => {
+                return page
+                    .child(row().h(px(34.)).pl_3().pr_1().children(self.folder_picker(colors, cx)))
+                    .child(empty(colors, Glyph::Branch, "Git unavailable", error.clone()));
+            }
+            Some(Ok(s)) => s,
         };
-        let snapshot = match snapshot {
-            Ok(s) => s,
-            Err(error) => return page.child(empty(colors, Glyph::Branch, "Git unavailable", error.clone())),
-        };
-        let project = self.current_project();
-        let touched: HashSet<_> = self
-            .current_thread()
-            .map(|t| {
-                t.files()
-                    .into_iter()
-                    .filter(|(_, touch)| *touch != crate::model::Touch::Read)
-                    .map(|(p, _)| match (&project.path, p.is_absolute()) {
-                        (Some(root), false) => root.join(p),
-                        _ => p,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let visible: Vec<&git::Entry> = snapshot
-            .entries
-            .iter()
-            .filter(|e| !self.thread_changes_only || e.paths().iter().any(|p| touched.contains(&snapshot.root.join(p))))
-            .collect();
+        let visible: Vec<&git::Entry> = snapshot.entries.iter().collect();
         // Each side's lines count once: a file staged in part shows both halves.
         let (adds, dels) = visible
             .iter()
@@ -406,13 +462,13 @@ impl Workspace {
                 .pl_3()
                 .pr_1()
                 .gap_2()
-                .child(self.repo_picker(colors, snapshot, cx))
+                .border_b_1()
+                .border_color(rgb(colors.row_border))
+                .children(self.folder_picker(colors, cx))
                 .child(div().flex_1())
-                .when(!visible.is_empty(), |s| {
-                    s.child(label(colors, format!("{} change{}", visible.len(), if visible.len() == 1 { "" } else { "s" })))
-                        .child(stat(colors, adds, dels))
-                }),
+                .child(self.worktree_picker(colors, &folder, snapshot, cx)),
         );
+        let folder = tree;
         if let Some(error) = self.git_errors.get(&folder) {
             page = page.child(div().px_3().py_2().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.red)).child(error.clone()));
         }
@@ -521,7 +577,7 @@ impl Workspace {
             list = list.child(empty(
                 colors,
                 Glyph::FileDiff,
-                if self.thread_changes_only { "No changes from this thread" } else { "Working tree clean" },
+                "Working tree clean",
                 "Git changes appear here as files are edited.",
             ));
         }
@@ -688,7 +744,21 @@ impl Workspace {
                         .on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::UndoCommit, cx))),
                 )
         });
-        page.child(commit_box).children(footer)
+        // The branch and what changed on it, pinned over the commit message.
+        let summary = row()
+            .flex_shrink_0()
+            .h(px(30.))
+            .px_3()
+            .gap_2()
+            .border_t_1()
+            .border_color(rgb(colors.row_border))
+            .child(branch_chip(colors, snapshot.branch.clone()))
+            .child(div().flex_1())
+            .when(!visible.is_empty(), |s| {
+                s.child(label(colors, format!("{} change{}", visible.len(), if visible.len() == 1 { "" } else { "s" })))
+                    .child(stat(colors, adds, dels))
+            });
+        page.child(summary).child(commit_box).children(footer)
     }
 
     pub(super) fn git_diff_view(&self, path: &Path, staged: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {

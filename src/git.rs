@@ -75,6 +75,30 @@ pub struct Snapshot {
     pub ahead: usize,
     /// The commit `HEAD` points at; `None` before the first commit.
     pub last_commit: Option<LastCommit>,
+    /// Every checkout of the repository, the main one first.
+    pub worktrees: Vec<Worktree>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    /// The branch checked out, or `None` when detached.
+    pub branch: Option<String>,
+}
+/// `worktree list --porcelain`: a record per checkout, separated by blank lines.
+fn parse_worktrees(bytes: &[u8]) -> Vec<Worktree> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out: Vec<Worktree> = Vec::new();
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            out.push(Worktree { path: PathBuf::from(p), branch: None });
+        } else if let (Some(b), Some(last)) = (line.strip_prefix("branch "), out.last_mut()) {
+            last.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_owned());
+        } else if line == "bare" {
+            // A bare repository has nothing checked out to show.
+            out.pop();
+        }
+    }
+    out
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastCommit {
@@ -250,7 +274,8 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
         let (parents, message) = out.split_once('\0')?;
         Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty() })
     });
-    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit })
+    let worktrees = run(&root, &["worktree", "list", "--porcelain"]).map(|out| parse_worktrees(&out)).unwrap_or_default();
+    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit, worktrees })
 }
 /// `--numstat -z` records: counts and a path, or counts, nothing, and two paths for a rename.
 fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
@@ -325,6 +350,127 @@ pub fn diff(root: &Path, entry: &Entry, staged: bool) -> Result<Diff, String> {
         _ => Diff::Binary,
     })
 }
+/// How a line of the working file differs from HEAD, for the file view's gutter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Added,
+    Modified,
+    /// Lines were removed just above this one.
+    RemovedAbove,
+    /// Lines were removed just below this one (the file's end).
+    RemovedBelow,
+}
+
+/// The commit a run of lines last changed in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    /// Empty for lines not committed yet.
+    pub sha: String,
+    pub author: String,
+    /// Seconds since the epoch.
+    pub time: i64,
+    pub summary: String,
+}
+impl Commit {
+    pub fn committed(&self) -> bool {
+        !self.sha.is_empty()
+    }
+}
+
+/// What Git knows about an open file: each line's change since HEAD and the
+/// commit that last touched it, by line.
+#[derive(Clone, Debug, Default)]
+pub struct FileInfo {
+    pub marks: Vec<Option<Mark>>,
+    pub commits: Vec<Commit>,
+    /// Each line's commit, as an index into `commits`.
+    pub blame: Vec<Option<usize>>,
+}
+
+/// Per-line marks for `new` against `old`, as an editor gutter shows them.
+pub fn line_marks(old: &str, new: &str) -> Vec<Option<Mark>> {
+    use similar::DiffOp;
+    let count = new.lines().count();
+    let mut marks = vec![None; count];
+    for op in similar::TextDiff::from_lines(old, new).ops() {
+        match *op {
+            DiffOp::Equal { .. } => {}
+            DiffOp::Insert { new_index, new_len, .. } => {
+                marks[new_index..(new_index + new_len).min(count)].fill(Some(Mark::Added));
+            }
+            DiffOp::Replace { new_index, new_len, .. } => {
+                marks[new_index..(new_index + new_len).min(count)].fill(Some(Mark::Modified));
+            }
+            DiffOp::Delete { new_index, .. } => {
+                if new_index < count {
+                    marks[new_index].get_or_insert(Mark::RemovedAbove);
+                } else if let Some(last) = marks.last_mut() {
+                    last.get_or_insert(Mark::RemovedBelow);
+                }
+            }
+        }
+    }
+    marks
+}
+
+/// `blame --porcelain`: a header per line, commit details the first time a
+/// commit appears, then the line itself after a tab.
+fn parse_blame(bytes: &[u8]) -> (Vec<Commit>, Vec<Option<usize>>) {
+    let text = String::from_utf8_lossy(bytes);
+    let mut commits: Vec<Commit> = Vec::new();
+    let mut blame = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in text.lines() {
+        if line.starts_with('\t') {
+            blame.push(current);
+            continue;
+        }
+        let mut words = line.splitn(2, ' ');
+        let (key, value) = (words.next().unwrap_or_default(), words.next().unwrap_or_default());
+        if key.len() == 40 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let sha = if key.bytes().all(|b| b == b'0') { String::new() } else { key.to_owned() };
+            current = Some(commits.iter().position(|c| c.sha == sha).unwrap_or_else(|| {
+                commits.push(Commit { sha, author: String::new(), time: 0, summary: String::new() });
+                commits.len() - 1
+            }));
+            continue;
+        }
+        let Some(commit) = current.map(|i| &mut commits[i]) else { continue };
+        match key {
+            "author" => commit.author = value.to_owned(),
+            "author-time" => commit.time = value.parse().unwrap_or(0),
+            "summary" => commit.summary = value.to_owned(),
+            _ => {}
+        }
+    }
+    (commits, blame)
+}
+
+/// Gutter marks and blame for a file in a working tree; `None` outside one or
+/// for an ignored file.
+pub fn file_info(file: &Path) -> Option<FileInfo> {
+    // Git reports the top level with symlinks resolved.
+    let file = &std::fs::canonicalize(file).ok()?;
+    let folder = file.parent()?;
+    let top = run(folder, &["rev-parse", "--show-toplevel"]).ok()?;
+    let root = path(top.trim_ascii_end());
+    let relative = file.strip_prefix(&root).ok()?;
+    let text = std::fs::read(file).ok().filter(|b| b.len() <= MAX_DIFF && !b.contains(&0))?;
+    let text = String::from_utf8(text).ok()?;
+    let head = blob(&root, relative, "HEAD:").and_then(|b| String::from_utf8(b).ok());
+    if head.is_none() && checked(command(&root).args(["check-ignore", "-q", "--"]).arg(relative).output()).is_ok() {
+        return None;
+    }
+    let marks = line_marks(head.as_deref().unwrap_or(""), &text);
+    let (commits, blame) = head
+        .is_some()
+        .then(|| checked(command(&root).args(["blame", "--porcelain", "--"]).arg(relative).output()).ok())
+        .flatten()
+        .map(|out| parse_blame(&out))
+        .unwrap_or_default();
+    Some(FileInfo { marks, commits, blame })
+}
+
 pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
     match operation {
         Operation::Stage(paths) | Operation::Unstage(paths) if paths.is_empty() => return Ok(()),
@@ -545,6 +691,46 @@ mod tests {
         let s = snapshot(&r.0).unwrap();
         assert!(s.last_commit.is_none());
         assert!(s.entries[0].staged());
+    }
+    #[test]
+    fn lists_worktrees_main_first() {
+        let list = parse_worktrees(b"worktree /r\nHEAD abc\nbranch refs/heads/main\n\nworktree /r-side\nHEAD def\ndetached\n\n");
+        assert_eq!(list, [Worktree { path: "/r".into(), branch: Some("main".into()) }, Worktree { path: "/r-side".into(), branch: None }]);
+        let r = Repo::new();
+        r.write("a", "x\n");
+        r.stage("a");
+        r.commit();
+        run(&r.0, &["worktree", "add", "-q", "-b", "side", "side-tree"]).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.worktrees.len(), 2);
+        assert_eq!(s.worktrees[1].branch.as_deref(), Some("side"));
+    }
+    #[test]
+    fn marks_added_modified_and_removed_lines() {
+        let marks = line_marks("a\nb\nc\nd\n", "a\nB\nc\nnew\n");
+        assert_eq!(marks, [None, Some(Mark::Modified), None, Some(Mark::Modified)]);
+        assert_eq!(line_marks("a\nb\nc\n", "a\nc\n"), [None, Some(Mark::RemovedAbove)]);
+        assert_eq!(line_marks("a\nb\n", "a\n"), [Some(Mark::RemovedBelow)]);
+        assert_eq!(line_marks("a\n", "a\nb\n"), [None, Some(Mark::Added)]);
+    }
+    #[test]
+    fn file_info_blames_committed_and_uncommitted_lines() {
+        let r = Repo::new();
+        r.write("a", "one\ntwo\n");
+        r.stage("a");
+        r.commit();
+        r.write("a", "one\nTWO\nthree\n");
+        let info = file_info(&r.0.join("a")).unwrap();
+        assert_eq!(info.marks, [None, Some(Mark::Modified), Some(Mark::Modified)]);
+        let commit = |n: usize| &info.commits[info.blame[n].unwrap()];
+        assert!(commit(0).committed());
+        assert_eq!((commit(0).author.as_str(), commit(0).summary.as_str()), ("Test", "test"));
+        assert!(!commit(1).committed() && !commit(2).committed());
+
+        r.write("new", "x\n");
+        let info = file_info(&r.0.join("new")).unwrap();
+        assert_eq!(info.marks, [Some(Mark::Added)]);
+        assert!(info.blame.is_empty());
     }
     #[test]
     fn status_reads_upstream_and_ahead() {

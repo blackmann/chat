@@ -177,6 +177,10 @@ pub struct Workspace {
     files: HashMap<PathBuf, Result<Rc<FileView>, SharedString>>,
     /// Where each open file is scrolled, so a link can jump to a line.
     file_scroll: HashMap<PathBuf, UniformListScrollHandle>,
+    /// Each open file's changes since HEAD and blame, read in the background.
+    file_git: HashMap<PathBuf, Rc<crate::git::FileInfo>>,
+    /// File views show who last changed each line.
+    show_blame: bool,
     /// Lines a link jumped to, lit briefly so the eye finds them.
     flash: Option<Flash>,
     terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
@@ -237,7 +241,9 @@ pub struct Workspace {
     git_busy: bool,
     git_revision: usize,
     git_errors: HashMap<PathBuf, String>,
-    thread_changes_only: bool,
+    /// Worktrees picked in the Changes page, by thread and project folder. They
+    /// win over what the thread's agent reported until it reports again.
+    git_picks: HashMap<(Option<usize>, PathBuf), PathBuf>,
     commit_message: Entity<InputState>,
     clear_commit_message: Option<String>,
     /// An undone commit's message, to put back in an empty commit box.
@@ -349,6 +355,8 @@ impl Workspace {
             listings: HashMap::new(),
             files: HashMap::new(),
             file_scroll: HashMap::new(),
+            file_git: HashMap::new(),
+            show_blame: true,
             flash: None,
             terminal: None,
             views: HashMap::new(),
@@ -389,7 +397,7 @@ impl Workspace {
             git_busy: false,
             git_revision: 0,
             git_errors: HashMap::new(),
-            thread_changes_only: false,
+            git_picks: HashMap::new(),
             commit_message,
             clear_commit_message: None,
             restore_commit_message: None,
@@ -439,6 +447,8 @@ impl Workspace {
             workspace.settings.tab_width.unwrap_or(syntax::DEFAULT_TAB_WIDTH),
             workspace.settings.indent_guides.unwrap_or(true),
         );
+        // Before any agent starts, so each one is offered the worktree tool.
+        workspace.listen_for_worktrees(cx);
         // Reopen where things were left: the project's latest thread.
         if workspace.current_project().threads.is_empty() {
             workspace.start_thread(cx);
@@ -720,6 +730,7 @@ impl Workspace {
     fn connect(&mut self, project: usize, thread: usize, cx: &mut Context<Self>) {
         let cwd = self.projects[project].path.clone().unwrap_or_else(Settings::scratch);
         let extra = self.projects[project].folders.clone();
+        let roots = self.projects[project].roots();
         let t = &mut self.projects[project].threads[thread];
         let Some(spec) = self.settings.agents.get(t.agent).cloned() else {
             return;
@@ -727,7 +738,8 @@ impl Workspace {
         let id = t.id;
         // Capture the latest choices before clearing the controls for reconnect.
         t.picks = t.current_picks();
-        let (commands, mut events, run) = agent::connect(spec, cwd, extra, t.session_id.clone(), t.picks.clone());
+        let tool = crate::worktree_tool::socket().filter(|_| !roots.is_empty()).map(|s| crate::worktree_tool::args(s, t.id, &roots));
+        let (commands, mut events, run) = agent::connect(spec, cwd, extra, t.session_id.clone(), t.picks.clone(), tool);
         let driver = cx.background_executor().spawn(run);
         let listener = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -747,6 +759,40 @@ impl Workspace {
         self.live.retain(|l| *l != id);
         self.live.push(id);
         self.stop_idle_agents();
+    }
+    /// Take reports from agents' worktree tool as they come.
+    fn listen_for_worktrees(&mut self, cx: &mut Context<Self>) {
+        let (tx, mut reports) = futures::channel::mpsc::unbounded();
+        if crate::worktree_tool::listen(move |report| {
+            let _ = tx.unbounded_send(report);
+        })
+        .is_err()
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            while let Some(report) = reports.next().await {
+                if this.update(cx, |s, cx| s.on_worktree(report, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    /// A thread's agent says which worktree it works in for a project folder.
+    fn on_worktree(&mut self, report: crate::worktree_tool::Report, cx: &mut Context<Self>) {
+        let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == report.thread) else {
+            return;
+        };
+        match report.worktree {
+            Some(tree) => thread.worktrees.insert(report.folder.clone(), tree),
+            None => thread.worktrees.remove(&report.folder),
+        };
+        // The agent's word is newer than a pick made before it.
+        self.git_picks.remove(&(Some(report.thread), report.folder));
+        self.save_soon(cx);
+        self.refresh_git(cx);
+        cx.notify();
     }
     /// Keep at most `LIVE_SESSIONS` agents running, stopping the ones shown
     /// longest ago. A thread mid-turn, or the one on screen, is never stopped.
@@ -931,6 +977,7 @@ impl Workspace {
         if let TabKind::File(path) = &kind {
             self.files.insert(path.clone(), read_lines(path));
             self.file_scroll.entry(path.clone()).or_default();
+            self.load_file_git(path.clone(), cx);
         }
         // A diff's file goes to its server too, so its lines can be looked up.
         if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind {
@@ -948,6 +995,25 @@ impl Workspace {
         self.refresh_git(cx);
         self.focus_terminal(cx);
         cx.notify();
+    }
+    /// Read an open file's gutter marks and blame off the main thread.
+    pub(super) fn load_file_git(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let read = path.clone();
+            let info = cx.background_executor().spawn(async move { crate::git::file_info(&read) }).await;
+            let _ = this.update(cx, |s, cx| {
+                // The tab may have closed meanwhile.
+                if !s.files.contains_key(&path) {
+                    return;
+                }
+                match info {
+                    Some(info) => s.file_git.insert(path, Rc::new(info)),
+                    None => s.file_git.remove(&path),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
     /// Open `path` in a tab and, given 1-based `lines`, scroll them into view
     /// and light them up for a moment.
@@ -978,6 +1044,7 @@ impl Workspace {
         if let TabKind::File(path) = &kind {
             self.files.remove(path);
             self.file_scroll.remove(path);
+            self.file_git.remove(path);
         }
         // Its server forgets the file once no tab shows it.
         if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind

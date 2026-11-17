@@ -464,6 +464,70 @@ fn sideways_track(bounds: Bounds<Pixels>, gutter: f32) -> Bounds<Pixels> {
     Bounds::new(point(left, bounds.bottom() - px(10.)), size((right - left).max(px(0.)), px(10.)))
 }
 
+/// Width of a file view's blame column.
+const BLAME: f32 = 190.;
+
+/// Who last changed a file's line and when, written only where a run of lines
+/// from one commit begins; hovering shows the commit.
+fn blame_cell(colors: Palette, git: Option<&crate::git::FileInfo>, i: usize, now: i64) -> AnyElement {
+    let cell = div().w(px(BLAME)).h_full().flex_shrink_0().pl_1().pr_3().flex().items_center().overflow_hidden();
+    let Some((git, at)) = git.and_then(|g| Some((g, (*g.blame.get(i)?)?))) else {
+        return cell.into_any_element();
+    };
+    let commit = &git.commits[at];
+    let first = i == 0 || git.blame.get(i - 1).copied().flatten() != Some(at);
+    let (who, tip) = if commit.committed() {
+        let date = chrono::DateTime::from_timestamp(commit.time, 0).map(|d| d.format("%b %-d, %Y").to_string()).unwrap_or_default();
+        (
+            format!("{} · {}", commit.author, ago(now - commit.time)),
+            format!("{} · {} · {}\n{}", &commit.sha[..7.min(commit.sha.len())], commit.author, date, commit.summary),
+        )
+    } else {
+        ("Not committed yet".to_owned(), "Not committed yet".to_owned())
+    };
+    cell.id(("blame", i))
+        .font_family(crate::theme::ui_font())
+        .text_size(px(crate::theme::scaled_ui(11.)))
+        .text_color(rgb(colors.quiet))
+        .when(i > 0 && first, |s| s.border_t_1().border_color(rgb(colors.row_border)))
+        .hover(|s| s.text_color(rgb(colors.muted)))
+        .when(first, |s| s.child(div().truncate().child(who)))
+        .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(w, cx))
+        .into_any_element()
+}
+
+/// A span of seconds as a short "how long ago".
+fn ago(seconds: i64) -> String {
+    let (minute, hour, day) = (60, 3600, 86400);
+    match seconds.max(0) {
+        s if s < hour => format!("{} min ago", (s / minute).max(1)),
+        s if s < day => format!("{} hr ago", s / hour),
+        s if s < 2 * day => "yesterday".to_owned(),
+        s if s < 30 * day => format!("{} days ago", s / day),
+        s if s < 365 * day => format!("{} mo ago", s / (30 * day)),
+        s => format!("{} yr ago", s / (365 * day)),
+    }
+}
+
+/// The bar beside a file's line numbers marking its change since HEAD: green
+/// for added, amber for changed, and a red notch where lines were removed.
+fn change_bar(colors: Palette, mark: Option<crate::git::Mark>) -> Div {
+    use crate::git::Mark;
+    let notch = || div().absolute().left(px(-2.)).w(px(7.)).h(px(2.)).bg(rgb(colors.red));
+    div()
+        .relative()
+        .w(px(3.))
+        .h_full()
+        .mr(px(10.))
+        .flex_shrink_0()
+        .when_some(mark, |s, mark| match mark {
+            Mark::Added => s.bg(rgb(colors.green)),
+            Mark::Modified => s.bg(rgb(colors.amber)),
+            Mark::RemovedAbove => s.child(notch().top_0()),
+            Mark::RemovedBelow => s.child(notch().bottom_0()),
+        })
+}
+
 fn number(colors: Palette, n: Option<usize>, width: f32) -> Div {
     div()
         .w(px(width))
@@ -506,6 +570,10 @@ impl Workspace {
         let symbol = self.symbol.clone();
         let link = self.servers.link.clone();
         let tints = tints(colors);
+        let git = self.file_git.get(&path).cloned();
+        let has_blame = git.as_ref().is_some_and(|g| !g.blame.is_empty());
+        let blame = has_blame && self.show_blame;
+        let now = chrono::Utc::now().timestamp();
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
             range
@@ -522,7 +590,9 @@ impl Workspace {
                             s.bg(Hsla::from(rgb(colors.amber)).opacity(0.22 * k))
                         })
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
-                        .child(number(colors, Some(i + 1), 44.).mr_4())
+                        .when(blame, |s| s.child(blame_cell(colors, git.as_deref(), i, now)))
+                        .child(number(colors, Some(i + 1), 44.).mr_2())
+                        .child(change_bar(colors, git.as_ref().and_then(|g| g.marks.get(i).copied().flatten())))
                         .child(
                             code_cell(offset, StyledText::new(line).with_highlights(marks), guides.at(file.guides.1[i]), Some(pick))
                                 .text_color(rgb(colors.code)),
@@ -559,14 +629,23 @@ impl Workspace {
                                 .when_some(tip, |s, tip| s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(w, cx))),
                         )
                     })
-                    .child(label(colors, format!("{count} lines"))),
+                    .child(label(colors, format!("{count} lines")))
+                    .when(has_blame, |s| {
+                        s.child(
+                            toggle(colors, "file-blame", Glyph::Branch, "Blame", self.show_blame)
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.show_blame = !s.show_blame;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             ))
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(self.scroll_sideways(key, longest, GUTTER + 60., window, list, cx))
+                    .child(self.scroll_sideways(key, longest, GUTTER + if blame { BLAME } else { 0. } + 65., window, list, cx))
                     .vertical_scrollbar(&scroll),
             )
             .into_any_element()

@@ -9,6 +9,7 @@ mod settings;
 mod store;
 mod theme;
 mod workspace;
+mod worktree_tool;
 use gpui::*;
 use gpui_component::{Root, TitleBar};
 use workspace::*;
@@ -46,12 +47,18 @@ pub fn key_bindings() -> Vec<KeyBinding> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(worktree_tool::FLAG) {
+        worktree_tool::serve(&args[1..]);
+        return;
+    }
     Application::new().with_assets(icons::Assets).run(move |cx| {
         gpui_component::init(cx);
         theme::init(cx);
         workspace::init_terminal_keys(cx);
         cx.bind_keys(key_bindings());
         cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_app_quit(|_| async { worktree_tool::cleanup() }).detach();
         cx.set_menus(vec![
             Menu {
                 name: "Chat".into(),

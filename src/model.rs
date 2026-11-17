@@ -132,6 +132,8 @@ pub struct Thread {
     /// Setting choices (id, value) to put back once a reopened session is ready,
     /// so a thread keeps the model it was switched to.
     pub picks: Vec<(String, String)>,
+    /// Worktrees the agent said it works in, by the project folder each belongs to.
+    pub worktrees: std::collections::BTreeMap<PathBuf, PathBuf>,
     /// What each setting was when the session opened: the agent's defaults.
     pub defaults: Vec<(String, String)>,
     /// Index of the current turn's first block. Steering adds user blocks
@@ -180,6 +182,7 @@ impl Thread {
             problem: None,
             session_id: None,
             picks: Vec::new(),
+            worktrees: Default::default(),
             defaults: Vec::new(),
             turn_start: 0,
             turn_began: None,
