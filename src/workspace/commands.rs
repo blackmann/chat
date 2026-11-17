@@ -128,14 +128,14 @@ impl Workspace {
                     .child(
                         div()
                             .font_family(mono())
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::mono_size()))
                             .child(format!("/{name}")),
                     )
                     .child(
                         one_line(description.clone(), 18.)
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::scaled_ui(12.)))
                             .text_color(rgb(colors.muted)),
                     )
                     .on_mouse_down(

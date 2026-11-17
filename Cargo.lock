@@ -938,6 +938,7 @@ dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
  "anyhow",
+ "chrono",
  "futures",
  "gpui",
  "gpui-component",

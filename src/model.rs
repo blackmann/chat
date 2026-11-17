@@ -44,9 +44,46 @@ pub struct Permission {
     pub chosen: Option<String>,
 }
 
+/// Milliseconds since the Unix epoch, by the wall clock.
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// What the user sent, and when. Threads saved before messages carried a time
+/// stored just the text, so either form reads back.
+#[derive(Serialize, Deserialize)]
+#[serde(from = "SavedMessage")]
+pub struct Message {
+    pub text: SharedString,
+    /// `None` for messages from before times were kept.
+    pub at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedMessage {
+    Text(SharedString),
+    Timed { text: SharedString, at: Option<i64> },
+}
+
+impl From<SavedMessage> for Message {
+    fn from(saved: SavedMessage) -> Self {
+        match saved {
+            SavedMessage::Text(text) => Self { text, at: None },
+            SavedMessage::Timed { text, at } => Self { text, at },
+        }
+    }
+}
+
+impl Message {
+    pub fn now(text: impl Into<SharedString>) -> Self {
+        Self { text: text.into(), at: Some(now_ms()) }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum Block {
-    User(SharedString),
+    User(Message),
     /// Agent prose, grown chunk by chunk.
     Text(String),
     Thought(String),
@@ -54,6 +91,8 @@ pub enum Block {
     Permission(Permission),
     /// Something the app has to say: a stop, a failure.
     Notice(String),
+    /// The close of an agent turn: when it ended and how long the agent worked.
+    TurnEnded { at: i64, worked_ms: u64 },
 }
 
 /// The live connection behind a thread. Dropping it stops the agent process.
@@ -96,6 +135,8 @@ pub struct Thread {
     /// Index of the current turn's first block. Steering adds user blocks
     /// inside the turn, so the last user block no longer marks its start.
     turn_start: usize,
+    /// When the running turn began, to tell how long it worked once it ends.
+    turn_began: Option<i64>,
     /// One steer awaits a reply before the next follow-up can be dispatched.
     pending_steer: Option<(usize, QueuedMessage)>,
     pub queued: VecDeque<QueuedMessage>,
@@ -137,6 +178,7 @@ impl Thread {
             picks: Vec::new(),
             defaults: Vec::new(),
             turn_start: 0,
+            turn_began: None,
             pending_steer: None,
             queued: VecDeque::new(),
         }
@@ -151,7 +193,8 @@ impl Thread {
     }
     fn prompt(&mut self, shown: impl Into<SharedString>, prompt: String) {
         self.turn_start = self.blocks.len();
-        self.blocks.push(Block::User(shown.into()));
+        self.blocks.push(Block::User(Message::now(shown)));
+        self.turn_began = Some(now_ms());
         self.state = ThreadState::Running;
         self.send(Command::Prompt(prompt));
     }
@@ -178,7 +221,7 @@ impl Thread {
         let Some(message) = self.queued.pop_front() else { return };
         if busy {
             let index = self.blocks.len();
-            self.blocks.push(Block::User(message.shown.clone()));
+            self.blocks.push(Block::User(Message::now(message.shown.clone())));
             self.send(Command::Steer(message.prompt.clone()));
             self.pending_steer = Some((index, message));
         } else {
@@ -193,6 +236,13 @@ impl Thread {
             {
                 p.chosen = Some("Dismissed".into());
             }
+        }
+    }
+    /// Close the running turn with when it ended and how long it took.
+    fn stamp_turn(&mut self) {
+        if let Some(began) = self.turn_began.take() {
+            let at = now_ms();
+            self.blocks.push(Block::TurnEnded { at, worked_ms: (at - began).max(0) as u64 });
         }
     }
     /// A turn that ends leaves no tool call running.
@@ -325,6 +375,7 @@ impl Thread {
                         ThreadState::Failed
                     }
                 };
+                self.stamp_turn();
                 self.advance_follow_ups();
             }
             Event::SteerEnded(result) => {
@@ -352,6 +403,7 @@ impl Thread {
                 self.pending_steer = None;
                 self.dismiss_permissions();
                 self.settle_tools();
+                self.stamp_turn();
                 if reason.is_some() || interrupted {
                     self.problem = Some(reason.map_or("The agent exited.".into(), |r| format!("The agent stopped: {r}")));
                     self.state = ThreadState::Failed;
@@ -525,6 +577,11 @@ mod tests {
         }
     }
 
+    /// What the user has said so far, in order.
+    fn said(t: &Thread) -> Vec<&str> {
+        t.blocks.iter().filter_map(|b| if let Block::User(m) = b { Some(m.text.as_ref()) } else { None }).collect()
+    }
+
     #[test]
     fn folds_events_into_blocks() {
         let mut t = Thread::new(1, 0);
@@ -604,9 +661,18 @@ mod tests {
         assert!(matches!(&t.blocks[2], Block::Permission(p) if p.chosen.is_none()));
         t.apply(edit("x", Status::Done, "old", "new"));
         assert!(matches!(&t.blocks[1], Block::Tool(call) if call.status == Status::Done));
-        assert!(matches!(&t.blocks[3], Block::User(text) if text.as_ref() == "adjust"));
+        assert!(matches!(&t.blocks[3], Block::User(m) if m.text.as_ref() == "adjust"));
         t.apply(Event::TurnEnded(Ok(Stop::Finished)));
         assert!(t.state == ThreadState::Done);
+        assert!(matches!(t.blocks.last(), Some(Block::TurnEnded { .. })));
+    }
+
+    #[test]
+    fn messages_saved_without_a_time_still_read_back() {
+        let old: Block = serde_json::from_str(r#"{"User":"hi"}"#).unwrap();
+        assert!(matches!(&old, Block::User(m) if m.text.as_ref() == "hi" && m.at.is_none()));
+        let new: Block = serde_json::from_value(serde_json::to_value(Block::User(Message::now("hi"))).unwrap()).unwrap();
+        assert!(matches!(&new, Block::User(m) if m.at.is_some()));
     }
 
     #[test]
@@ -625,10 +691,10 @@ mod tests {
             assert_eq!(t.turn_start, 0);
             t.apply(second);
             assert!(t.state == ThreadState::Running);
-            assert!(matches!(&t.blocks[1], Block::User(text) if text.as_ref() == "first"));
+            assert_eq!(said(&t), ["initial", "first"]);
             assert_eq!(t.queued.len(), 1);
             t.apply(Event::TurnEnded(Ok(Stop::Finished)));
-            assert!(matches!(&t.blocks[2], Block::User(text) if text.as_ref() == "second"));
+            assert_eq!(said(&t), ["initial", "first", "second"]);
             assert!(t.queued.is_empty());
         }
     }
@@ -642,6 +708,7 @@ mod tests {
         assert!(t.pending_steer.is_none());
         assert_eq!(t.queued.len(), 1);
         t.apply(Event::TurnEnded(Ok(Stop::Finished)));
-        assert!(matches!(&t.blocks[1], Block::User(text) if text.as_ref() == "follow-up"));
+        assert_eq!(said(&t), ["initial", "follow-up"]);
+        assert!(matches!(&t.blocks[1], Block::TurnEnded { .. }), "the first turn closes before the follow-up starts");
     }
 }

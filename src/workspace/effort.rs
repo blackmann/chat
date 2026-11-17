@@ -156,7 +156,7 @@ impl Workspace {
                 .gap(px(2.))
                 .px_1()
                 .rounded(px(4.))
-                .text_size(px(11.))
+                .text_size(px(crate::theme::scaled_ui(11.)))
                 .text_color(rgb(colors.muted))
                 .cursor_pointer()
                 .hover(|s| s.text_color(rgb(colors.text)))
@@ -205,7 +205,7 @@ impl Workspace {
                                 .gap(px(2.))
                                 .child(
                                     div()
-                                        .text_size(px(13.))
+                                        .text_size(px(crate::theme::scaled_ui(13.)))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(colors.blue))
                                         .child(setting.current_name().to_string()),

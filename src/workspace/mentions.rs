@@ -30,24 +30,30 @@ pub(super) fn icon_path(path: &Path, dir: bool) -> SharedString {
     if dir {
         return IconName::Folder.path();
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    match ext.as_str() {
-        "md" | "mdx" | "txt" | "rst" | "adoc" => Glyph::FileText.path(),
-        "json" | "jsonc" | "toml" | "yaml" | "yml" | "lock" | "ini" | "env" | "xml" | "plist" => Glyph::FileJson.path(),
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "bmp" | "avif" => Glyph::FileImage.path(),
-        "" => IconName::File.path(),
-        _ if syntax::language(&path.to_string_lossy()).is_some() => Glyph::FileCode.path(),
-        "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "swift" | "kt" | "java" | "c" | "h" | "cpp" | "rb" | "sh" | "css" | "html" => {
-            Glyph::FileCode.path()
-        }
-        _ => IconName::File.path(),
-    }
+    super::file_kind::file_kind(path).0
 }
 
 /// A mention of `label`, sending `sent` in its place.
 pub(super) fn mention(label: &str, sent: String, icon: SharedString) -> FileMention {
     let shown = label.replace(' ', "\u{a0}");
     FileMention { token: format!("{MARKER}{LEAD}{shown}{TRAIL}{MARKER}"), label: label.to_string(), reference: sent.clone(), sent, icon }
+}
+
+/// Widen a mention's token so the room the input gives it holds the name as
+/// the chip draws it: in the mono face, which runs wider than the input's.
+pub(super) fn fit(mut m: FileMention, window: &Window) -> FileMention {
+    let shown = m.label.replace(' ', "\u{a0}");
+    // The composer's text is `text_sm` against a rem of the theme's base size.
+    let input = (crate::theme::ui_size() + 2.) * 0.875;
+    let drawn = text_width_in(window, &shown, crate::theme::mono_size(), crate::theme::mono());
+    let room = text_width_in(window, &shown, input, crate::theme::ui_font());
+    let space = text_width_in(window, "\u{a0}", input, crate::theme::ui_font()).max(px(1.));
+    let extra = ((drawn - room) / space).ceil().max(0.) as usize;
+    if extra > 0 {
+        let end = m.token.len() - MARKER.len();
+        m.token.insert_str(end, &"\u{a0}".repeat(extra));
+    }
+    m
 }
 
 /// How a path is sent to the agent: relative to the project where it can be.
@@ -458,6 +464,7 @@ impl Workspace {
             Kind::Dir => icon_path(&item.path, true),
             Kind::File => icon_path(&item.path, false),
         });
+        let added = fit(added, window);
         let token = format!("{} ", added.token);
         self.file_mentions.borrow_mut().push(added);
         self.composer.update(cx, |input, cx| {
@@ -518,6 +525,10 @@ impl Workspace {
         let mentions = self.file_mentions.clone();
         let border = Hsla::from(rgb(colors.border));
         let ink = Hsla::from(rgb(colors.muted));
+        let fill = Hsla::from(rgb(colors.hover));
+        let text_ink = Hsla::from(rgb(colors.text));
+        let chip_font = font(mono());
+        let chip_size = px(crate::theme::mono_size());
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
@@ -542,19 +553,34 @@ impl Workspace {
                         let lead = inner.start..inner.start + LEAD.len();
                         let whole = state.bounds_for_range(utf16(&text, inner.start)..utf16(&text, inner.end), origin, window, cx);
                         let pad = state.bounds_for_range(utf16(&text, lead.start)..utf16(&text, lead.end), origin, window, cx);
-                        let icon = mentions.iter().find(|m| text[range.clone()] == m.token).map(|m| m.icon.clone());
-                        if let (Some(whole), Some(pad), Some(icon)) = (whole, pad, icon) {
-                            chips.push((whole, pad, icon));
+                        let mention = mentions.iter().find(|m| text[range.clone()] == m.token);
+                        if let (Some(whole), Some(pad), Some(mention)) = (whole, pad, mention) {
+                            chips.push((whole, pad, mention.icon.clone(), mention.label.replace(' ', "\u{a0}")));
                         }
                     }
                 });
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    for (whole, pad, icon) in chips {
-                        let chip = Bounds::from_corners(whole.origin + point(px(0.), px(1.)), whole.bottom_right() - point(px(0.), px(1.)));
-                        window.paint_quad(quad(chip, px(4.), transparent_black(), px(1.), border, BorderStyle::Solid));
+                    for (whole, pad, icon, label) in chips {
+                        let run = TextRun {
+                            len: label.len(),
+                            font: chip_font.clone(),
+                            color: text_ink,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let line = window.text_system().shape_line(label.into(), chip_size, &[run], None);
+                        // The token is padded to hold the mono name; should fonts have
+                        // changed since, the chip still wraps the whole name.
+                        let right = whole.right().max(pad.right() + line.width + px(6.));
+                        let chip = Bounds::from_corners(whole.origin + point(px(0.), px(1.)), point(right, whole.bottom() - px(1.)));
+                        // Paint over the input's proportional label, then redraw it in
+                        // the configured mono face so composer and transcript chips match.
+                        window.paint_quad(quad(chip, px(4.), fill, px(1.), border, BorderStyle::Solid));
                         let size = px(12.).min(pad.size.width - px(4.)).max(px(8.));
                         let at = point(pad.left() + (pad.size.width - size) / 2., chip.center().y - size / 2.);
                         let _ = window.paint_svg(Bounds { origin: at, size: Size { width: size, height: size } }, icon, TransformationMatrix::unit(), ink, cx);
+                        let _ = line.paint(point(pad.right(), chip.top()), chip.size.height, window, cx);
                     }
                 });
             },
@@ -595,7 +621,7 @@ impl Workspace {
         let mut rows = col().id("mention-rows").max_h(px(260.)).overflow_y_scroll().track_scroll(&self.mention_scroll);
         if matches.is_empty() {
             rows = rows.child(
-                row().h(px(28.)).px_2().gap_2().text_size(px(12.)).text_color(rgb(colors.muted)).map(|s| {
+                row().h(px(28.)).px_2().gap_2().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.muted)).map(|s| {
                     if self.mention_index.as_ref().is_none_or(|i| i.project != self.current_project().path) {
                         s.child(spinner(colors)).child("Indexing files…")
                     } else {
@@ -630,10 +656,10 @@ impl Workspace {
                         )
                         .flex_1()
                         .min_w_0()
-                        .when(matches!(item.kind, Kind::Symbol(_)), |s| s.font_family(mono()).text_size(px(12.))),
+                        .when(matches!(item.kind, Kind::Symbol(_)), |s| s.font_family(mono()).text_size(px(crate::theme::mono_size()))),
                     )
                     .when_some(if let Kind::Symbol(kind) = item.kind { Some(kind) } else { None }, |s, kind| {
-                        s.child(label(colors, kind).text_size(px(11.)))
+                        s.child(label(colors, kind).text_size(px(crate::theme::scaled_ui(11.))))
                     })
                     .on_mouse_down(
                         MouseButton::Left,

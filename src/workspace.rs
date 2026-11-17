@@ -3,6 +3,7 @@
 mod chat;
 mod commands;
 mod effort;
+mod file_kind;
 mod chrome;
 mod md;
 mod mentions;
@@ -169,6 +170,9 @@ pub struct Workspace {
     /// Keep the transcript pinned to its end as output streams in. Scrolling up
     /// lets go; scrolling back to the end, sending, or switching threads takes hold again.
     follow: bool,
+    /// While a press is down in the transcript (on its scrollbar, say), where the
+    /// view sat when it began. New output waits to pin until it lifts.
+    holding_transcript: Option<Pixels>,
     thread_panels: Entity<ResizableState>,
     side_panels: Entity<ResizableState>,
     popup: Option<Entity<Menu>>,
@@ -307,6 +311,7 @@ impl Workspace {
             clear_composer: false,
             transcript: ScrollHandle::new(),
             follow: true,
+            holding_transcript: None,
             thread_panels: cx.new(|_| ResizableState::default()),
             side_panels: cx.new(|_| ResizableState::default()),
             popup: None,
@@ -362,7 +367,13 @@ impl Workspace {
             s.save_now();
             async {}
         }));
-        crate::theme::set_fonts(workspace.settings.ui_font.as_deref(), workspace.settings.mono_font.as_deref(), cx);
+        crate::theme::set_fonts(
+            workspace.settings.ui_font.as_deref(),
+            workspace.settings.mono_font.as_deref(),
+            workspace.settings.ui_font_size,
+            workspace.settings.mono_font_size,
+            cx,
+        );
         // Reopen where things were left: the project's latest thread.
         if workspace.current_project().threads.is_empty() {
             workspace.start_thread(cx);
@@ -730,8 +741,8 @@ impl Workspace {
             problem.push_str(&format!("\nCheck that {name} is installed and signed in, then send your message again."));
         }
         // Follow new output only while pinned, so scrolling back to read isn't
-        // undone by the next chunk.
-        if current && self.follow {
+        // undone by the next chunk, nor by a drag on the scrollbar.
+        if current && self.follow && self.holding_transcript.is_none() {
             self.transcript.scroll_to_bottom();
         }
         self.save_soon(cx);
@@ -1004,6 +1015,8 @@ pub struct FileView {
     /// The longest line, which sets how far the view scrolls sideways.
     pub longest: usize,
     pub highlights: Option<syntax::Highlights>,
+    /// The indent step in columns, and how many indent guides each line has.
+    pub guides: (usize, Vec<u16>),
 }
 
 fn read_lines(path: &Path) -> Result<Rc<FileView>, SharedString> {
@@ -1015,7 +1028,8 @@ fn read_lines(path: &Path) -> Result<Rc<FileView>, SharedString> {
     let lines = syntax::lines(&text);
     let highlights = syntax::language(&path.to_string_lossy()).and_then(|lang| syntax::highlight(lang, &lines));
     let longest = lines.iter().enumerate().max_by_key(|(_, l)| l.chars().count()).map_or(0, |(i, _)| i);
-    Ok(Rc::new(FileView { lines, longest, highlights }))
+    let guides = syntax::indent_guides(&lines);
+    Ok(Rc::new(FileView { lines, longest, highlights, guides }))
 }
 
 impl Workspace {
@@ -1042,7 +1056,7 @@ impl Workspace {
             }))
             .child(ui::label(colors, "Rename project").px_1())
             .child(gpui_component::Sizable::small(gpui_component::input::Input::new(&self.rename_input)))
-            .child(ui::label(colors, "↵ to save · esc to cancel").px_1().text_size(px(11.)).text_color(rgb(colors.quiet)))
+            .child(ui::label(colors, "↵ to save · esc to cancel").px_1().text_size(px(crate::theme::scaled_ui(11.))).text_color(rgb(colors.quiet)))
             .into_any_element()
     }
 }
@@ -1118,8 +1132,8 @@ impl Render for Workspace {
             .size_full()
             .bg(rgb(colors.background))
             .text_color(rgb(colors.text))
-            .font_family(".SystemUIFont")
-            .text_size(px(13.))
+            .font_family(crate::theme::ui_font())
+            .text_size(px(crate::theme::ui_size()))
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::new_thread))
             .on_action(cx.listener(Self::add_project))

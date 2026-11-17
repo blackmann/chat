@@ -7,14 +7,15 @@ use std::cell::RefCell;
 /// The platform's own interface font.
 pub const SYSTEM_UI: &str = ".SystemUIFont";
 pub const DEFAULT_MONO: &str = "Menlo";
+pub const UI_SIZE: f32 = 13.;
 pub const MONO_SIZE: f32 = 12.;
 
 thread_local! {
     /// The interface and code fonts. Kept here rather than passed around because
     /// views read them deep inside list closures that have no `App` to ask;
     /// everything that draws runs on the one UI thread.
-    static FONTS: RefCell<(SharedString, SharedString)> =
-        RefCell::new((SYSTEM_UI.into(), DEFAULT_MONO.into()));
+    static TYPOGRAPHY: RefCell<(SharedString, SharedString, f32, f32)> =
+        RefCell::new((SYSTEM_UI.into(), DEFAULT_MONO.into(), UI_SIZE, MONO_SIZE));
 }
 
 #[derive(Clone, Copy)]
@@ -126,19 +127,36 @@ pub fn palette(cx: &App) -> Palette {
     *cx.global::<Palette>()
 }
 pub fn ui_font() -> SharedString {
-    FONTS.with_borrow(|f| f.0.clone())
+    TYPOGRAPHY.with_borrow(|t| t.0.clone())
 }
 pub fn mono() -> SharedString {
-    FONTS.with_borrow(|f| f.1.clone())
+    TYPOGRAPHY.with_borrow(|t| t.1.clone())
+}
+pub fn ui_size() -> f32 {
+    TYPOGRAPHY.with_borrow(|t| t.2)
+}
+pub fn mono_size() -> f32 {
+    TYPOGRAPHY.with_borrow(|t| t.3)
+}
+/// Scale a deliberately smaller or larger interface label with the selected base size.
+pub fn scaled_ui(size: f32) -> f32 {
+    size * ui_size() / UI_SIZE
+}
+/// Scale code and chip labels with the selected monospace base size.
+pub fn scaled_mono(size: f32) -> f32 {
+    size * mono_size() / MONO_SIZE
 }
 
-/// Switch fonts; `None` means the default. Every window redraws with them.
-pub fn set_fonts(ui: Option<&str>, mono: Option<&str>, cx: &mut App) {
+/// Switch fonts and their base sizes; `None` means the default. Every window redraws with them.
+pub fn set_fonts(ui: Option<&str>, mono: Option<&str>, ui_size: Option<f32>, mono_size: Option<f32>, cx: &mut App) {
     let (ui, mono) = (SharedString::from(ui.unwrap_or(SYSTEM_UI).to_string()), SharedString::from(mono.unwrap_or(DEFAULT_MONO).to_string()));
-    FONTS.with_borrow_mut(|f| *f = (ui, mono));
+    TYPOGRAPHY.with_borrow_mut(|t| *t = (ui, mono, ui_size.unwrap_or(UI_SIZE), mono_size.unwrap_or(MONO_SIZE)));
     let t = Theme::global_mut(cx);
     t.font_family = ui_font();
     t.mono_font_family = self::mono();
+    // Component chrome is based on a 15px rem while workspace copy is 13px.
+    t.font_size = px(self::ui_size() + 2.);
+    t.mono_font_size = px(self::mono_size());
     cx.refresh_windows();
 }
 
@@ -165,10 +183,10 @@ fn apply(appearance: WindowAppearance, cx: &mut App) {
     let c = |v: u32| -> Hsla { rgb(v).into() };
     let t = Theme::global_mut(cx);
     // GPUI Component sizes controls in rem, and Root sets rem to this value.
-    t.font_size = px(15.);
+    t.font_size = px(ui_size() + 2.);
     t.font_family = ui_font();
     t.mono_font_family = mono();
-    t.mono_font_size = px(MONO_SIZE);
+    t.mono_font_size = px(mono_size());
     t.radius = px(5.);
     t.radius_lg = px(8.);
     t.shadow = false;

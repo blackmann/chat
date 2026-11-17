@@ -109,6 +109,48 @@ pub fn lines(text: &str) -> Vec<SharedString> {
     text.lines().map(|l| l.replace('\t', "    ").into()).collect()
 }
 
+/// Where vertical indent guides fall in a run of lines (as `lines` makes them):
+/// the indent step in columns, and how many guides each line carries. A guide
+/// sits at every step left of a line's text; a blank line takes the lesser of
+/// the lines around it, so guides run unbroken through gaps in a block.
+pub fn indent_guides<S: AsRef<str>>(lines: &[S]) -> (usize, Vec<u16>) {
+    let indents: Vec<Option<usize>> = lines
+        .iter()
+        .map(|l| {
+            let l = l.as_ref();
+            let text = l.trim_start_matches(' ');
+            (!text.trim().is_empty()).then(|| l.len() - text.len())
+        })
+        .collect();
+    // The step is the commonest rise from one non-blank line to the next.
+    let mut rises = [0usize; 9];
+    let mut last = 0;
+    for &n in indents.iter().flatten() {
+        if n > last && n - last <= 8 && n - last >= 2 {
+            rises[n - last] += 1;
+        }
+        last = n;
+    }
+    let unit = (2..=8).max_by_key(|&s| (rises[s], s == 4)).filter(|&s| rises[s] > 0).unwrap_or(4);
+    let levels = |n: usize| n.div_ceil(unit) as u16;
+    let mut out = vec![0; lines.len()];
+    let mut below = 0;
+    for (i, indent) in indents.iter().enumerate().rev() {
+        if let Some(n) = indent {
+            below = levels(*n);
+        }
+        out[i] = below;
+    }
+    let mut above = 0;
+    for (i, indent) in indents.iter().enumerate() {
+        match indent {
+            Some(_) => above = out[i],
+            None => out[i] = out[i].min(above),
+        }
+    }
+    (unit, out)
+}
+
 /// How many highlighted texts to keep before starting over.
 const CACHE: usize = 256;
 
@@ -255,7 +297,7 @@ fn per_line(styles: &[(Range<usize>, HighlightStyle)], starts: &[usize], lines: 
 
 #[cfg(test)]
 mod tests {
-    use super::{cached, highlight, language, lines};
+    use super::{cached, highlight, indent_guides, language, lines};
     use gpui::SharedString;
     #[test]
     fn picks_languages_by_name() {
@@ -283,5 +325,15 @@ mod tests {
         assert_eq!(first.dark.len(), lines(text).len());
         assert_eq!(lines(text)[1], "    let x = 1;");
         assert!(cached("txt", text).is_none());
+    }
+
+    #[test]
+    fn indent_guides_follow_the_step_and_bridge_blank_lines() {
+        let src = ["fn a() {", "  if x {", "    y();", "", "    z();", "  }", "", "}"];
+        let (unit, levels) = indent_guides(&src);
+        assert_eq!(unit, 2);
+        assert_eq!(levels, [0, 1, 2, 2, 2, 1, 0, 0]);
+        assert_eq!(indent_guides(&["a", "    b"]).0, 4);
+        assert_eq!(indent_guides::<&str>(&[]).1, Vec::<u16>::new());
     }
 }

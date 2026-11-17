@@ -2,7 +2,7 @@
 use super::ui::*;
 use super::*;
 use crate::icons::Glyph;
-use gpui_component::Icon;
+use gpui_component::{ActiveTheme, Icon, scroll::ScrollableElement};
 
 const LINE: f32 = 20.;
 /// Unchanged lines kept around each change in a diff.
@@ -184,7 +184,7 @@ fn pane_header(colors: Palette, glyph: impl Into<Icon>, path: &str, trailing: im
         .border_b_1()
         .border_color(rgb(colors.row_border))
         .font_family(mono())
-        .text_size(px(12.))
+        .text_size(px(crate::theme::mono_size()))
         .child(icon(glyph).size(px(13.)).text_color(rgb(colors.muted)))
         .child(
             row()
@@ -207,6 +207,7 @@ fn diff_body(
     new: &str,
     offset: Pixels,
     select: Option<Select>,
+    window: &Window,
 ) -> Option<(Div, usize, f32)> {
     let (before, after) = (syntax::cached(name, old), syntax::cached(name, new));
     let lines = diff_lines(old, new);
@@ -237,8 +238,10 @@ fn diff_body(
             i += 1;
         }
     }
+    let (unit, levels) = syntax::indent_guides(&lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>());
+    let guides = Guides::new(colors, window, unit);
     let width = lines.iter().filter_map(|l| l.new.or(l.old)).max().unwrap_or(1).to_string().len() as f32 * 8. + 20.;
-    let mut rows = col().w_full().pb_4().font_family(mono()).text_size(px(crate::theme::MONO_SIZE));
+    let mut rows = col().w_full().pb_4().font_family(mono()).text_size(px(crate::theme::mono_size()));
     for (n, line) in lines.into_iter().enumerate() {
         if line.kind == LineKind::Hunk {
             if n > 0 {
@@ -268,28 +271,98 @@ fn diff_body(
             .child(div().w(px(3.)).h_full().flex_shrink_0().when_some(bars[n], |s, hue| s.bg(rgb(hue))))
             // Removed lines have no place in the new file, so no number.
             .child(number(colors, if line.kind == LineKind::Del { None } else { line.new }, width).pr_3())
-            .child(code_cell(offset, StyledText::new(line.text).with_highlights(marks)));
+            .child(code_cell(offset, StyledText::new(line.text).with_highlights(marks), guides.at(levels[n])));
         rows = rows.child(cells);
     }
     let gutter = if select.is_some() { GUTTER } else { 0. };
     Some((rows, longest, gutter + 3. + width + 12.))
 }
 
+/// Vertical indent guides for one code row: how many, the gap between them
+/// (an indent step in pixels), and their colour.
+#[derive(Clone, Copy)]
+struct Guides {
+    count: u16,
+    step: Pixels,
+    color: Hsla,
+}
+
+impl Guides {
+    /// A code view's guide spacing and colour; each row then sets its own count.
+    fn new(colors: Palette, window: &Window, unit: usize) -> Self {
+        Self { count: 0, step: glyph_width(window) * unit as f32, color: rgb(colors.row_border).into() }
+    }
+
+    fn at(self, count: u16) -> Self {
+        Self { count, ..self }
+    }
+}
+
+/// The width of one character in the code font.
+fn glyph_width(window: &Window) -> Pixels {
+    text_width_in(window, "0000000000", crate::theme::mono_size(), mono()) / 10.
+}
+
 /// A line's code, shifted left by how far the view has scrolled sideways and
-/// clipped at the gutter, which stays put.
-fn code_cell(offset: Pixels, text: impl IntoElement) -> Div {
+/// clipped at the gutter, which stays put. Indent guides scroll with the code.
+fn code_cell(offset: Pixels, text: impl IntoElement, guides: Guides) -> Div {
+    let lines = (0..guides.count).map(|k| {
+        div().absolute().top_0().bottom_0().left(guides.step * k as f32).w(px(1.)).bg(guides.color)
+    });
     div().flex().flex_1().min_w_0().h_full().items_center().overflow_hidden().child(
-        div().flex_shrink_0().whitespace_nowrap().pr_4().ml(-offset).child(text),
+        div()
+            .relative()
+            .h_full()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .whitespace_nowrap()
+            .pr_4()
+            .ml(-offset)
+            .children(lines)
+            .child(text),
     )
 }
 
 /// How far a code view has scrolled sideways, how wide its longest line is, and
 /// how much room its code has: enough to keep the scroll in bounds.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct Sideways {
     offset: Pixels,
     content: Pixels,
     viewport: Pixels,
+    /// Up-and-down scroll of a view that has no handle of its own, for its scrollbar.
+    scroll: ScrollHandle,
+    /// The axis the current trackpad swipe is held to.
+    axis: Option<Axis>,
+    /// Where a drag on the sideways scrollbar began, and the offset then.
+    drag: Option<(Pixels, Pixels)>,
+    hover: bool,
+}
+
+impl Sideways {
+    fn max(&self) -> Pixels {
+        (self.content - self.viewport).max(px(0.))
+    }
+
+    /// The sideways scrollbar's thumb within `track`, when there is anywhere to scroll.
+    fn thumb(&self, track: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
+        let max = self.max();
+        if max <= px(0.) || self.content <= px(0.) {
+            return None;
+        }
+        let width = (track.size.width * (self.viewport / self.content)).max(px(24.)).min(track.size.width);
+        let left = track.left() + (track.size.width - width) * (self.offset / max);
+        Some(Bounds::new(point(left, track.top() + px(2.)), size(width, track.size.height - px(4.))))
+    }
+}
+
+/// Where a code view's sideways scrollbar runs: along the bottom, right of the
+/// line numbers and clear of the up-and-down scrollbar.
+fn sideways_track(bounds: Bounds<Pixels>, gutter: f32) -> Bounds<Pixels> {
+    let left = bounds.left() + px(gutter);
+    let right = bounds.right() - px(12.);
+    Bounds::new(point(left, bounds.bottom() - px(10.)), size((right - left).max(px(0.)), px(10.)))
 }
 
 fn number(colors: Palette, n: Option<usize>, width: f32) -> Div {
@@ -326,7 +399,8 @@ impl Workspace {
         if flash.is_some() {
             window.request_animation_frame();
         }
-        let scroll = self.file_scroll.get(&path).cloned();
+        let scroll = self.file_scroll.get(&path).cloned().unwrap_or_default();
+        let guides = Guides::new(colors, window, file.guides.0);
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
             range
@@ -339,15 +413,18 @@ impl Workspace {
                         })
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
                         .child(number(colors, Some(i + 1), 44.).mr_4())
-                        .child(code_cell(offset, StyledText::new(line).with_highlights(marks)).text_color(rgb(colors.code)))
+                        .child(
+                            code_cell(offset, StyledText::new(line).with_highlights(marks), guides.at(file.guides.1[i]))
+                                .text_color(rgb(colors.code)),
+                        )
                 })
                 .collect()
         })
-        .when_some(scroll, |l, scroll| l.track_scroll(scroll))
+        .track_scroll(scroll.clone())
         .size_full()
         .py_2()
         .font_family(mono())
-        .text_size(px(crate::theme::MONO_SIZE));
+        .text_size(px(crate::theme::mono_size()));
         col()
             .size_full()
             .child(pane_header(
@@ -360,7 +437,14 @@ impl Workspace {
                     .when(edited, |s| s.child(pill("Edited in this thread", colors.amber, colors.amber_tint)))
                     .child(label(colors, format!("{count} lines"))),
             ))
-            .child(div().flex_1().min_h_0().child(self.scroll_sideways(key, longest, GUTTER + 60., window, list, cx)))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.scroll_sideways(key, longest, GUTTER + 60., window, list, cx))
+                    .vertical_scrollbar(&scroll),
+            )
             .into_any_element()
     }
 
@@ -371,44 +455,126 @@ impl Workspace {
     /// Wrap a code view whose lines are drawn with `code_cell`: sideways scrolling
     /// over it shifts the code and leaves the line numbers where they are.
     fn scroll_sideways(&self, key: SharedString, longest: usize, gutter: f32, window: &Window, view: impl IntoElement, cx: &mut Context<Self>) -> Div {
-        let glyph = text_width_in(window, "0000000000", crate::theme::MONO_SIZE, mono()) / 10.;
+        let glyph = glyph_width(window);
         let content = glyph * longest as f32 + px(16.);
         self.sideways.borrow_mut().entry(key.clone()).or_default().content = content;
         let store = self.sideways.clone();
-        let canvas_key = key.clone();
-        div()
-            .relative()
-            .size_full()
-            .child(view)
-            .child(
-                canvas(
-                    move |bounds, _, _| {
+        let view_id = cx.entity_id();
+        let theme = cx.theme();
+        let (thumb, thumb_hover) = (theme.scrollbar_thumb, theme.scrollbar_thumb_hover);
+        div().relative().size_full().child(view).child(
+            canvas(
+                {
+                    let store = store.clone();
+                    let key = key.clone();
+                    move |bounds, window, _| {
                         let mut all = store.borrow_mut();
-                        let s = all.entry(canvas_key.clone()).or_default();
+                        let s = all.entry(key).or_default();
                         s.viewport = bounds.size.width - px(gutter);
-                        s.offset = s.offset.min((s.content - s.viewport).max(px(0.)));
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
+                        s.offset = s.offset.min(s.max());
+                        window.insert_hitbox(bounds, HitboxBehavior::Normal)
+                    }
+                },
+                move |bounds, hitbox, window, _| {
+                    let track = sideways_track(bounds, gutter);
+                    if let Some(bar) = store.borrow().get(&key).and_then(|s| s.thumb(track)) {
+                        let lit = store.borrow().get(&key).is_some_and(|s| s.drag.is_some()) || track.contains(&window.mouse_position());
+                        window.paint_quad(fill(bar, if lit { thumb_hover } else { thumb }).corner_radii(px(3.)));
+                    }
+
+                    // Trackpad swipes are taken whole: the axis the gesture starts
+                    // along is the only one it moves, so code doesn't drift
+                    // diagonally. Sideways ones are kept from the list beneath.
+                    let (s1, k1, h1) = (store.clone(), key.clone(), hitbox.clone());
+                    window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture || !h1.should_handle_scroll(window) {
+                            return;
+                        }
+                        let mut all = s1.borrow_mut();
+                        let side = all.entry(k1.clone()).or_default();
+                        let d = e.delta.pixel_delta(px(LINE));
+                        let sideways = match e.delta {
+                            // A wheel turns sideways with shift.
+                            ScrollDelta::Lines(_) => {
+                                side.axis = None;
+                                e.modifiers.shift || d.x.abs() > d.y.abs()
+                            }
+                            ScrollDelta::Pixels(_) => {
+                                if matches!(e.touch_phase, TouchPhase::Started) {
+                                    side.axis = None;
+                                }
+                                if side.axis.is_none() && (d.x != px(0.) || d.y != px(0.)) {
+                                    side.axis = Some(if d.x.abs() > d.y.abs() { Axis::Horizontal } else { Axis::Vertical });
+                                }
+                                side.axis == Some(Axis::Horizontal)
+                            }
+                        };
+                        if !sideways {
+                            return;
+                        }
+                        cx.stop_propagation();
+                        let dx = if d.x == px(0.) { d.y } else { d.x };
+                        let next = (side.offset - dx).clamp(px(0.), side.max());
+                        if next != side.offset {
+                            side.offset = next;
+                            cx.notify(view_id);
+                        }
+                    });
+
+                    // The scrollbar: drag its thumb, or press the track to jump there.
+                    let (s2, k2, h2) = (store.clone(), key.clone(), hitbox.clone());
+                    window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble || e.button != MouseButton::Left || !h2.is_hovered(window) || !track.contains(&e.position) {
+                            return;
+                        }
+                        let mut all = s2.borrow_mut();
+                        let Some(side) = all.get_mut(&k2) else { return };
+                        let Some(bar) = side.thumb(track) else { return };
+                        if !bar.contains(&e.position) {
+                            // Center the thumb under the press.
+                            let room = track.size.width - bar.size.width;
+                            let at = (e.position.x - track.left() - bar.size.width / 2.).clamp(px(0.), room);
+                            side.offset = if room > px(0.) { side.max() * (at / room) } else { px(0.) };
+                        }
+                        side.drag = Some((e.position.x, side.offset));
+                        cx.stop_propagation();
+                        cx.notify(view_id);
+                    });
+                    let s3 = store.clone();
+                    let k3 = key.clone();
+                    window.on_mouse_event(move |e: &MouseMoveEvent, _, _, cx| {
+                        let mut all = s3.borrow_mut();
+                        let Some(side) = all.get_mut(&k3) else { return };
+                        let hovering = track.contains(&e.position);
+                        if side.drag.is_none() {
+                            if hovering != side.hover {
+                                side.hover = hovering;
+                                cx.notify(view_id);
+                            }
+                            return;
+                        }
+                        let (Some((x, from)), Some(bar)) = (side.drag, side.thumb(track)) else { return };
+                        let room = track.size.width - bar.size.width;
+                        if room > px(0.) {
+                            side.offset = (from + (e.position.x - x) * (side.max() / room)).clamp(px(0.), side.max());
+                            cx.stop_propagation();
+                            cx.notify(view_id);
+                        }
+                    });
+                    let s4 = store.clone();
+                    window.on_mouse_event(move |e: &MouseUpEvent, _, _, cx| {
+                        if e.button == MouseButton::Left
+                            && let Some(side) = s4.borrow_mut().get_mut(&key)
+                            && side.drag.take().is_some()
+                        {
+                            cx.notify(view_id);
+                        }
+                    });
+                },
             )
-            .on_scroll_wheel(cx.listener(move |s, e: &ScrollWheelEvent, _, cx| {
-                let d = e.delta.pixel_delta(px(LINE));
-                // Shift turns a mouse wheel sideways; on a trackpad, only mostly-sideways swipes count.
-                let dx = if e.modifiers.shift && d.x == px(0.) { d.y } else { d.x };
-                if dx == px(0.) || (!e.modifiers.shift && dx.abs() < d.y.abs()) {
-                    return;
-                }
-                let mut all = s.sideways.borrow_mut();
-                let side = all.entry(key.clone()).or_default();
-                let max = (side.content - side.viewport).max(px(0.));
-                let next = (side.offset - dx).clamp(px(0.), max);
-                if next != side.offset {
-                    side.offset = next;
-                    cx.notify();
-                }
-            }))
+            .absolute()
+            .inset_0(),
+        )
     }
 
     /// A change between two texts, as `diff_body` draws it, scrolling up and down
@@ -420,11 +586,12 @@ impl Workspace {
         };
         let this = cx.weak_entity();
         let select = Some((&this, &source, self.selected_rows(&source)));
-        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select) else {
+        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, window) else {
             return empty(colors, Glyph::FileDiff, "No changes", "The two sides are the same.").into_any_element();
         };
-        let list = div().id(key.clone()).size_full().overflow_y_scroll().child(rows);
-        self.scroll_sideways(key, longest, gutter, window, list, cx).into_any_element()
+        let scroll = self.sideways.borrow_mut().entry(key.clone()).or_default().scroll.clone();
+        let list = div().id(key.clone()).size_full().overflow_y_scroll().track_scroll(&scroll).child(rows);
+        self.scroll_sideways(key, longest, gutter, window, list, cx).vertical_scrollbar(&scroll).into_any_element()
     }
 
     /// The selected rows, when they are in `source`.

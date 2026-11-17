@@ -61,6 +61,9 @@ pub struct Settings {
     /// Interface and code fonts by family name; unset means the default.
     pub ui_font: Option<String>,
     pub mono_font: Option<String>,
+    /// Base sizes for interface copy and monospace content; unset means the default.
+    pub ui_font_size: Option<f32>,
+    pub mono_font_size: Option<f32>,
     /// How messages sent during a running turn are delivered.
     pub follow_up_mode: FollowUpMode,
 }
@@ -88,6 +91,8 @@ impl Settings {
             settings.agents = AgentSpec::defaults();
         }
         settings.agent = settings.agent.min(settings.agents.len() - 1);
+        settings.ui_font_size = settings.ui_font_size.filter(|size| size.is_finite() && (11.0..=16.0).contains(size));
+        settings.mono_font_size = settings.mono_font_size.filter(|size| size.is_finite() && (10.0..=16.0).contains(size));
         settings
     }
     pub fn save(&self) -> anyhow::Result<()> {
@@ -130,5 +135,17 @@ mod tests {
         let settings = Settings { follow_up_mode: FollowUpMode::Steer, ..Default::default() };
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
         assert_eq!(restored.follow_up_mode, FollowUpMode::Steer);
+    }
+
+    #[test]
+    fn typography_sizes_are_optional_and_round_trip() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.ui_font_size, None);
+        assert_eq!(old.mono_font_size, None);
+
+        let settings = Settings { ui_font_size: Some(15.), mono_font_size: Some(14.), ..Default::default() };
+        let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert_eq!(restored.ui_font_size, Some(15.));
+        assert_eq!(restored.mono_font_size, Some(14.));
     }
 }

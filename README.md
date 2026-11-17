@@ -6,7 +6,7 @@ Projects are pinned down the far left, the selected project's threads sit beside
 workspace is tabbed: the chat is pinned first, with files and diffs opening next to it. The right
 panel is tabbed by icon for context, changes and files.
 
-Run `cargo run` for a dev build.
+Run `cargo run` for a dev build. To install on your Mac, `./scripts/install-app.sh`.
 
 ## Agents
 

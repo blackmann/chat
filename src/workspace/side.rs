@@ -113,7 +113,7 @@ impl Workspace {
                         .pl_3()
                         .pr_1()
                         .gap_2()
-                        .text_size(px(12.))
+                        .text_size(px(crate::theme::scaled_ui(12.)))
                         .text_color(rgb(colors.muted))
                         .child("Folders")
                         .child(count_badge(colors, roots.len()))
@@ -145,7 +145,7 @@ impl Workspace {
                             .items_end()
                             .gap(px(6.))
                             .pb_2()
-                            .child(div().text_size(px(20.)).line_height(px(22.)).font_weight(FontWeight::MEDIUM).child(tokens(used)))
+                            .child(div().text_size(px(crate::theme::scaled_ui(20.))).line_height(relative(1.1)).font_weight(FontWeight::MEDIUM).child(tokens(used)))
                             .child(label(colors, format!("of {} tokens", tokens(size))))
                             .child(div().flex_1())
                             .child(label(colors, format!("{:.0}%", share * 100.))),
@@ -162,7 +162,7 @@ impl Workspace {
                         row()
                             .pt_2()
                             .gap_2()
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::scaled_ui(12.)))
                             .text_color(rgb(colors.muted))
                             .child(format!("{} left", tokens(size.saturating_sub(used))))
                             .child(div().flex_1())
@@ -335,14 +335,12 @@ impl Workspace {
                     } else {
                         div().w(px(12.)).flex_shrink_0().into_any_element()
                     })
-                    .child(
-                        icon(match (dir, expanded) {
-                            (true, true) => Icon::from(IconName::FolderOpen),
-                            (true, false) => Icon::from(IconName::Folder),
-                            _ => Icon::from(IconName::File),
-                        })
-                        .text_color(rgb(colors.muted)),
-                    )
+                    .child(if dir {
+                        icon(if expanded { IconName::FolderOpen } else { IconName::Folder }).text_color(rgb(colors.muted))
+                    } else {
+                        let (glyph, tint) = super::file_kind::file_kind(&entry.path);
+                        icon(Icon::empty().path(glyph)).text_color(rgb(tint.color(colors)))
+                    })
                     .child(one_line(entry.name.clone(), 18.).flex_1().min_w_0().when_some(mark, |s, (_, hue)| s.text_color(rgb(hue))))
                     .when_some(mark, |s, (letter, hue)| {
                         s.child(if dir {
@@ -354,7 +352,7 @@ impl Workspace {
                                 .flex_shrink_0()
                                 .text_center()
                                 .font_family(mono())
-                                .text_size(px(11.))
+                                .text_size(px(crate::theme::scaled_mono(11.)))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(hue))
                                 .child(letter.to_string())

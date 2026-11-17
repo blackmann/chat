@@ -333,7 +333,7 @@ impl Workspace {
                 }),
         );
         if let Some(error) = self.git_errors.get(&folder) {
-            page = page.child(div().px_3().py_2().text_size(px(12.)).text_color(rgb(colors.red)).child(error.clone()));
+            page = page.child(div().px_3().py_2().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.red)).child(error.clone()));
         }
 
         // Conflicts are settled in the editor first, then staged from Unstaged.
@@ -369,7 +369,7 @@ impl Workspace {
                                     .on_click(cx.listener(move |s, _, _, cx| s.git_operation(operation.clone(), cx)))
                             }),
                     )
-                    .child(div().text_size(px(12.)).font_weight(FontWeight::MEDIUM).text_color(rgb(if conflicts { colors.red } else { colors.muted })).child(title))
+                    .child(div().text_size(px(crate::theme::scaled_ui(12.))).font_weight(FontWeight::MEDIUM).text_color(rgb(if conflicts { colors.red } else { colors.muted })).child(title))
                     .child(count_badge(colors, entries.len()))
                     .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border)))
                     .when(!conflicts, |s| s.child(stat(colors, adds, dels))),
@@ -415,7 +415,7 @@ impl Workspace {
                         .map(|s| match entry.stat(staged) {
                             Some((adds, dels)) => s.child(stat(colors, adds, dels)),
                             None if status == b'D' || conflicts => s,
-                            None => s.child(label(colors, "binary").text_size(px(11.))),
+                            None => s.child(label(colors, "binary").text_size(px(crate::theme::scaled_ui(11.)))),
                         })
                         .child(
                             div()
@@ -423,7 +423,7 @@ impl Workspace {
                                 .flex_shrink_0()
                                 .text_center()
                                 .font_family(mono())
-                                .text_size(px(11.))
+                                .text_size(px(crate::theme::scaled_mono(11.)))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(rgb(hue))
                                 .child(if status == b'?' { "U".to_string() } else { char::from(status).to_string() }),
@@ -453,18 +453,27 @@ impl Workspace {
             col()
                 .flex_shrink_0()
                 .border_t_1()
-                .border_color(rgb(colors.row_border))
-                .p_3()
-                .gap_2()
-                .child(Input::new(&self.commit_message))
+                .border_color(rgb(colors.border))
+                .bg(rgb(colors.panel))
+                .min_h(px(96.))
+                .child(
+                    div()
+                        .flex_1()
+                        .px(px(14.))
+                        .pt(px(12.))
+                        .pb(px(6.))
+                        .child(Input::new(&self.commit_message).appearance(false).p_0()),
+                )
                 .child(
                     row()
-                        .gap_2()
+                        .h(px(36.))
+                        .px(px(8.))
+                        .gap(px(8.))
                         .child(
                             label(
                                 colors,
                                 if all_tracked {
-                                    "Nothing staged: commits every tracked change".to_string()
+                                    String::new()
                                 } else {
                                     format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })
                                 },

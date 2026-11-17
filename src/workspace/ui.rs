@@ -20,7 +20,7 @@ pub fn col() -> Div {
 pub fn label(colors: Palette, text: impl Into<SharedString>) -> Div {
     div()
         .text_color(rgb(colors.muted))
-        .text_size(px(12.))
+        .text_size(px(crate::theme::scaled_ui(12.)))
         .child(text.into())
 }
 pub fn icon(name: impl Into<Icon>) -> Icon {
@@ -56,7 +56,8 @@ pub fn pill(text: impl Into<SharedString>, fg: u32, bg: u32) -> Div {
         .rounded(px(4.))
         .bg(rgb(bg))
         .text_color(rgb(fg))
-        .text_size(px(11.))
+        .font_family(mono())
+        .text_size(px(crate::theme::scaled_mono(11.)))
         .font_weight(FontWeight::MEDIUM)
         .child(text.into())
 }
@@ -71,7 +72,8 @@ pub fn count_badge(colors: Palette, n: usize) -> Div {
         .justify_center()
         .rounded(px(4.))
         .bg(rgb(colors.hover))
-        .text_size(px(11.))
+        .font_family(mono())
+        .text_size(px(crate::theme::scaled_mono(11.)))
         .text_color(rgb(colors.muted))
         .child(n.to_string())
 }
@@ -89,7 +91,7 @@ pub fn branch_chip(colors: Palette, text: impl Into<SharedString>) -> Div {
         .bg(rgb(colors.blue_tint))
         .text_color(rgb(colors.blue))
         .font_family(mono())
-        .text_size(px(11.5))
+        .text_size(px(crate::theme::scaled_mono(11.5)))
         .child(icon(crate::icons::Glyph::Branch).size(px(11.)))
         .child(div().min_w_0().truncate().child(text.into()))
 }
@@ -168,7 +170,7 @@ pub fn stat(colors: Palette, adds: u32, dels: u32) -> Div {
         .flex_shrink_0()
         .gap(px(5.))
         .font_family(mono())
-        .text_size(px(11.5))
+        .text_size(px(crate::theme::scaled_mono(11.5)))
         .when(adds > 0, |s| s.child(div().text_color(rgb(colors.green)).child(format!("+{adds}"))))
         .when(dels > 0, |s| s.child(div().text_color(rgb(colors.red)).child(format!("−{dels}"))))
 }
@@ -240,7 +242,7 @@ pub fn section(colors: Palette, title: impl Into<SharedString>, count: Option<us
         .h(px(30.))
         .px_3()
         .gap_2()
-        .text_size(px(12.))
+        .text_size(px(crate::theme::scaled_ui(12.)))
         .text_color(rgb(colors.muted))
         .child(title.into())
         .when_some(count, |s, n| s.child(count_badge(colors, n)))

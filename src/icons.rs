@@ -29,6 +29,17 @@ pub enum Glyph {
     FileJson,
     FileImage,
     Braces,
+    FileTerminal,
+    FileSliders,
+    FileLock,
+    FileArchive,
+    FileAudio,
+    FileVideo,
+    FileSpreadsheet,
+    FileType,
+    FileKey,
+    Database,
+    Package,
     Claude,
     OpenAi,
 }
@@ -37,7 +48,7 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 25] = [
+    pub const ALL: [Glyph; 36] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -61,6 +72,17 @@ impl Glyph {
         Self::FileJson,
         Self::FileImage,
         Self::Braces,
+        Self::FileTerminal,
+        Self::FileSliders,
+        Self::FileLock,
+        Self::FileArchive,
+        Self::FileAudio,
+        Self::FileVideo,
+        Self::FileSpreadsheet,
+        Self::FileType,
+        Self::FileKey,
+        Self::Database,
+        Self::Package,
         Self::Claude,
         Self::OpenAi,
     ];
@@ -89,6 +111,17 @@ impl Glyph {
             Self::FileJson => "file-json.svg",
             Self::FileImage => "file-image.svg",
             Self::Braces => "braces.svg",
+            Self::FileTerminal => "file-terminal.svg",
+            Self::FileSliders => "file-sliders.svg",
+            Self::FileLock => "file-lock.svg",
+            Self::FileArchive => "file-archive.svg",
+            Self::FileAudio => "file-audio.svg",
+            Self::FileVideo => "file-video.svg",
+            Self::FileSpreadsheet => "file-spreadsheet.svg",
+            Self::FileType => "file-type.svg",
+            Self::FileKey => "file-key.svg",
+            Self::Database => "database.svg",
+            Self::Package => "package.svg",
             Self::Claude => "claude.svg",
             Self::OpenAi => "openai.svg",
         }
@@ -160,6 +193,17 @@ fn svg(file: &str) -> Option<&'static str> {
         "braces.svg" => {
             r#"<path d="M8 3H7a2 2 0 0 0-2 2v5a2 2 0 0 1-2 2 2 2 0 0 1 2 2v5c0 1.1.9 2 2 2h1"/><path d="M16 21h1a2 2 0 0 0 2-2v-5c0-1.1.9-2 2-2a2 2 0 0 1-2-2V5a2 2 0 0 0-2-2h-1"/>"#
         }
+        "file-terminal.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="m8 16 2-2-2-2"/><path d="M12 18h4"/>"#,
+        "file-sliders.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M8 12h8"/><path d="M10 11v2"/><path d="M8 17h8"/><path d="M14 16v2"/>"#,
+        "file-lock.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><rect width="8" height="5" x="8" y="13" rx="1"/><path d="M10 13v-1.5a2 2 0 0 1 4 0V13"/>"#,
+        "file-archive.svg" => r#"<path d="M10 12v-1"/><path d="M10 18v-2"/><path d="M10 7V6"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M15.5 22H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v16a2 2 0 0 0 .274 1.01"/><circle cx="10" cy="20" r="2"/>"#,
+        "file-audio.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="17" r="2"/><path d="M12 17v-6l3 1"/>"#,
+        "file-video.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="m10 11 5 3-5 3z"/>"#,
+        "file-spreadsheet.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M8 13h2"/><path d="M14 13h2"/><path d="M8 17h2"/><path d="M14 17h2"/>"#,
+        "file-type.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 13v-1h6v1"/><path d="M12 12v6"/><path d="M11 18h2"/>"#,
+        "file-key.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="16" r="2"/><path d="m16 10-4.5 4.5"/><path d="m15 11 1 1"/>"#,
+        "database.svg" => r#"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>"#,
+        "package.svg" => r#"<path d="M11 21.73a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73z"/><path d="M12 22V12"/><path d="m3.3 7 7.703 4.734a2 2 0 0 0 1.994 0L20.7 7"/><path d="m7.5 4.27 9 5.15"/>"#,
         _ => return None,
     })
 }

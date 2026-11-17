@@ -143,7 +143,7 @@ mod tests {
         let mut project = Project::chats();
         let mut thread = Thread::new(1, 1);
         thread.title = "Add a greeting".into();
-        thread.blocks.push(Block::User("add a greeting".into()));
+        thread.blocks.push(Block::User(crate::model::Message::now("add a greeting")));
         thread.apply(Event::Text("Done.".into()));
         thread.state = ThreadState::Running;
         thread.session_id = Some("s-1".into());

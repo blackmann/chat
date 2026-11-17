@@ -34,6 +34,7 @@ use std::{
 };
 
 const CODEX_ACP_PACKAGE: &str = "@agentclientprotocol/codex-acp";
+const CLAUDE_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
 
 /// How to start an agent that speaks ACP on its stdio.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -54,7 +55,7 @@ impl AgentSpec {
     /// Claude Code and Codex, through their ACP adapters.
     pub fn defaults() -> Vec<Self> {
         vec![
-            Self::new("Claude Code", "npx", &["-y", "@agentclientprotocol/claude-agent-acp"]),
+            Self::new("Claude Code", "npx", &["-y", CLAUDE_ACP_PACKAGE]),
             Self::new("Codex", "npx", &["-y", CODEX_ACP_PACKAGE]),
         ]
     }
@@ -71,6 +72,14 @@ impl AgentSpec {
             }
         }
         None
+    }
+
+    fn uses_claude_adapter(&self) -> bool {
+        Path::new(&self.command).file_name() == Some(OsStr::new("claude-agent-acp"))
+            || self.args.iter().any(|arg| {
+                arg == CLAUDE_ACP_PACKAGE
+                    || arg.strip_prefix(CLAUDE_ACP_PACKAGE).is_some_and(|suffix| suffix.starts_with('@'))
+            })
     }
 
     fn uses_codex_adapter(&self) -> bool {
@@ -266,6 +275,11 @@ async fn run(
     let mut config = AcpAgentConfig::new(&spec.command).args(spec.args.iter().cloned());
     if let Some(path) = shell_path() {
         config = config.env("PATH", path);
+    }
+    // Claude Code leaves its task-list tools out for newer models unless asked;
+    // the adapter turns those tools into the plan shown in the Context panel.
+    if spec.uses_claude_adapter() && std::env::var_os("CLAUDE_CODE_ENABLE_TODO_TOOLS").is_none() {
+        config = config.env("CLAUDE_CODE_ENABLE_TODO_TOOLS", "1");
     }
     // The adapter forwards CODEX_CONFIG with thread/resume. Restoring the model
     // through session/set_config_option happens after Codex checks the rollout.

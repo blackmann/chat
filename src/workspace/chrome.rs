@@ -32,7 +32,13 @@ fn state_mark(colors: Palette, state: ThreadState) -> AnyElement {
     match state {
         ThreadState::Running => spinner(colors).into_any_element(),
         ThreadState::Waiting => icon(Glyph::CircleDot).size(px(13.)).text_color(rgb(colors.blue)).into_any_element(),
-        ThreadState::Done => icon(IconName::Check).size(px(13.)).text_color(rgb(colors.quiet)).into_any_element(),
+        ThreadState::Done => div()
+            .size(px(13.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().size(px(6.)).rounded_full().bg(rgb(colors.quiet)))
+            .into_any_element(),
         ThreadState::Idle => icon(Glyph::CircleDashed).size(px(13.)).text_color(rgb(colors.quiet)).into_any_element(),
         ThreadState::Failed => icon(IconName::TriangleAlert).size(px(13.)).text_color(rgb(colors.red)).into_any_element(),
     }
@@ -68,7 +74,7 @@ fn face(name: &str, hue: u32, size: f32) -> Div {
         .rounded_full()
         .bg(Hsla::from(rgb(hue)).opacity(0.24))
         .text_color(rgb(hue))
-        .text_size(px(12.))
+        .text_size(px(crate::theme::scaled_ui(12.)))
         .font_weight(FontWeight::SEMIBOLD)
         .child(initials(name))
 }
@@ -127,7 +133,7 @@ impl Workspace {
                     .min_w_0()
                     .pr_2()
                     .gap(px(6.))
-                    .text_size(px(13.))
+                    .text_size(px(crate::theme::scaled_ui(13.)))
                     .child(icon(Glyph::Sparkle).text_color(rgb(colors.blue)))
                     .child(div().font_weight(FontWeight::MEDIUM).child("Chat"))
                     .child(div().text_color(rgb(colors.quiet)).child("/"))
@@ -206,7 +212,7 @@ impl Workspace {
                             .border_color(if active { Hsla::from(rgb(colors.blue)) } else { transparent_black() })
                             .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
                             .text_color(rgb(hue))
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::scaled_ui(12.)))
                             .font_weight(FontWeight::SEMIBOLD)
                             .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
                             .map(|s| match p.path {
@@ -543,7 +549,7 @@ impl Workspace {
             .bg(rgb(colors.chrome))
             .border_t_1()
             .border_color(rgb(colors.border))
-            .text_size(px(12.))
+            .text_size(px(crate::theme::scaled_ui(12.)))
             .text_color(rgb(colors.muted))
             .child(
                 toggle(colors, "toggle-threads", IconName::PanelLeft, "Toggle threads · ⌘ B", self.threads_open)

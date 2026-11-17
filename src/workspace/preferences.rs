@@ -8,7 +8,7 @@ use crate::{
     theme::{DEFAULT_MONO, SYSTEM_UI},
 };
 use gpui_component::{
-    IconName, Sizable,
+    Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
     kbd::Kbd,
     radio::Radio,
@@ -60,10 +60,10 @@ fn setting(colors: Palette, title: &str, description: &str, control: impl IntoEl
                 .w(px(PAGE - CONTROL - GAP))
                 .flex_shrink_0()
                 .gap(px(3.))
-                .child(div().text_size(px(14.)).child(title.to_string()))
+                .child(div().text_size(px(crate::theme::scaled_ui(14.))).child(title.to_string()))
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(px(crate::theme::scaled_ui(13.)))
                         .line_height(relative(1.45))
                         .text_color(rgb(colors.muted))
                         .child(description.to_string()),
@@ -77,7 +77,7 @@ fn group(colors: Palette, title: &str) -> Div {
         .pt_6()
         .pb_1()
         .font_family(mono())
-        .text_size(px(12.))
+        .text_size(px(crate::theme::mono_size()))
         .text_color(rgb(colors.muted))
         .border_b_1()
         .border_color(rgb(colors.row_border))
@@ -122,7 +122,87 @@ impl Workspace {
             FontRole::Mono => self.settings.mono_font = family,
         }
         let _ = self.settings.save();
-        crate::theme::set_fonts(self.settings.ui_font.as_deref(), self.settings.mono_font.as_deref(), cx);
+        self.apply_typography(cx);
+        cx.notify();
+    }
+
+    fn apply_typography(&self, cx: &mut Context<Self>) {
+        crate::theme::set_fonts(
+            self.settings.ui_font.as_deref(),
+            self.settings.mono_font.as_deref(),
+            self.settings.ui_font_size,
+            self.settings.mono_font_size,
+            cx,
+        );
+    }
+
+    fn font_size(&self, role: FontRole) -> f32 {
+        match role {
+            FontRole::Ui => self.settings.ui_font_size.unwrap_or(crate::theme::UI_SIZE),
+            FontRole::Mono => self.settings.mono_font_size.unwrap_or(crate::theme::MONO_SIZE),
+        }
+    }
+
+    fn set_font_size(&mut self, role: FontRole, size: Option<f32>, cx: &mut Context<Self>) {
+        match role {
+            FontRole::Ui => self.settings.ui_font_size = size,
+            FontRole::Mono => self.settings.mono_font_size = size,
+        }
+        let _ = self.settings.save();
+        self.apply_typography(cx);
+        cx.notify();
+    }
+
+    fn font_size_picker(&self, role: FontRole, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let size = self.font_size(role);
+        let (minus, plus, min, max) = match role {
+            FontRole::Ui => ("pref-ui-size-minus", "pref-ui-size-plus", 11., 16.),
+            FontRole::Mono => ("pref-mono-size-minus", "pref-mono-size-plus", 10., 16.),
+        };
+        row()
+            .w(px(CONTROL))
+            .justify_end()
+            .gap_1()
+            .child(
+                Button::new(minus)
+                    .icon(IconName::Minus)
+                    .ghost()
+                    .xsmall()
+                    .disabled(size <= min)
+                    .on_click(cx.listener(move |s, _, _, cx| s.set_font_size(role, Some((size - 1.).max(min)), cx))),
+            )
+            .child(
+                div()
+                    .w(px(62.))
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .font_family(mono())
+                    .text_size(px(crate::theme::scaled_mono(12.)))
+                    .child(format!("{size:.0} px")),
+            )
+            .child(
+                Button::new(plus)
+                    .icon(IconName::Plus)
+                    .ghost()
+                    .xsmall()
+                    .disabled(size >= max)
+                    .on_click(cx.listener(move |s, _, _, cx| s.set_font_size(role, Some((size + 1.).min(max)), cx))),
+            )
+    }
+
+    fn reset_typography(&mut self, cx: &mut Context<Self>) {
+        self.settings.ui_font = None;
+        self.settings.mono_font = None;
+        self.settings.ui_font_size = None;
+        self.settings.mono_font_size = None;
+        let _ = self.settings.save();
+        self.apply_typography(cx);
         cx.notify();
     }
 
@@ -251,7 +331,7 @@ impl Workspace {
                     .border_1()
                     .border_color(rgb(colors.row_border))
                     .font_family(mono())
-                    .text_size(px(crate::theme::MONO_SIZE))
+                    .text_size(px(crate::theme::mono_size()))
                     .line_height(relative(1.5))
                     .text_color(rgb(colors.code))
                     .children(code),
@@ -260,10 +340,13 @@ impl Workspace {
 
     pub(super) fn preferences_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let customised = self.settings.ui_font.is_some() || self.settings.mono_font.is_some();
+        let customised = self.settings.ui_font.is_some()
+            || self.settings.mono_font.is_some()
+            || self.settings.ui_font_size.is_some()
+            || self.settings.mono_font_size.is_some();
         let page = col()
             .w(px(PAGE))
-            .child(div().text_size(px(20.)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
+            .child(div().text_size(px(crate::theme::scaled_ui(20.))).font_weight(FontWeight::SEMIBOLD).child("Settings"))
             .child(group(colors, "Fonts"))
             .child(setting(
                 colors,
@@ -277,14 +360,27 @@ impl Workspace {
                 "Code blocks in replies, open files, diffs and paths.",
                 self.font_picker(FontRole::Mono, cx),
             ))
+            .child(setting(
+                colors,
+                "Interface font size",
+                "The base size for chat text, controls, menus, tabs and panels.",
+                self.font_size_picker(FontRole::Ui, cx),
+            ))
+            .child(setting(
+                colors,
+                "Code font size",
+                "The base size for code, paths and chip-style inlays.",
+                self.font_size_picker(FontRole::Mono, cx),
+            ))
             .child(self.font_preview(colors))
             .child(
                 row().pt_4().child(div().flex_1()).when(customised, |s| {
                     s.child(
-                        Button::new("reset-fonts").label("Restore defaults").ghost().small().on_click(cx.listener(|s, _, _, cx| {
-                            s.set_font(FontRole::Ui, None, cx);
-                            s.set_font(FontRole::Mono, None, cx);
-                        })),
+                        Button::new("reset-fonts")
+                            .label("Restore defaults")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|s, _, _, cx| s.reset_typography(cx))),
                     )
                 }),
             )
@@ -333,7 +429,7 @@ impl Workspace {
                             .pl(px(40.))
                             .pr_3()
                             .gap_2()
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::scaled_ui(12.)))
                             .text_color(rgb(colors.muted))
                             .child("Settings")
                             .child(div().flex_1())

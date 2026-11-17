@@ -356,7 +356,7 @@ impl Render for TerminalView {
                     div()
                         .px_3()
                         .py_1()
-                        .text_size(px(12.))
+                        .text_size(px(crate::theme::scaled_ui(12.)))
                         .text_color(rgb(colors.muted))
                         .child("Shell exited · close this tab to start again"),
                 )
@@ -431,7 +431,7 @@ impl Render for TerminalView {
                                     .text_system()
                                     .advance(
                                         window.text_system().resolve_font(&font),
-                                        px(crate::theme::MONO_SIZE),
+                                        px(crate::theme::mono_size()),
                                         'm',
                                     )
                                     .map(|s| f32::from(s.width))
@@ -541,7 +541,7 @@ impl Render for TerminalView {
                                         };
                                         let line = window.text_system().shape_line(
                                             text.into(),
-                                            px(crate::theme::MONO_SIZE),
+                                            px(crate::theme::mono_size()),
                                             &[run],
                                             None,
                                         );
@@ -568,7 +568,7 @@ impl Render for TerminalView {
                                         };
                                         let line = window.text_system().shape_line(
                                             s.marked.clone().into(),
-                                            px(crate::theme::MONO_SIZE),
+                                            px(crate::theme::mono_size()),
                                             &[run],
                                             None,
                                         );

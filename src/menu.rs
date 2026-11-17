@@ -255,7 +255,7 @@ impl Render for Menu {
                     .px(px(8.))
                     .pt(px(if i == 0 { 2. } else { 6. }))
                     .pb(px(3.))
-                    .text_size(px(12.))
+                    .text_size(px(crate::theme::scaled_ui(12.)))
                     .text_color(rgb(colors.muted))
                     .child(text)
                     .into_any_element(),
@@ -277,7 +277,7 @@ impl Render for Menu {
                         .min_h(px(28.))
                         .px(px(8.))
                         .rounded(px(6.))
-                        .text_size(px(13.))
+                        .text_size(px(crate::theme::scaled_ui(13.)))
                         .when(item.disabled, |s| s.text_color(rgb(colors.quiet)))
                         .when(!item.disabled, |s| {
                             s.cursor_pointer()
@@ -309,7 +309,7 @@ impl Render for Menu {
                                 .when_some(item.description, |s, d| {
                                     s.child(
                                         div()
-                                            .text_size(px(12.))
+                                            .text_size(px(crate::theme::scaled_ui(12.)))
                                             .line_height(relative(1.35))
                                             .text_color(rgb(colors.muted))
                                             .child(d),
@@ -328,7 +328,7 @@ impl Render for Menu {
                             s.child(
                                 div()
                                     .flex_shrink_0()
-                                    .text_size(px(12.))
+                                    .text_size(px(crate::theme::scaled_ui(12.)))
                                     .text_color(rgb(colors.muted))
                                     .child(d),
                             )

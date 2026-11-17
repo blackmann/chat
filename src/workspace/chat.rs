@@ -7,7 +7,7 @@ use crate::{
     menu::{Entry, Item},
     model::{Permission, ToolCall},
 };
-use gpui_component::{Icon, IconName, Rope, input::{DocumentColorProvider, Input}, tooltip::Tooltip};
+use gpui_component::{Icon, IconName, Rope, scroll::ScrollableElement, input::{DocumentColorProvider, Input}, tooltip::Tooltip};
 use lsp_types::{Color, ColorInformation, Position, Range};
 
 /// The transcript and composer share one readable column.
@@ -93,6 +93,39 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+/// When something happened, as briefly as it can be told from now: the time of
+/// day today, then "Yesterday", then the date.
+fn clock(at_ms: i64, now: chrono::DateTime<chrono::Local>) -> String {
+    use chrono::{Datelike, TimeZone};
+    let Some(at) = chrono::Local.timestamp_millis_opt(at_ms).single() else { return String::new() };
+    let time = at.format("%-I:%M %p");
+    let (day, today) = (at.date_naive(), now.date_naive());
+    if day == today {
+        time.to_string()
+    } else if today.pred_opt() == Some(day) {
+        format!("Yesterday {time}")
+    } else if day.year() == today.year() {
+        format!("{} · {time}", at.format("%b %-d"))
+    } else {
+        format!("{} · {time}", at.format("%b %-d, %Y"))
+    }
+}
+
+/// How long something took: `42s`, `3m 05s`, `1h 12m`.
+fn duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
+/// A quiet line of metadata under a message or turn.
+fn meta(colors: Palette, text: String) -> Div {
+    div().text_size(px(crate::theme::scaled_ui(11.))).text_color(rgb(colors.quiet)).child(text)
+}
+
 /// Agent thought updates often arrive as short lines separated by blank lines.
 /// Empty lines are spacing, not another selectable update.
 fn thought_lines(text: &str) -> Vec<SharedString> {
@@ -105,8 +138,12 @@ fn thought_lines(text: &str) -> Vec<SharedString> {
     if lines.is_empty() { vec![SharedString::default()] } else { lines }
 }
 
-fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>) -> String {
-    let added = paths.paths().iter().map(|path| super::mentions::path_mention(path, root)).collect::<Vec<_>>();
+fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>, window: &Window) -> String {
+    let added = paths
+        .paths()
+        .iter()
+        .map(|path| super::mentions::fit(super::mentions::path_mention(path, root), window))
+        .collect::<Vec<_>>();
     let mut text = added.iter().map(|mention| mention.token.as_str()).collect::<Vec<_>>().join(" ");
     mentions.extend(added);
     if !text.is_empty() {
@@ -203,7 +240,7 @@ fn option(colors: Palette, id: &'static str, glyph: impl Into<Icon>, text: impl 
         .px(px(7.))
         .gap(px(5.))
         .rounded(px(5.))
-        .text_size(px(12.))
+        .text_size(px(crate::theme::scaled_ui(12.)))
         .text_color(rgb(colors.muted))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
@@ -232,7 +269,7 @@ pub(super) fn choices(setting: &Setting, weak: WeakEntity<Workspace>, describe: 
 impl Workspace {
     fn insert_dropped_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
         let root = self.current_project().path.as_deref();
-        let text = dropped_paths(paths, root, &mut self.file_mentions.borrow_mut());
+        let text = dropped_paths(paths, root, &mut self.file_mentions.borrow_mut(), window);
         if text.is_empty() {
             return;
         }
@@ -244,14 +281,15 @@ impl Workspace {
     }
 
     /// Put a snippet's chip at the composer's caret, on the chat tab.
-    pub(super) fn insert_mention(&mut self, mut added: FileMention, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn insert_mention(&mut self, added: FileMention, window: &mut Window, cx: &mut Context<Self>) {
+        let mut added = super::mentions::fit(added, window);
         {
             // Snippets with the same label would share a token and could swap places when sent.
             let mentions = self.file_mentions.borrow();
             let label = added.label.clone();
             let mut n = 2;
             while mentions.iter().any(|m| m.token == added.token && m.sent != added.sent) {
-                added = super::mentions::relabel(&added, &format!("{label} ({n})"));
+                added = super::mentions::fit(super::mentions::relabel(&added, &format!("{label} ({n})")), window);
                 n += 1;
             }
         }
@@ -295,7 +333,7 @@ impl Workspace {
             .shadow_md()
             .cursor_pointer()
             .font_family(crate::theme::ui_font())
-            .text_size(px(12.))
+            .text_size(px(crate::theme::scaled_ui(12.)))
             .hover(|s| s.bg(rgb(colors.hover)))
             .child(icon(IconName::Plus).size(px(12.)))
             .child("Add to chat")
@@ -305,9 +343,8 @@ impl Workspace {
     }
 
     /// What you sent, rendered as Markdown with mentions as chips, as it looked when typed.
-    fn user_block(&self, colors: Palette, thread: usize, block: usize, text: &SharedString, on_link: &md::OnLink) -> Div {
-        div()
-            .mt_2()
+    fn user_block(&self, colors: Palette, thread: usize, block: usize, message: &crate::model::Message, now: chrono::DateTime<chrono::Local>, on_link: &md::OnLink) -> Div {
+        let bubble = div()
             .px_3()
             .py(px(9.))
             .rounded(px(8.))
@@ -316,14 +353,19 @@ impl Workspace {
             .bg(rgb(colors.panel))
             .child(md::render(
                 SharedString::from(format!("user-{thread}-{block}")),
-                text,
+                &message.text,
                 md::Breaks::Hard,
                 colors,
                 mono(),
-                px(crate::theme::MONO_SIZE),
+                px(crate::theme::mono_size()),
                 Some((self.selection.clone(), block)),
                 Some(on_link.clone()),
-            ))
+            ));
+        col()
+            .mt_2()
+            .gap_1()
+            .child(bubble)
+            .when_some(message.at, |s, at| s.child(meta(colors, clock(at, now)).px_1()))
     }
 
     fn queued_block(&self, colors: Palette, n: usize, text: &SharedString) -> Div {
@@ -336,8 +378,8 @@ impl Workspace {
             .border_1()
             .border_color(rgb(colors.border))
             .bg(rgb(colors.panel))
-            .child(div().text_size(px(11.)).text_color(rgb(colors.quiet)).child("Queued"))
-            .child(md::render(SharedString::from(format!("queued-{n}")), text, md::Breaks::Hard, colors, mono(), px(crate::theme::MONO_SIZE), None, None))
+            .child(div().text_size(px(crate::theme::scaled_ui(11.))).text_color(rgb(colors.quiet)).child("Queued"))
+            .child(md::render(SharedString::from(format!("queued-{n}")), text, md::Breaks::Hard, colors, mono(), px(crate::theme::mono_size()), None, None))
     }
 
     /// Thought progress stays one row tall. Each short vertical marker stands
@@ -379,7 +421,7 @@ impl Workspace {
             .h(px(25.))
             .gap(px(8.))
             .items_center()
-            .text_size(px(12.5))
+            .text_size(px(crate::theme::scaled_ui(12.5)))
             .text_color(rgb(colors.muted))
             .child(markers)
             .child(one_line(lines[selected].clone(), 19.).flex_1().min_w_0())
@@ -391,9 +433,9 @@ impl Workspace {
         let relative = self.current_project().relative(path).to_string_lossy().into_owned();
         let (name, dir) = split_path(&relative);
         let shown = if dir.is_empty() { name.to_string() } else { format!("{name}  {dir}") };
-        let width = (text_width_in(window, &shown, 12., mono()) + px(2.)).min(max);
+        let width = (text_width_in(window, &shown, crate::theme::mono_size(), mono()) + px(2.)).min(max);
         let dir = (!dir.is_empty()).then(|| (SharedString::from(dir.to_string()), Hsla::from(rgb(colors.quiet))));
-        line_with_detail(name.to_string(), dir, 18.).w(width).flex_shrink_0().font_family(mono()).text_size(px(12.))
+        line_with_detail(name.to_string(), dir, 18.).w(width).flex_shrink_0().font_family(mono()).text_size(px(crate::theme::mono_size()))
     }
 
     /// One line per tool call: what ran, on what, and how it went. A call that
@@ -432,7 +474,7 @@ impl Workspace {
                         .px_2()
                         .gap(px(7.))
                         .rounded(px(5.))
-                        .text_size(px(12.5))
+                        .text_size(px(crate::theme::scaled_ui(12.5)))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(colors.hover)))
                         .child(mark(Glyph::Pencil.into()))
@@ -465,7 +507,7 @@ impl Workspace {
             .px_2()
             .gap(px(7.))
             .rounded(px(5.))
-            .text_size(px(12.5))
+            .text_size(px(crate::theme::scaled_ui(12.5)))
             .text_color(rgb(colors.muted))
             .cursor_pointer()
             .hover(|s| s.bg(rgb(colors.hover)))
@@ -481,7 +523,7 @@ impl Workspace {
                 .flex_1()
                 .min_w_0()
                 .text_color(rgb(colors.text))
-                .when(!prose, |s| s.font_family(mono()).text_size(px(12.))),
+                .when(!prose, |s| s.font_family(mono()).text_size(px(crate::theme::mono_size()))),
             )
             // The chevron shows on hover, and stays while the call is open.
             .child(
@@ -517,9 +559,9 @@ impl Workspace {
                     div()
                         .px_3()
                         .py_2()
-                        .text_size(px(12.))
+                        .text_size(px(crate::theme::scaled_ui(12.)))
                         .line_height(relative(1.5))
-                        .when(!prose, |s| s.font_family(mono()))
+                        .when(!prose, |s| s.font_family(mono()).text_size(px(crate::theme::mono_size())))
                         .child(tool.title.clone()),
                 )
                 .when(!lines.is_empty(), |s| {
@@ -533,7 +575,7 @@ impl Workspace {
                             .border_t_1()
                             .border_color(rgb(colors.row_border))
                             .font_family(mono())
-                            .text_size(px(12.))
+                            .text_size(px(crate::theme::mono_size()))
                             .line_height(relative(1.5))
                             .text_color(rgb(colors.muted))
                             .when(hidden > 0, |s| {
@@ -557,7 +599,7 @@ impl Workspace {
                     .h(px(26.))
                     .px(px(10.))
                     .rounded(px(5.))
-                    .text_size(px(12.5))
+                    .text_size(px(crate::theme::scaled_ui(12.5)))
                     .cursor_pointer()
                     .map(|s| {
                         // The first way to say yes is the one to reach for.
@@ -614,7 +656,7 @@ impl Workspace {
                         .rounded(px(5.))
                         .border_1()
                         .border_color(rgb(colors.border))
-                        .text_size(px(12.5))
+                        .text_size(px(crate::theme::scaled_ui(12.5)))
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(colors.hover)))
                         .child("Review changes")
@@ -755,7 +797,7 @@ impl Workspace {
                     .gap(px(2.))
                     .children(mode)
                     .when(thread.session.is_some() && !thread.ready, |s| {
-                        s.child(row().px(px(7.)).gap(px(6.)).text_size(px(12.)).text_color(rgb(colors.quiet)).child(spinner(colors)).child("Connecting…"))
+                        s.child(row().px(px(7.)).gap(px(6.)).text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.quiet)).child(spinner(colors)).child("Connecting…"))
                     })
                     .child(div().flex_1())
                     .child(agent)
@@ -810,16 +852,20 @@ impl Workspace {
             if available > px(0.) { s.w(available.min(px(COLUMN))) } else { s.w_full().max_w(px(COLUMN)) }
         });
         let on_link = self.link_opener(cx);
+        let now = chrono::Local::now();
         for (i, block) in thread.blocks.iter().enumerate() {
             list = list.child(match block {
-                Block::User(text) => self.user_block(colors, thread.id, i, text, &on_link),
+                Block::User(message) => self.user_block(colors, thread.id, i, message, now, &on_link),
+                Block::TurnEnded { at, worked_ms } => {
+                    row().h(px(22.)).child(meta(colors, format!("Worked for {} · {}", duration(*worked_ms), clock(*at, now))))
+                }
                 Block::Text(text) => div().py(px(5.)).child(md::render(
                     SharedString::from(format!("md-{}-{i}", thread.id)),
                     text.trim(),
                     md::Breaks::Hard,
                     colors,
                     mono(),
-                    px(crate::theme::MONO_SIZE),
+                    px(crate::theme::mono_size()),
                     Some((self.selection.clone(), i)),
                     Some(on_link.clone()),
                 )),
@@ -830,7 +876,7 @@ impl Workspace {
                     .items_start()
                     .py(px(4.))
                     .gap_2()
-                    .text_size(px(12.5))
+                    .text_size(px(crate::theme::scaled_ui(12.5)))
                     .text_color(rgb(colors.muted))
                     .child(row().h(px(19.)).child(icon(IconName::Info).size(px(13.)).text_color(rgb(colors.quiet))))
                     .child(div().flex_1().min_w_0().line_height(relative(1.5)).child(text.clone())),
@@ -844,7 +890,7 @@ impl Workspace {
                 row()
                     .h(px(28.))
                     .gap_2()
-                    .text_size(px(12.5))
+                    .text_size(px(crate::theme::scaled_ui(12.5)))
                     .text_color(rgb(colors.muted))
                     .child(spinner(colors))
                     .child(if thread.ready { "Working…" } else { "Starting the agent…" })
@@ -857,7 +903,7 @@ impl Workspace {
                     .items_start()
                     .py(px(4.))
                     .gap_2()
-                    .text_size(px(12.5))
+                    .text_size(px(crate::theme::scaled_ui(12.5)))
                     .child(row().h(px(19.)).child(icon(IconName::TriangleAlert).size(px(13.)).text_color(rgb(colors.red))))
                     .child(div().flex_1().min_w_0().line_height(relative(1.5)).child(problem.clone())),
             );
@@ -882,11 +928,18 @@ impl Workspace {
             )
             .into_any_element()
         } else {
-            div()
+            let transcript = div()
                 .id("transcript")
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.transcript)
+                // A sideways swipe belongs to the code block under it. Unrestricted,
+                // gpui turns a purely sideways delta into an up-and-down one here,
+                // and the transcript jumps away from the block being scrolled.
+                .map(|mut d| {
+                    d.style().restrict_scroll_to_axis = Some(true);
+                    d
+                })
                 // Any scroll up lets go of the end; reaching it again takes hold.
                 .on_scroll_wheel(cx.listener(|s, e: &ScrollWheelEvent, _, _| {
                     let dy = e.delta.pixel_delta(px(16.)).y;
@@ -919,7 +972,29 @@ impl Workspace {
                     s.selection.borrow_mut().dragging = false;
                     cx.notify();
                 }))
-                .child(list.mx_auto())
+                .child(list.mx_auto());
+            // The scrollbar moves the view without wheel events: a drag that ends
+            // off the end lets go of it, and one that ends at the end takes hold.
+            // A click that doesn't move the view leaves `follow` as it was.
+            let release = |s: &mut Self, cx: &mut Context<Self>| {
+                let Some(pressed) = s.holding_transcript.take() else { return };
+                let now = s.transcript.offset().y;
+                if now != pressed {
+                    s.follow = now <= -s.transcript.max_offset().height + px(2.);
+                }
+                if s.follow {
+                    s.transcript.scroll_to_bottom();
+                }
+                cx.notify();
+            };
+            div()
+                .relative()
+                .size_full()
+                .capture_any_mouse_down(cx.listener(|s, _, _, _| s.holding_transcript = Some(s.transcript.offset().y)))
+                .capture_any_mouse_up(cx.listener(move |s, _, _, cx| release(s, cx)))
+                .on_mouse_up_out(MouseButton::Left, cx.listener(move |s, _, _, cx| release(s, cx)))
+                .child(transcript)
+                .vertical_scrollbar(&self.transcript)
                 .into_any_element()
         };
         col()
@@ -990,6 +1065,13 @@ mod tests {
     fn dropped_external_file_sends_its_absolute_path() {
         let mention = file_mention(Path::new("/tmp/example.txt"), Some(Path::new("/project")));
         assert_eq!(replace_file_mentions(&mention.token, &[mention.clone()], Mentions::Paths), "@/tmp/example.txt");
+    }
+
+    #[test]
+    fn durations_read_briefly() {
+        assert_eq!(super::duration(42_900), "42s");
+        assert_eq!(super::duration(185_000), "3m 05s");
+        assert_eq!(super::duration(4_320_000), "1h 12m");
     }
 
     #[test]

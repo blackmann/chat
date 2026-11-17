@@ -180,7 +180,7 @@ impl Inline {
             .map(|(len, s)| TextRun {
                 len: *len,
                 font: Font {
-                    family: if s.code { cx.mono.clone() } else { crate::theme::ui_font() },
+                    family: if s.code || s.chip { cx.mono.clone() } else { crate::theme::ui_font() },
                     features: FontFeatures::default(),
                     fallbacks: None,
                     weight: if s.bold { FontWeight::SEMIBOLD } else { FontWeight::NORMAL },
@@ -439,7 +439,7 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
                         .px(px(6.))
                         .py(px(2.))
                         .rounded(px(4.))
-                        .text_size(px(11.))
+                        .text_size(px(crate::theme::scaled_ui(11.)))
                         .text_color(rgb(colors.muted))
                         .bg(rgb(colors.background))
                         .border_1()
@@ -540,10 +540,10 @@ pub fn render(
         Ok(Node::Root(root)) => col()
             .w_full()
             .gap(px(10.))
-            .text_size(px(13.))
+            .text_size(px(crate::theme::ui_size()))
             .children(blocks(&root.children, &cx))
             .into_any_element(),
-        _ => div().text_size(px(13.)).child(text.to_string()).into_any_element(),
+        _ => div().text_size(px(crate::theme::ui_size())).child(text.to_string()).into_any_element(),
     }
 }
 
