@@ -19,6 +19,9 @@ use std::{ops::Range, sync::Arc};
 pub(super) const LOCATIONS: &str = "lsp-locations";
 /// How long the pointer rests on a word before asking what it is.
 pub(super) const HOVER_DELAY: Duration = Duration::from_millis(450);
+/// How long a hover card stays once the pointer leaves its word, time enough
+/// to cross over to it.
+pub(super) const CARD_GRACE: Duration = Duration::from_millis(300);
 /// How long a server with no open files is kept, in case one opens again.
 pub(super) const IDLE: Duration = Duration::from_secs(10 * 60);
 
@@ -32,6 +35,16 @@ pub(super) struct Servers {
     /// The word under the pointer while ⌘ is held.
     pub link: Option<Link>,
     pub(super) hover: Option<HoverCard>,
+    /// The pointer is over the hover card, which keeps it open.
+    pub(super) in_card: bool,
+    /// The card is closing: the pointer left it and its word. Counts, so a
+    /// closing that was called off can tell.
+    closing: Option<u64>,
+    card_seq: u64,
+    /// Where the pointer rests while a card is closing, asked about once it's gone.
+    want: Option<(HoverKey, Point<Pixels>)>,
+    /// Text selected in the hover card.
+    pub(super) card_selection: select::Shared,
     pub(super) notice: Option<(SharedString, Point<Pixels>, u64)>,
     /// Places jumped from and, after going back, the places to go forward to.
     pub(super) back: Vec<Spot>,
@@ -62,10 +75,15 @@ pub(super) struct Spot {
     pub(super) row: Option<usize>,
 }
 
+/// A word in a pane: its source, row and range in the line.
+pub(super) type HoverKey = (LineSource, usize, Range<usize>);
+
 pub(super) struct HoverCard {
-    pub(super) key: (LineSource, usize, Range<usize>),
+    pub(super) key: HoverKey,
     point: Point<Pixels>,
     pub(super) text: Option<SharedString>,
+    /// Tells cards apart, so each starts scrolled to its top.
+    seq: u64,
     _ask: Task<()>,
 }
 
@@ -658,16 +676,35 @@ impl Workspace {
             cx.notify();
         }
         let key = range.filter(|_| !cmd).map(|r| (source.clone(), row, r));
+        // A card on screen stays while the pointer crosses to it; back on its
+        // word, it stays put.
+        if self.card_shown() {
+            if self.servers.hover.as_ref().map(|h| &h.key) == key.as_ref() {
+                self.servers.closing = None;
+                self.servers.want = None;
+            } else {
+                self.servers.want = key.filter(|_| self.navigable(source)).map(|k| (k, point));
+                self.close_card_soon(cx);
+            }
+            return;
+        }
         if self.servers.hover.as_ref().map(|h| &h.key) == key.as_ref() {
             return;
         }
-        if self.servers.hover.take().is_some_and(|h| h.text.is_some()) {
-            cx.notify();
-        }
+        self.servers.hover = None;
         let Some(key) = key else { return };
         if !self.navigable(source) {
             return;
         }
+        self.ask_hover(key, point, cx);
+    }
+
+    fn card_shown(&self) -> bool {
+        self.servers.hover.as_ref().is_some_and(|h| h.text.is_some())
+    }
+
+    /// Ask the server about a word once the pointer has rested on it.
+    fn ask_hover(&mut self, key: HoverKey, point: Point<Pixels>, cx: &mut Context<Self>) {
         let (src, row_, start) = (key.0.clone(), key.1, key.2.start);
         let ask = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(HOVER_DELAY).await;
@@ -682,12 +719,59 @@ impl Workspace {
             this.update(cx, |s, cx| {
                 if let Some(card) = s.servers.hover.as_mut().filter(|h| h.key.0 == src && h.key.1 == row_ && h.key.2.start == start) {
                     card.text = Some(text.into());
+                    s.servers.card_selection.borrow_mut().clear();
                     cx.notify();
                 }
             })
             .ok();
         });
-        self.servers.hover = Some(HoverCard { key, point, text: None, _ask: ask });
+        self.servers.card_seq += 1;
+        self.servers.hover = Some(HoverCard { key, point, text: None, seq: self.servers.card_seq, _ask: ask });
+    }
+
+    /// The pointer left the card and its word: let the card go after a moment,
+    /// unless it comes back or is selecting in it.
+    fn close_card_soon(&mut self, cx: &mut Context<Self>) {
+        if self.servers.in_card || self.servers.closing.is_some() || self.servers.card_selection.borrow().dragging {
+            return;
+        }
+        self.servers.card_seq += 1;
+        let seq = self.servers.card_seq;
+        self.servers.closing = Some(seq);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CARD_GRACE).await;
+            this.update(cx, |s, cx| {
+                if s.servers.closing == Some(seq) {
+                    s.close_card(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Take the card away, and ask about the word the pointer rests on now.
+    pub(super) fn close_card(&mut self, cx: &mut Context<Self>) {
+        self.servers.closing = None;
+        self.servers.in_card = false;
+        self.servers.card_selection.borrow_mut().clear();
+        if self.servers.hover.take().is_some_and(|h| h.text.is_some()) {
+            cx.notify();
+        }
+        if let Some((key, point)) = self.servers.want.take() {
+            self.ask_hover(key, point, cx);
+        }
+    }
+
+    /// The pointer went into the hover card, or out of it.
+    fn card_hovered(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.servers.in_card = hovered;
+        if hovered {
+            self.servers.closing = None;
+            self.servers.want = None;
+        } else {
+            self.close_card_soon(cx);
+        }
     }
 
     /// ⌘ pressed or let go: the word resting under the pointer becomes a link,
@@ -699,7 +783,13 @@ impl Workspace {
             }
             return;
         }
+        // ⌘ in the card is for copying from it.
+        if self.servers.in_card {
+            return;
+        }
         let Some(card) = self.servers.hover.take() else { return };
+        self.servers.closing = None;
+        self.servers.want = None;
         let (source, row, range) = card.key;
         if self.navigable(&source) {
             self.servers.link = Some(Link { source, row, range });
@@ -713,8 +803,13 @@ impl Workspace {
             self.servers.link = None;
             cx.notify();
         }
-        if self.servers.hover.as_ref().is_some_and(|h| &h.key.0 == source && h.key.1 == row) && self.servers.hover.take().is_some_and(|h| h.text.is_some()) {
-            cx.notify();
+        if self.card_shown() {
+            if self.servers.want.as_ref().is_some_and(|(k, _)| &k.0 == source && k.1 == row) {
+                self.servers.want = None;
+            }
+            self.close_card_soon(cx);
+        } else if self.servers.hover.as_ref().is_some_and(|h| &h.key.0 == source && h.key.1 == row) {
+            self.servers.hover = None;
         }
     }
 
@@ -951,7 +1046,10 @@ impl Workspace {
     /// The hover card and the notice, floating over everything.
     pub(super) fn lsp_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let colors = palette(cx);
-        let card = self.servers.hover.as_ref().and_then(|h| Some((h.text.clone()?, h.point)));
+        let card = self.servers.hover.as_ref().and_then(|h| Some((h.text.clone()?, h.point, h.seq)));
+        let selection = self.servers.card_selection.clone();
+        selection.borrow_mut().forget_layout();
+        let tint = Hsla::from(rgb(colors.blue)).opacity(0.28);
         let notice = self.servers.notice.as_ref().map(|(text, point, _)| (text.clone(), *point));
         if card.is_none() && notice.is_none() {
             return None;
@@ -966,7 +1064,7 @@ impl Workspace {
                 .top_0()
                 .left_0()
                 .size_0()
-                .when_some(card, |s, (text, point)| {
+                .when_some(card, |s, (text, point, seq)| {
                     // Pieces stacked, a rule between each: signatures and paths
                     // highlighted as code, docs as Markdown.
                     let mut body = super::ui::col();
@@ -986,18 +1084,47 @@ impl Workspace {
                                     .text_color(rgb(colors.code))
                                     .children(lines.into_iter().enumerate().map(|(i, line)| {
                                         let styles = marks.as_ref().and_then(|m| m.line(colors.dark, i)).cloned().unwrap_or_default();
-                                        div().child(StyledText::new(line).with_highlights(styles))
+                                        let styled = StyledText::new(line.clone()).with_highlights(styles);
+                                        let layout = styled.layout().clone();
+                                        div().min_h(px(4.)).child(select::selectable(&selection, (n, i), layout, line, styled.into_any_element(), tint))
                                     }))
                                     .into_any_element()
                             }
                             HoverPart::Text(text) => div()
                                 .px_3()
                                 .py_2()
-                                .child(super::md::render(format!("lsp-hover-{n}").into(), &text, super::md::Breaks::Soft, colors, mono(), px(crate::theme::mono_size()), None, None))
+                                .child(super::md::render(format!("lsp-hover-{n}").into(), &text, super::md::Breaks::Soft, colors, mono(), px(crate::theme::mono_size()), Some((selection.clone(), n)), None))
                                 .into_any_element(),
                         });
                     }
-                    s.child(float(point, surface().id("lsp-hover").max_w(px(440.)).max_h(px(360.)).overflow_y_scroll().child(body).into_any_element()))
+                    // The pointer can come into the card to scroll it and select
+                    // in it; ⌘ C copies what's selected.
+                    let card = surface()
+                        .id(("lsp-hover", seq as usize))
+                        .debug_selector(|| "lsp-hover".into())
+                        .occlude()
+                        .max_w(px(440.))
+                        .max_h(px(360.))
+                        .overflow_y_scroll()
+                        .on_hover(cx.listener(|s, hovered: &bool, _, cx| s.card_hovered(*hovered, cx)))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|s, e: &MouseDownEvent, window, cx| {
+                            if s.servers.card_selection.borrow_mut().press(e.position, e.click_count, e.modifiers.shift) {
+                                s.focus.focus(window);
+                            }
+                            cx.notify();
+                        }))
+                        .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
+                            if e.pressed_button == Some(MouseButton::Left) && s.servers.card_selection.borrow_mut().drag(e.position) {
+                                cx.notify();
+                            }
+                        }))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|s, _, _, _| s.servers.card_selection.borrow_mut().dragging = false))
+                        .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, cx| {
+                            s.servers.card_selection.borrow_mut().dragging = false;
+                            s.close_card_soon(cx);
+                        }))
+                        .child(body);
+                    s.child(float(point, card.into_any_element()))
                 })
                 .when_some(notice, |s, (text, point)| {
                     s.child(float(point, surface().px_2().py_1().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.text)).child(text).into_any_element()))

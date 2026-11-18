@@ -5,7 +5,7 @@
 // Not `super::*`: gpui's own `test` attribute would shadow the built-in one.
 use super::panes::{LineKind, LineSource, diff_lines};
 use super::{TabKind, Workspace, lsp};
-use gpui::{AppContext as _, Context, Entity, Modifiers, Pixels, Point, TestAppContext, VisualTestContext, point, px};
+use gpui::{AppContext as _, Context, Entity, Modifiers, MouseButton, MouseDownEvent, Pixels, Point, TestAppContext, VisualTestContext, point, px};
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
@@ -327,9 +327,19 @@ fn drives_code_review_with_rust_analyzer(cx: &mut TestAppContext) {
     let text = d.read(|s| s.servers.hover.as_ref().and_then(|h| h.text.clone())).unwrap();
     eprintln!("hover: {text:?}");
     assert!(text.contains("Doubles a number") && text.contains("fn twice"), "{text}");
-    // Moving off the word, onto the space after `pub`, takes it away.
+    // The pointer can go into the card, and it stays while it's there.
+    let card = d.cx.debug_bounds("lsp-hover").expect("the card is drawn");
+    d.cx.simulate_mouse_move(card.center(), None, Modifiers::none());
+    d.settle();
+    d.cx.executor().advance_clock(lsp::CARD_GRACE * 2);
+    d.settle();
+    assert!(d.read(|s| s.servers.in_card && s.servers.hover.is_some()), "the card stays with the pointer in it");
+    // Moving off it, onto the space after `pub`, takes it away after a moment.
     let off = d.point(1, 3);
     d.cx.simulate_mouse_move(off, None, Modifiers::none());
+    d.settle();
+    assert!(d.read(|s| s.servers.hover.is_some()), "the card waits for the pointer to come back");
+    d.cx.executor().advance_clock(lsp::CARD_GRACE + Duration::from_millis(50));
     d.settle();
     assert!(d.read(|s| s.servers.hover.is_none()));
 
@@ -658,8 +668,9 @@ fn scrolls_the_terminal_with_its_bar(cx: &mut TestAppContext) {
     let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
     let (project, config) = fixture();
     let mut d = boot(cx, &config);
-    d.act(|s, cx| s.open(TabKind::Terminal, cx));
-    let term = d.read(|s| match &s.terminal {
+    let cwd = project.clone();
+    d.act(move |s, cx| s.open(TabKind::Terminal(cwd), cx));
+    let term = d.read(|s| match s.terminals.values().next() {
         Some(Ok(t)) => t.clone(),
         _ => panic!("no terminal"),
     });
@@ -677,7 +688,7 @@ fn scrolls_the_terminal_with_its_bar(cx: &mut TestAppContext) {
     d.cx.simulate_mouse_move(low, None, Modifiers::none());
     d.cx.simulate_mouse_down(low, gpui::MouseButton::Left, Modifiers::none());
     let high = point(bar.center().x, bar.top() - px(200.));
-    d.cx.simulate_mouse_move(high, gpui::MouseButton::Left, Modifiers::none());
+    d.cx.simulate_mouse_move(high, MouseButton::Left, Modifiers::none());
     d.cx.simulate_mouse_up(high, gpui::MouseButton::Left, Modifiers::none());
     d.settle();
     assert_eq!(state(&mut d).0, history, "dragged to the top of the history");
@@ -699,4 +710,190 @@ fn scrolls_the_terminal_with_its_bar(cx: &mut TestAppContext) {
     d.settle();
     assert_eq!(state(&mut d).0, 0, "the wheel goes back to the bottom");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Each folder of a project gets its own terminal tab, and closing one leaves
+/// the other's shell running.
+#[gpui::test]
+fn keeps_a_terminal_per_folder(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let other = project.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut d = boot(cx, &config);
+    let (a, b) = (project.clone(), other.clone());
+    d.act(move |s, cx| {
+        s.open(TabKind::Terminal(a.clone()), cx);
+        s.open(TabKind::Terminal(b), cx);
+        // Asking for the first folder again goes back to its tab.
+        s.open(TabKind::Terminal(a), cx);
+    });
+    let terminals = |s: &Workspace| s.tabs.iter().filter(|t| matches!(t.kind, TabKind::Terminal(_))).count();
+    assert_eq!(d.read(terminals), 2);
+    assert_eq!(d.read(|s| s.terminals.len()), 2);
+    let shown = project.clone();
+    assert!(d.read(move |s| s.tabs[s.active].kind == TabKind::Terminal(shown)));
+    d.act(|s, cx| s.close(s.active, cx));
+    assert_eq!(d.read(terminals), 1);
+    let kept = other.clone();
+    assert!(d.read(move |s| s.terminals.contains_key(&kept) && s.terminals.len() == 1));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Open with: the file header's button lists the editors, with their icons
+/// and Reveal in Finder; a right-click in the Files page offers them in a
+/// submenu, leaving out those that don't open folders when it's a folder.
+#[gpui::test]
+fn offers_other_editors(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    // Stand-ins for whatever this Mac has installed, put in once the real
+    // lookup at startup is done.
+    let fake = |name: &str, icon: bool, folders: bool| crate::editors::Editor {
+        name: name.into(),
+        app: PathBuf::from(format!("/nonexistent/{name}.app")),
+        icon: icon.then(|| PathBuf::from("/nonexistent/icon.png")),
+        folders,
+    };
+    let editors = crate::editors::Editors { list: vec![fake("Coder", true, true), fake("Jotter", false, false)], finder: None };
+    let file = project.join("src/main.rs");
+    let opened = file.clone();
+    d.act(move |s, cx| {
+        s.editors = Rc::new(editors);
+        s.side = super::Side::Files;
+        s.open(TabKind::File(opened), cx);
+    });
+    let labels = |d: &mut Driver| {
+        let ws = d.ws.clone();
+        d.cx.update(|_, cx| ws.read(cx).popup.clone().map(|m| m.read(cx).labels(cx)))
+    };
+
+    // The header's button, right above the file.
+    let button = d.cx.debug_bounds(super::panes::OPEN_WITH).expect("an Open with button in the file's header");
+    d.cx.simulate_click(button.center(), Modifiers::none());
+    d.settle();
+    assert_eq!(d.read(|s| s.popup_anchor), Some(super::panes::OPEN_WITH));
+    let (items, _) = labels(&mut d).expect("a list of editors");
+    assert_eq!(items, ["Coder [img]", "Jotter", "Reveal in Finder"]);
+    d.keys("escape");
+    assert!(d.read(|s| s.popup.is_none()));
+
+    // A right-click on a file: Open with ▸ its editors, and Reveal in Finder.
+    let right_click = |d: &mut Driver, name: &str| {
+        let key: &'static str = Box::leak(format!("file-row:{name}").into_boxed_str());
+        let row = d.cx.debug_bounds(key).unwrap_or_else(|| panic!("{name} isn't in the Files page"));
+        d.cx.simulate_mouse_down(row.center(), gpui::MouseButton::Right, Modifiers::none());
+        d.cx.simulate_mouse_up(row.center(), gpui::MouseButton::Right, Modifiers::none());
+        d.settle();
+        row.center()
+    };
+    // The menu's top-left corner is where it was opened; its first row, Open
+    // with, sits just inside. Hovering it opens its submenu.
+    let hover_first = |d: &mut Driver, at: Point<Pixels>| {
+        d.cx.simulate_mouse_move(at + point(px(40.), px(18.)), None, Modifiers::none());
+        d.settle();
+    };
+    let at = right_click(&mut d, "notes.go");
+    let (items, _) = labels(&mut d).expect("a menu on the file");
+    assert_eq!(items, ["Open with", "Reveal in Finder"]);
+    hover_first(&mut d, at);
+    let (_, sub) = labels(&mut d).unwrap();
+    assert_eq!(sub.expect("the submenu opens"), ["Coder [img]", "Jotter"]);
+    // The Files page is at the window's right edge: the submenu opens to the
+    // menu's left rather than over it.
+    let (menu, sub) = (d.cx.debug_bounds("menu").unwrap(), d.cx.debug_bounds("submenu").unwrap());
+    assert!(!menu.intersects(&sub), "the submenu covers its menu: {menu:?} {sub:?}");
+    // A press elsewhere closes it.
+    d.cx.simulate_click(point(px(1.), px(300.)), Modifiers::none());
+    d.settle();
+    assert!(d.read(|s| s.popup.is_none()));
+
+    // On a folder, only editors that open folders.
+    let at = right_click(&mut d, "src");
+    hover_first(&mut d, at);
+    let (_, sub) = labels(&mut d).expect("a menu on the folder");
+    assert_eq!(sub.expect("the submenu opens"), ["Coder [img]"]);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Typing on the chat with nothing focused starts the message in the composer;
+/// shortcuts still go where they did.
+#[gpui::test]
+fn typing_fills_the_composer(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    assert_eq!(d.active(), TabKind::Chat);
+    let ws = d.ws.clone();
+    d.cx.update(|window, cx| ws.read(cx).focus.focus(window));
+    d.settle();
+    d.keys("h i");
+    let (value, focused) = d.cx.update(|window, cx| {
+        let c = ws.read(cx).composer.read(cx);
+        (c.value().to_string(), gpui::Focusable::focus_handle(c, cx).is_focused(window))
+    });
+    assert_eq!(value, "hi");
+    assert!(focused, "the composer takes the cursor");
+
+    // Pasting does the same, adding to what's there.
+    d.cx.update(|window, cx| ws.read(cx).focus.focus(window));
+    d.cx.write_to_clipboard(gpui::ClipboardItem::new_string(" there".into()));
+    d.keys("cmd-v");
+    let value = d.cx.update(|_, cx| ws.read(cx).composer.read(cx).value().to_string());
+    assert_eq!(value, "hi there");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// Code in file and diff panes can be selected like text: a drag runs across
+/// lines, a double click takes a word, and ⌘ C copies what's selected.
+#[gpui::test]
+fn selects_text_in_code_panes(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let util = project.join("src/util.rs");
+    let opened = util.clone();
+    d.act(move |s, cx| s.open(TabKind::File(opened), cx));
+    d.wait("util.rs", 10, |d| d.read(|s| matches!(s.files.get(&util), Some(Ok(_)))));
+    let selected = |d: &mut Driver| d.read(|s| s.code_text_selected());
+
+    // From `fn` on row 1 to just before `* 2` on row 2.
+    let (from, to) = (d.point(1, 4), d.point(2, 6));
+    d.cx.simulate_mouse_move(from, None, Modifiers::none());
+    d.cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+    d.cx.simulate_mouse_move(to, MouseButton::Left, Modifiers::none());
+    d.cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+    d.settle();
+    assert_eq!(selected(&mut d).as_deref(), Some("fn twice(x: i32) -> i32 {\n    x "));
+    d.keys("cmd-c");
+    assert_eq!(d.cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("fn twice(x: i32) -> i32 {\n    x "));
+
+    // A double click takes the word.
+    let at = d.point(1, 9);
+    d.cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    d.cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    d.cx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::none(), click_count: 2, first_mouse: false });
+    d.cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    d.settle();
+    assert_eq!(selected(&mut d).as_deref(), Some("twice"));
+    d.keys("escape");
+    assert_eq!(selected(&mut d), None);
+
+    // In a diff, only the drawn text is taken: no `+`, no hunk header.
+    let main_rs = project.join("src/main.rs");
+    d.act(|s, cx| s.open(TabKind::GitDiff(main_rs.clone(), false), cx));
+    let diff = LineSource::GitDiff(main_rs.clone(), false);
+    d.wait("the Git diff", 30, |d| d.read(|s| s.diff_sides(&diff).is_some()));
+    assert_eq!(selected(&mut d), None, "a selection in another pane doesn't follow");
+    let added = d.diff_row(&diff, LineKind::Add, "again");
+    let at = d.point(added, 30);
+    d.cx.simulate_mouse_down(at, MouseButton::Left, Modifiers::none());
+    d.cx.simulate_event(MouseDownEvent { button: MouseButton::Left, position: at, modifiers: Modifiers::none(), click_count: 3, first_mouse: false });
+    d.cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    d.settle();
+    assert_eq!(selected(&mut d).as_deref(), Some("\tlet again = util::twice(total);"));
 }

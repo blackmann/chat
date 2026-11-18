@@ -396,11 +396,12 @@ impl Workspace {
     /// ⌘ L: add the selected lines of a file or diff, or else the transcript's
     /// selected text, to the message being written.
     pub(super) fn add_to_chat(&mut self, _: &AddToChat, window: &mut Window, cx: &mut Context<Self>) {
-        let added = match self.line_selection.take() {
+        let added = match self.line_selection.take().or_else(|| self.code_text_lines()) {
             Some(lines) => self.lines_mention(&lines),
             None => self.selection.borrow().text().filter(|t| !t.trim().is_empty()).map(|t| super::mentions::quote_mention(&t)),
         };
         self.selection.borrow_mut().clear();
+        self.code_text.borrow_mut().clear();
         match added {
             Some(added) => self.insert_mention(added, window, cx),
             None => cx.notify(),

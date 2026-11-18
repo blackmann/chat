@@ -1,4 +1,5 @@
 mod agent;
+mod editors;
 mod icons;
 mod git;
 mod git_watch;

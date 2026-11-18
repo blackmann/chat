@@ -21,6 +21,8 @@ pub struct Item {
     detail: Option<SharedString>,
     description: Option<SharedString>,
     icon: Option<Icon>,
+    /// A picture in place of the icon, such as an app's.
+    image: Option<std::path::PathBuf>,
     checked: bool,
     disabled: bool,
     keep_open: bool,
@@ -38,6 +40,7 @@ impl Item {
             detail: None,
             description: None,
             icon: None,
+            image: None,
             checked: false,
             disabled: false,
             keep_open: false,
@@ -68,6 +71,11 @@ impl Item {
     }
     pub fn icon(mut self, icon: impl Into<Icon>) -> Self {
         self.icon = Some(icon.into());
+        self
+    }
+    /// Show a picture, such as an app's icon, where the icon goes.
+    pub fn image(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.image = Some(path.into());
         self
     }
     pub fn checked(mut self, checked: bool) -> Self {
@@ -129,6 +137,21 @@ impl EventEmitter<Back> for Menu {}
 impl Focusable for Menu {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
+    }
+}
+
+#[cfg(test)]
+impl Menu {
+    /// The labels of the items as built now, and of the open submenu's.
+    pub fn labels(&self, cx: &App) -> (Vec<String>, Option<Vec<String>>) {
+        let labels = (self.build)(cx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Item(item) => Some(format!("{}{}", item.label, if item.image.is_some() { " [img]" } else { "" })),
+                _ => None,
+            })
+            .collect();
+        (labels, self.sub.as_ref().map(|(_, m)| m.read(cx).labels(cx).0))
     }
 }
 
@@ -327,7 +350,7 @@ impl Menu {
 }
 
 impl Render for Menu {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = palette(cx);
         let entries = self.visible(cx);
         let searching = self
@@ -348,6 +371,15 @@ impl Render for Menu {
             .sub
             .as_ref()
             .and_then(|(i, m)| Some((m.clone(), *self.rows.borrow().get(i)?)));
+        // The submenu opens to the right of its item, or to the left when it
+        // wouldn't fit there: snapping it back inside the window would cover
+        // the menu it came from.
+        let sub = sub.map(|(menu, at)| {
+            let width = menu.read(cx).width;
+            let fits_right = at.right() + px(6.) + width + px(8.) <= window.viewport_size().width;
+            let (corner, x) = if fits_right { (Corner::TopLeft, at.right() + px(6.)) } else { (Corner::TopRight, at.left() - px(6.)) };
+            (menu, corner, point(x, at.top() - px(5.)))
+        });
         for (i, entry) in entries.into_iter().enumerate() {
             list = list.child(match entry {
                 Entry::Label(text) => div()
@@ -395,6 +427,7 @@ impl Render for Menu {
                                 }))
                                 .on_click(cx.listener(move |m, _, w, cx| m.activate(i, w, cx)))
                         })
+                        .when_some(item.image, |s, path| s.child(img(path).flex_shrink_0().size(px(16.))))
                         .when_some(item.icon, |s, icon| {
                             s.child(icon.size(px(14.)).text_color(rgb(colors.muted)))
                         })
@@ -507,6 +540,10 @@ impl Render for Menu {
                 }
             }))
             .occlude()
+            .debug_selector({
+                let nested = self.nested;
+                move || if nested { "submenu".into() } else { "menu".into() }
+            })
             .w(self.width)
             .flex()
             .flex_col()
@@ -533,11 +570,12 @@ impl Render for Menu {
             // The submenu, beside its item and level with it. Drawn last and
             // outside the list, so nothing covers or clips it; menus are
             // already drawn deferred, so it can't be deferred again.
-            .when_some(sub, |s, (sub, at)| {
+            .when_some(sub, |s, (sub, corner, at)| {
                 let sub_bounds = self.sub_bounds.clone();
                 s.child(
                     anchored()
-                        .position(point(at.right() + px(6.), at.top() - px(5.)))
+                        .anchor(corner)
+                        .position(at)
                         .snap_to_window_with_margin(px(8.))
                         .child(
                             div().relative().child(sub).child(

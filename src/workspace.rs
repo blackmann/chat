@@ -9,6 +9,7 @@ mod md;
 mod mentions;
 mod panes;
 mod preferences;
+mod search;
 mod select;
 mod side;
 mod symbols;
@@ -73,7 +74,8 @@ pub enum TabKind {
     Diff(PathBuf),
     /// One side of a file's change, from the Git panel: staged (HEAD → index) or not.
     GitDiff(PathBuf, bool),
-    Terminal,
+    /// A shell, by the folder it started in: one per project folder.
+    Terminal(PathBuf),
     /// A language server's log, by its name and root.
     ServerLog(String, PathBuf),
 }
@@ -109,16 +111,19 @@ impl Side {
     }
 }
 
-/// What a project had showing when you left it, put back when you return. The
-/// terminal is kept here too, so its shell goes on running in the background.
+/// What a project had showing when you left it, put back when you return. Its
+/// terminals are kept here too, so their shells go on running in the background.
 struct ProjectView {
     tabs: Vec<Tab>,
     active: usize,
     expanded: HashSet<PathBuf>,
-    terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
+    terminals: Terminals,
     /// The thread that was showing, by id: indexes shift as threads are added.
     thread: Option<usize>,
 }
+
+/// Shells by the folder each started in, or why one couldn't start.
+type Terminals = HashMap<PathBuf, Result<Entity<terminal::TerminalView>, SharedString>>;
 
 /// A file or folder in the Files page.
 #[derive(Clone)]
@@ -147,6 +152,8 @@ const SKIPPED: &[&str] = &[".git", ".DS_Store", "node_modules", "target"];
 /// Agent processes kept running at once. Past this, the least recently shown
 /// idle thread's agent is stopped; its session reopens when it is shown again.
 const LIVE_SESSIONS: usize = 4;
+/// The tab strip's terminal button, where the folder picker opens.
+const TERMINAL_BUTTON: &str = "open-terminal";
 /// Files larger than this aren't opened in a tab.
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 
@@ -187,10 +194,15 @@ pub struct Workspace {
     show_blame: bool,
     /// Lines a link jumped to, lit briefly so the eye finds them.
     flash: Option<Flash>,
-    terminal: Option<Result<Entity<terminal::TerminalView>, SharedString>>,
+    /// The project's shells, by the folder each started in.
+    terminals: Terminals,
     /// Projects not showing, by index, as they were left.
     views: HashMap<usize, ProjectView>,
     thread_search: Entity<InputState>,
+    /// What the last content search found, once it's done.
+    thread_hits: Option<search::Results>,
+    /// The search under way: for which project and query.
+    thread_searching: Option<(usize, String, Task<()>)>,
     composer: Entity<InputState>,
     /// Dropped files displayed as basename chips in the composer. Their paths
     /// are substituted only in the prompt sent to the agent.
@@ -261,6 +273,9 @@ pub struct Workspace {
     selection: select::Shared,
     /// Lines selected in a file or diff pane.
     line_selection: Option<panes::LineSelection>,
+    /// Text selected in a file or diff pane, and which pane it is in.
+    code_text: select::Shared,
+    code_text_source: Option<panes::LineSource>,
     /// The word clicked in a file or diff pane, marked wherever it appears there.
     symbol: Option<symbols::SymbolMark>,
     /// Language servers for the files open in tabs.
@@ -299,6 +314,8 @@ pub struct Workspace {
     /// The usage limits each agent (by index) last reported, by window. They
     /// belong to the account, so any of the agent's threads updates them.
     limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
+    /// Other apps a file can be opened in, found once at startup.
+    editors: Rc<crate::editors::Editors>,
     _quit: Option<Subscription>,
 }
 
@@ -325,7 +342,11 @@ impl Workspace {
         composer.update(cx, |input, _| {
             input.lsp.document_color_provider = Some(Rc::new(chat::FileMentionColors::new(composer_mentions)));
         });
-        cx.observe(&thread_search, |_, _, cx| cx.notify()).detach();
+        cx.observe(&thread_search, |s, _, cx| {
+            s.search_threads(cx);
+            cx.notify();
+        })
+        .detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         cx.subscribe_in(&rename_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
@@ -364,9 +385,11 @@ impl Workspace {
             cursor_line: HashMap::new(),
             show_blame: true,
             flash: None,
-            terminal: None,
+            terminals: HashMap::new(),
             views: HashMap::new(),
             thread_search,
+            thread_hits: None,
+            thread_searching: None,
             composer,
             file_mentions,
             command_index: 0,
@@ -412,6 +435,8 @@ impl Workspace {
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
+            code_text: Rc::default(),
+            code_text_source: None,
             symbol: None,
             servers: lsp::Servers::default(),
             effort_open: false,
@@ -435,8 +460,17 @@ impl Workspace {
             limits: HashMap::new(),
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
+            editors: Rc::default(),
             _quit: None,
         };
+        cx.spawn(async move |this, cx| {
+            let editors = cx.background_executor().spawn(async { crate::editors::load() }).await;
+            let _ = this.update(cx, |s, cx| {
+                s.editors = Rc::new(editors);
+                cx.notify();
+            });
+        })
+        .detach();
         // Whatever hasn't been written yet is written on the way out.
         workspace._quit = Some(cx.on_app_quit(|s, _| {
             s.save_now();
@@ -508,7 +542,7 @@ impl Workspace {
             tabs: std::mem::take(&mut self.tabs),
             active: self.active,
             expanded: std::mem::take(&mut self.expanded),
-            terminal: self.terminal.take(),
+            terminals: std::mem::take(&mut self.terminals),
             thread: self.current_thread().map(|t| t.id),
         };
         self.views.insert(self.project, leaving);
@@ -523,7 +557,7 @@ impl Workspace {
             Some(view) => {
                 self.tabs = view.tabs;
                 self.expanded = view.expanded;
-                self.terminal = view.terminal;
+                self.terminals = view.terminals;
                 self.active = view.active.min(self.tabs.len().saturating_sub(1));
             }
             None => {
@@ -558,6 +592,45 @@ impl Workspace {
             self.drafts.insert(owner, (text, self.file_mentions.borrow().clone()));
         }
     }
+    /// Look through the threads' contents for the search query, off the main
+    /// thread, once typing pauses.
+    fn search_threads(&mut self, cx: &mut Context<Self>) {
+        let query = self.thread_search.read(cx).value().trim().to_string();
+        let project = self.project;
+        if query.is_empty() {
+            self.thread_hits = None;
+            self.thread_searching = None;
+            return;
+        }
+        // The input also notifies on cursor moves and focus.
+        let same = |p: usize, q: &str| p == project && q == query;
+        if self.thread_hits.as_ref().is_some_and(|r| same(r.project, &r.query))
+            || self.thread_searching.as_ref().is_some_and(|(p, q, _)| same(*p, q))
+        {
+            return;
+        }
+        let task = cx.spawn({
+            let query = query.clone();
+            async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let Ok(Some(docs)) = this.update(cx, |s, _| s.projects.get(project).map(search::docs)) else {
+                    return;
+                };
+                let hits = cx.background_executor().spawn({
+                    let query = query.clone();
+                    async move { search::run(&docs, &query) }
+                });
+                let hits = hits.await;
+                let _ = this.update(cx, |s, cx| {
+                    s.thread_hits = Some(search::Results { project, query, hits });
+                    s.thread_searching = None;
+                    cx.notify();
+                });
+            }
+        });
+        self.thread_searching = Some((project, query, task));
+    }
+
     fn select_thread(&mut self, index: usize, cx: &mut Context<Self>) {
         let id = self.current_project().threads.get(index).map(|t| t.id);
         if id != self.draft_owner {
@@ -977,9 +1050,9 @@ impl Workspace {
 
     /// Focus the tab showing `kind`, opening one beside the chat if needed.
     fn open(&mut self, kind: TabKind, cx: &mut Context<Self>) {
-        if kind == TabKind::Terminal && self.terminal.is_none() {
-            let cwd = self.current_project().path.clone().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())));
-            self.terminal = Some(terminal::TerminalView::new(cwd, cx).map_err(|e| SharedString::from(e.to_string())));
+        if let TabKind::Terminal(cwd) = &kind && !self.terminals.contains_key(cwd) {
+            let view = terminal::TerminalView::new(cwd.clone(), cx).map_err(|e| SharedString::from(e.to_string()));
+            self.terminals.insert(cwd.clone(), view);
         }
         if let TabKind::File(path) = &kind {
             self.files.insert(path.clone(), read_lines(path));
@@ -1038,15 +1111,50 @@ impl Workspace {
         cx.notify();
     }
     fn focus_terminal(&self, cx: &mut Context<Self>) {
-        if self.tabs[self.active].kind == TabKind::Terminal {
-            if let Some(Ok(terminal)) = &self.terminal { terminal.update(cx, |s, cx| { s.request_focus = true; cx.notify(); }); }
+        if let TabKind::Terminal(cwd) = &self.tabs[self.active].kind
+            && let Some(Ok(terminal)) = self.terminals.get(cwd)
+        {
+            terminal.update(cx, |s, cx| {
+                s.request_focus = true;
+                cx.notify();
+            });
         }
+    }
+    /// Open a terminal: straight away in a single-folder project, otherwise
+    /// asking which folder to start it in.
+    fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let roots = self.current_project().roots();
+        if roots.len() < 2 {
+            let cwd = roots.into_iter().next().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into())));
+            return self.open(TabKind::Terminal(cwd), cx);
+        }
+        let weak = cx.weak_entity();
+        let build: popover::Builder = Rc::new(move |cx: &App| {
+            let Some(w) = weak.upgrade() else { return Vec::new() };
+            let s = w.read(cx);
+            let mut entries = vec![crate::menu::Entry::Label("Open terminal in".into())];
+            for root in s.current_project().roots() {
+                let running = s.terminals.get(&root).is_some_and(|t| t.is_ok());
+                let mut item = crate::menu::Item::new(crate::model::folder_name(&root)).icon(gpui_component::IconName::Folder);
+                if running {
+                    item = item.detail("running");
+                }
+                let weak = weak.clone();
+                entries.push(crate::menu::Entry::Item(item.on_click(move |_, cx| {
+                    let _ = weak.update(cx, |s, cx| s.open(TabKind::Terminal(root.clone()), cx));
+                })));
+            }
+            entries
+        });
+        self.open_popover(TERMINAL_BUTTON, Point::default(), Corner::TopRight, 240., None, build, window, cx);
     }
     fn close(&mut self, index: usize, cx: &mut Context<Self>) {
         if self.tabs.get(index).is_none_or(Tab::fixed) {
             return;
         }
-        if self.tabs[index].kind == TabKind::Terminal { self.terminal = None; }
+        if let TabKind::Terminal(cwd) = &self.tabs[index].kind {
+            self.terminals.remove(cwd);
+        }
         let kind = self.tabs.remove(index).kind;
         if let TabKind::File(path) = &kind {
             self.files.remove(path);
@@ -1206,9 +1314,11 @@ fn list(dir: &Path, ignored: bool) -> Vec<Entry> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let path = e.path();
+            let dir = e.file_type().is_ok_and(|t| t.is_dir());
             (!SKIPPED.contains(&name.as_str())).then(|| Entry {
-                dir: e.file_type().is_ok_and(|t| t.is_dir()),
-                ignored: ignored || !kept.contains(&path),
+                // A folder git keeps can still hold only what it ignores.
+                ignored: ignored || !kept.contains(&path) || (dir && holds_only_ignored(&path)),
+                dir,
                 path,
                 name: name.into(),
             })
@@ -1216,6 +1326,20 @@ fn list(dir: &Path, ignored: bool) -> Vec<Entry> {
         .collect();
     entries.sort_by(|a, b| b.dir.cmp(&a.dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     entries
+}
+
+/// Whether a folder has something in it, but no file anywhere beneath it that
+/// git doesn't ignore. The walk skips ignored folders, and stops at the first
+/// file it keeps, so it stays short either way.
+fn holds_only_ignored(dir: &Path) -> bool {
+    let has_any = std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some());
+    has_any
+        && !ignore::WalkBuilder::new(dir)
+            .hidden(false)
+            .filter_entry(|e| !SKIPPED.contains(&e.file_name().to_string_lossy().as_ref()))
+            .build()
+            .flatten()
+            .any(|e| e.file_type().is_some_and(|t| !t.is_dir()))
 }
 
 /// Rows of a file lit after a link jumped to them, fading out from `at`.
@@ -1291,6 +1415,10 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_component::resizable::{h_resizable, resizable_panel};
+        // With nothing focused, keys would stop at the window root; the workspace takes them instead.
+        if window.focused(cx).is_none() {
+            self.focus.focus(window);
+        }
         if std::mem::take(&mut self.clear_composer) {
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -1385,7 +1513,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &ShowContext, _, cx| s.show_side(Side::Context, cx)))
             .on_action(cx.listener(|s, _: &ShowChanges, _, cx| s.show_side(Side::Changes, cx)))
             .on_action(cx.listener(|s, _: &ShowFiles, _, cx| s.show_side(Side::Files, cx)))
-            .on_action(cx.listener(|s, _: &OpenTerminal, _, cx| s.open(TabKind::Terminal, cx)))
+            .on_action(cx.listener(|s, _: &OpenTerminal, window, cx| s.open_terminal(window, cx)))
             .on_action(cx.listener(Self::open_prefs))
             .on_action(cx.listener(|s, _: &GoToDefinition, window, cx| s.go_to_definition(window, cx)))
             .on_action(cx.listener(|s, _: &FindReferences, window, cx| s.find_references(window, cx)))
@@ -1398,18 +1526,47 @@ impl Render for Workspace {
                 let key = e.keystroke.key.as_str();
                 // ⌘ C copies the transcript's selection once a click there took focus from the composer.
                 if key == "c" && e.keystroke.modifiers.platform && s.focus.is_focused(window) {
-                    if let Some(text) = s.selection.borrow().text() {
+                    // What's selected in a hover card comes first: it was selected last.
+                    let card = s.servers.card_selection.borrow().text().filter(|_| s.servers.hover.is_some());
+                    if let Some(text) = card.or_else(|| s.code_text_selected()).or_else(|| s.selection.borrow().text()) {
                         cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
+                    return;
+                }
+                // Typing or pasting with nothing else taking keys starts the message in the composer.
+                let m = e.keystroke.modifiers;
+                let typing_here = s.focus.is_focused(window) && matches!(s.tabs[s.active].kind, TabKind::Chat);
+                if typing_here && key == "v" && m.platform && !(m.control || m.alt || m.function || m.shift) {
+                    cx.stop_propagation();
+                    s.composer.update(cx, |c, cx| c.focus(window, cx));
+                    // The composer's own paste, so it behaves as if it had been focused.
+                    window.dispatch_action(Box::new(gpui_component::input::Paste), cx);
+                    return;
+                }
+                if typing_here
+                    && !(m.platform || m.control || m.function)
+                    && let Some(text) = e.keystroke.key_char.as_ref().filter(|t| !t.chars().any(char::is_control))
+                {
+                    let text = text.clone();
+                    cx.stop_propagation();
+                    s.composer.update(cx, |c, cx| {
+                        c.focus(window, cx);
+                        c.insert(text, window, cx);
+                    });
                     return;
                 }
                 if key != "escape" {
                     return;
                 }
-                if s.effort_open {
+                if s.servers.hover.as_ref().is_some_and(|h| h.text.is_some()) {
+                    s.close_card(cx);
+                } else if s.effort_open {
                     s.close_effort(cx);
                 } else if s.line_selection.is_some() {
                     s.line_selection = None;
+                    cx.notify();
+                } else if !s.code_text.borrow().is_empty() {
+                    s.code_text.borrow_mut().clear();
                     cx.notify();
                 } else if s.symbol.is_some() {
                     s.symbol = None;
@@ -1495,6 +1652,9 @@ mod listing_tests {
             ("nested/.gitignore", "secret.txt\n"),
             ("nested/secret.txt", ""),
             ("nested/kept.txt", ""),
+            ("cache/.gitignore", "*\n"),
+            ("cache/blob.bin", ""),
+            ("logs/today.log", ""),
         ] {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1506,6 +1666,8 @@ mod listing_tests {
         let top = list(&dir, false);
         assert!(!ignored(&top, "main.rs") && !ignored(&top, ".gitignore") && !ignored(&top, "nested"));
         assert!(ignored(&top, "debug.log") && ignored(&top, "build"));
+        // Folders git keeps, but whose every file it ignores, fade too.
+        assert!(ignored(&top, "cache") && ignored(&top, "logs"));
         // Nested rules count in their own folder.
         let nested = list(&dir.join("nested"), false);
         assert!(ignored(&nested, "secret.txt") && !ignored(&nested, "kept.txt"));

@@ -331,6 +331,10 @@ impl Workspace {
             list = list.child(
                 row()
                     .id(("node", i))
+                    .debug_selector({
+                        let name = entry.name.clone();
+                        move || format!("file-row:{name}")
+                    })
                     .h(px(26.))
                     .mx_1()
                     .pl(px(8. + depth as f32 * 14.))
@@ -373,6 +377,10 @@ impl Workspace {
                                 .child(letter.to_string())
                                 .into_any_element()
                         })
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        let path = path.clone();
+                        cx.listener(move |s, e: &MouseDownEvent, window, cx| s.file_menu(path.clone(), dir, e.position, window, cx))
                     })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if dir {

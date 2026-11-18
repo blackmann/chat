@@ -41,6 +41,10 @@ impl Selection {
         let (a, b) = (self.anchor?, self.head?);
         Some(if a <= b { (a, b) } else { (b, a) })
     }
+    /// The selection's two ends in order, when it covers anything.
+    pub fn span(&self) -> Option<(Point2, Point2)> {
+        self.ordered().filter(|(a, b)| a != b)
+    }
     pub fn is_empty(&self) -> bool {
         self.ordered().is_none_or(|(a, b)| a == b)
     }
@@ -103,7 +107,12 @@ impl Selection {
     /// click takes the word, a triple click the whole segment. Returns whether
     /// the press landed on text.
     pub fn press(&mut self, position: Point<Pixels>, clicks: usize, extend: bool) -> bool {
-        let Some((key, at)) = self.hit(position, true) else {
+        self.press_at(position, clicks, extend, true)
+    }
+    /// `press`, where `strict` false lets a press beside the text (past a line's
+    /// end, say) land on the nearest text, as code views want.
+    pub fn press_at(&mut self, position: Point<Pixels>, clicks: usize, extend: bool, strict: bool) -> bool {
+        let Some((key, at)) = self.hit(position, strict) else {
             self.clear();
             return false;
         };
@@ -163,11 +172,20 @@ pub struct Selectable {
     text: SharedString,
     state: Shared,
     color: Hsla,
+    cursor: bool,
+}
+
+impl Selectable {
+    /// Whether the text shows the I-beam; off where something else sets the cursor.
+    pub fn cursor(mut self, on: bool) -> Self {
+        self.cursor = on;
+        self
+    }
 }
 
 /// Wrap `child`, which draws a `StyledText` whose layout is `layout`.
 pub fn selectable(state: &Shared, key: Key, layout: TextLayout, text: impl Into<SharedString>, child: AnyElement, color: Hsla) -> Selectable {
-    Selectable { key, child, layout, text: text.into(), state: state.clone(), color }
+    Selectable { key, child, layout, text: text.into(), state: state.clone(), color, cursor: true }
 }
 
 impl IntoElement for Selectable {
@@ -200,7 +218,9 @@ impl Element for Selectable {
             state.segments.insert(self.key, Segment { layout: self.layout.clone(), bounds, text: self.text.clone() });
             state.range(self.key, self.text.len())
         };
-        window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        if self.cursor {
+            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        }
         if let Some(range) = range {
             for rect in highlight(&self.layout, bounds, range) {
                 window.paint_quad(fill(rect, self.color));

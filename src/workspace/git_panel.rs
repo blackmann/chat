@@ -354,7 +354,7 @@ impl Workspace {
     fn worktree_picker(&self, colors: Palette, folder: &Path, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> Div {
         let reported = self.current_thread().and_then(|t| t.worktrees.get(folder)).cloned();
         let main = snapshot.worktrees.first().is_none_or(|w| w.path == snapshot.root);
-        let name = if main { "Main worktree".to_string() } else { crate::model::folder_name(&snapshot.root) };
+        let name = if main { "main".to_string() } else { crate::model::folder_name(&snapshot.root) };
         let following = reported.as_ref().is_some_and(|r| same_dir(r, &snapshot.root));
         let trigger = row()
             .id("worktree-button")
@@ -380,7 +380,7 @@ impl Workspace {
                 let theirs = reported.as_ref().is_some_and(|r| same_dir(r, &tree.path)) || (i == 0 && reported.is_none());
                 let branch = tree.branch.clone().unwrap_or_else(|| "detached".into());
                 let detail = if theirs && reported.is_some() { format!("{branch} · this thread") } else { branch };
-                let title = if i == 0 { "Main worktree".to_string() } else { crate::model::folder_name(&tree.path) };
+                let title = if i == 0 { "main".to_string() } else { crate::model::folder_name(&tree.path) };
                 // The main checkout is the folder itself, keyed as the project knows it.
                 let target = if i == 0 { folder.clone() } else { tree.path.clone() };
                 let (weak, folder) = (weak.clone(), folder.clone());

@@ -16,7 +16,7 @@ pub fn tab_glyph(kind: &TabKind) -> Icon {
         TabKind::Chat => Glyph::Message.into(),
         TabKind::File(_) => Glyph::FileCode.into(),
         TabKind::Diff(_) | TabKind::GitDiff(..) => Glyph::FileDiff.into(),
-        TabKind::Terminal => Glyph::Terminal.into(),
+        TabKind::Terminal(_) => Glyph::Terminal.into(),
         TabKind::ServerLog(..) => Glyph::Zap.into(),
     }
 }
@@ -125,17 +125,33 @@ impl Workspace {
         self.open_popover("project-menu", position, Corner::TopLeft, 200., None, build, window, cx);
     }
 
+    /// A right-click on a file or folder in the Files page.
+    pub(super) fn file_menu(&mut self, path: PathBuf, dir: bool, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let editors = self.editors.clone();
+        let build: crate::menu::Builder = Rc::new(move |_: &App| {
+            let mut entries = vec![open_with_item(&editors, &path, dir)];
+            entries.push(reveal_item(&editors, &path));
+            entries
+        });
+        self.open_popover("file-menu", position, Corner::TopLeft, 200., None, build, window, cx);
+    }
+
     /// The right-click menu on a diff — a row that opens one, or its tab.
     pub(super) fn diff_menu(&mut self, path: PathBuf, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
+        let editors = self.editors.clone();
         let build: crate::menu::Builder = Rc::new(move |_: &App| {
             let open = weak.clone();
             let target = path.clone();
-            vec![crate::menu::Entry::Item(
+            let mut entries = vec![crate::menu::Entry::Item(
                 crate::menu::Item::new("View file").icon(Glyph::FileCode).disabled(!path.is_file()).on_click(move |_, cx| {
                     let _ = open.update(cx, |s, cx| s.open(TabKind::File(target.clone()), cx));
                 }),
-            )]
+            )];
+            if path.is_file() {
+                entries.push(open_with_item(&editors, &path, false));
+            }
+            entries
         });
         self.open_popover("diff-menu", position, Corner::TopLeft, 180., None, build, window, cx);
     }
@@ -147,6 +163,7 @@ impl Workspace {
         let (kind, pinned) = (tab.kind.clone(), tab.pinned);
         let others = self.tabs.iter().any(|t| t.id != id && !t.fixed());
         let weak = cx.weak_entity();
+        let editors = self.editors.clone();
         let build: crate::menu::Builder = Rc::new(move |_: &App| {
             let act = |f: fn(&mut Workspace, usize, &mut Context<Workspace>)| {
                 let weak = weak.clone();
@@ -168,7 +185,12 @@ impl Workspace {
                     }),
                 ));
             }
-            if kind == TabKind::Terminal {
+            if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind
+                && path.is_file()
+            {
+                entries.push(open_with_item(&editors, path, false));
+            }
+            if matches!(kind, TabKind::Terminal(_)) {
                 entries.push(crate::menu::Entry::Item(
                     crate::menu::Item::new(if pinned { "Unpin" } else { "Pin" }).icon(Glyph::Pin).on_click(act(Workspace::toggle_pin)),
                 ));
@@ -399,11 +421,16 @@ impl Workspace {
     pub(super) fn threads_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let project = self.current_project();
-        let q = self.thread_search.read(cx).value().trim().to_lowercase();
+        let query = self.thread_search.read(cx).value().trim().to_string();
+        let q = query.to_lowercase();
+        // Content hits for this query, once the background search is back.
+        let hits = self.thread_hits.as_ref().filter(|r| r.project == self.project && r.query == query);
+        let searching = !q.is_empty() && hits.is_none();
         let mut list = col().py_1();
         let mut shown = 0;
         for (i, t) in project.threads.iter().enumerate() {
-            if !q.is_empty() && !t.title.to_lowercase().contains(&q) {
+            let hit = hits.and_then(|h| h.get(t.id));
+            if !q.is_empty() && hit.is_none() && search::find(&t.title, &q).is_empty() {
                 continue;
             }
             shown += 1;
@@ -436,8 +463,47 @@ impl Workspace {
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                     .on_click(cx.listener(move |s, _, _, cx| s.select_thread(i, cx))),
             );
+            let Some(hit) = hit else { continue };
+            // The paragraphs that matched, under the thread they're from.
+            let mut group = col().mx_1().mb_1().pl(px(30.)).pr_2().gap(px(2.));
+            for (n, snippet) in hit.snippets.iter().enumerate() {
+                let marks = snippet
+                    .marks
+                    .iter()
+                    .map(|m| (m.clone(), HighlightStyle { color: Some(rgb(colors.text).into()), font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() }))
+                    .collect::<Vec<_>>();
+                group = group.child(
+                    div()
+                        .id(SharedString::from(format!("hit-{}-{n}", t.id)))
+                        .px_1()
+                        .py(px(2.))
+                        .rounded(px(4.))
+                        .text_size(px(12.))
+                        .line_height(px(16.))
+                        .text_color(rgb(colors.muted))
+                        .line_clamp(3)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgb(colors.hover)))
+                        .child(StyledText::new(snippet.text.clone()).with_highlights(marks))
+                        .on_click(cx.listener(move |s, _, _, cx| s.select_thread(i, cx))),
+                );
+            }
+            if hit.more > 0 {
+                group = group.child(
+                    div()
+                        .px_1()
+                        .text_size(px(11.))
+                        .text_color(rgb(colors.quiet))
+                        .child(format!("{} more match{}", hit.more, if hit.more == 1 { "" } else { "es" })),
+                );
+            }
+            list = list.child(group);
         }
-        if shown == 0 {
+        if searching {
+            list = list.child(
+                row().h(px(30.)).mx_1().px_2().gap_2().text_color(rgb(colors.muted)).child(row().w(px(14.)).justify_center().child(spinner(colors))).child("Searching…"),
+            );
+        } else if shown == 0 {
             list = list.child(div().p_3().text_color(rgb(colors.muted)).child(if q.is_empty() { "No threads yet" } else { "No matches" }));
         }
         col()
@@ -512,7 +578,11 @@ impl Workspace {
                     };
                     (name.to_string(), detail)
                 }
-                TabKind::Terminal => ("Terminal".to_string(), String::new()),
+                TabKind::Terminal(cwd) => {
+                    // With several folders, which one it's in tells the terminals apart.
+                    let many = self.current_project().roots().len() > 1;
+                    ("Terminal".to_string(), if many { crate::model::folder_name(cwd) } else { String::new() })
+                }
                 TabKind::ServerLog(name, root) => {
                     let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     (format!("{name} logs"), folder)
@@ -606,10 +676,16 @@ impl Workspace {
                     .gap(px(2.))
                     .border_b_1()
                     .border_color(rgb(colors.border))
-                    .child(
-                        icon_button("open-terminal", Glyph::Terminal, "Terminal · ⌃ `")
-                            .on_click(cx.listener(|s, _, _, cx| s.open(TabKind::Terminal, cx))),
-                    )
+                    .child(self.anchor(
+                        TERMINAL_BUTTON,
+                        icon_button(TERMINAL_BUTTON, Glyph::Terminal, "Terminal · ⌃ `").on_click(cx.listener(|s, _, window, cx| {
+                            // Mouse-down outside already closed the folder picker: the click only closes it.
+                            if s.dismissed.take().is_some_and(|(a, at)| a == TERMINAL_BUTTON && at.elapsed() < Duration::from_millis(400)) {
+                                return;
+                            }
+                            s.open_terminal(window, cx)
+                        })),
+                    ))
                     .child(icon_button("new-tab", IconName::Plus, "Open a file").on_click(cx.listener(|s, _, _, cx| {
                         s.side = Side::Files;
                         s.side_open = true;
@@ -641,7 +717,7 @@ impl Workspace {
                     "Nothing is unstaged in this file anymore. This diff is out of date."
                 })
             }
-            TabKind::Chat | TabKind::Terminal | TabKind::ServerLog(..) => None,
+            TabKind::Chat | TabKind::Terminal(_) | TabKind::ServerLog(..) => None,
         }
     }
 
@@ -653,7 +729,7 @@ impl Workspace {
             // With no change to show, the page itself already says why.
             TabKind::Diff(path) => return self.diff_view(path.clone(), window, cx),
             TabKind::GitDiff(path, staged) => self.git_diff_view(path, *staged, window, cx),
-            TabKind::Terminal => return self.terminal_view(cx),
+            TabKind::Terminal(cwd) => return self.terminal_view(cwd, cx),
             TabKind::ServerLog(name, root) => return self.server_log_view(name, root, cx),
         };
         // A Git diff that failed to load already says why in its place.
@@ -775,4 +851,51 @@ impl Workspace {
                 .into_any_element(),
         )
     }
+}
+
+/// The apps `path` can be opened in, then Reveal in Finder.
+pub(super) fn open_with_entries(editors: &crate::editors::Editors, path: &Path, dir: bool) -> Vec<crate::menu::Entry> {
+    let mut entries = editor_entries(editors, path, dir);
+    entries.push(crate::menu::Entry::Separator);
+    entries.push(reveal_item(editors, path));
+    entries
+}
+
+/// The apps `path` can be opened in, each with its icon. A folder is offered
+/// only to editors that open folders.
+fn editor_entries(editors: &crate::editors::Editors, path: &Path, dir: bool) -> Vec<crate::menu::Entry> {
+    use crate::menu::{Entry, Item};
+    let mut entries: Vec<Entry> = editors
+        .list
+        .iter()
+        .filter(|e| !dir || e.folders)
+        .map(|editor| {
+            let (app, target) = (editor.app.clone(), path.to_path_buf());
+            let item = Item::new(editor.name.clone()).on_click(move |_, _| crate::editors::open(&app, &target));
+            Entry::Item(match &editor.icon {
+                Some(png) => item.image(png.clone()),
+                None => item.icon(IconName::ExternalLink),
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        entries.push(Entry::Item(Item::new("No editors found").disabled(true)));
+    }
+    entries
+}
+
+/// "Open with", its apps in a submenu.
+pub(super) fn open_with_item(editors: &Rc<crate::editors::Editors>, path: &Path, dir: bool) -> crate::menu::Entry {
+    let (editors, path) = (editors.clone(), path.to_path_buf());
+    let sub: crate::menu::Builder = Rc::new(move |_: &App| editor_entries(&editors, &path, dir));
+    crate::menu::Entry::Item(crate::menu::Item::new("Open with").icon(IconName::ExternalLink).submenu(sub))
+}
+
+fn reveal_item(editors: &crate::editors::Editors, path: &Path) -> crate::menu::Entry {
+    let target = path.to_path_buf();
+    let item = crate::menu::Item::new("Reveal in Finder").on_click(move |_, cx| cx.reveal_path(&target));
+    crate::menu::Entry::Item(match &editors.finder {
+        Some(png) => item.image(png.clone()),
+        None => item.icon(IconName::FolderOpen),
+    })
 }

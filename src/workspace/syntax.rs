@@ -148,6 +148,34 @@ fn expand_tabs_to(line: &str, width: usize) -> String {
     out
 }
 
+/// The part of `line` that bytes `from..to` of its expanded form (as
+/// `expand_tabs` draws it) show. A tab is taken when any of its spaces are.
+pub fn source_span(line: &str, from: usize, to: usize) -> &str {
+    source_span_to(line, from, to, tab_width())
+}
+
+fn source_span_to(line: &str, from: usize, to: usize, width: usize) -> &str {
+    if !line.contains('\t') {
+        return line.get(from.min(line.len())..to.min(line.len()).max(from.min(line.len()))).unwrap_or_default();
+    }
+    // Walk the line, tracking where each character starts and ends when expanded.
+    let (mut start, mut end) = (line.len(), line.len());
+    let (mut shown, mut column) = (0, 0);
+    for (i, c) in line.char_indices() {
+        let size = if c == '\t' { width - column % width } else { c.len_utf8() };
+        column += if c == '\t' { size } else { 1 };
+        let next = shown + size;
+        if start == line.len() && next > from {
+            start = i;
+        }
+        if next > to && end == line.len() {
+            end = if shown < to && c == '\t' { i + 1 } else { i };
+        }
+        shown = next;
+    }
+    line.get(start..end.max(start)).unwrap_or_default()
+}
+
 /// A text as the lines views draw: no line endings, tabs expanded.
 pub fn lines(text: &str) -> Vec<SharedString> {
     text.lines().map(|l| expand_tabs(l).into()).collect()
@@ -389,5 +417,9 @@ mod tests {
         assert_eq!(expand_tabs_to("\t\tx", 2), "    x");
         assert_eq!(expand_tabs_to("abcd\te", 4), "abcd    e");
         assert_eq!(expand_tabs_to("no tabs", 8), "no tabs");
+        assert_eq!(super::source_span_to("\tlet x", 0, 9, 4), "\tlet x");
+        assert_eq!(super::source_span_to("\tlet x", 4, 7, 4), "let");
+        assert_eq!(super::source_span_to("a\tb", 0, 2, 4), "a\t");
+        assert_eq!(super::source_span_to("café", 0, 5, 4), "café");
     }
 }

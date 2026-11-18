@@ -369,6 +369,24 @@ pub fn connect(
     (command_tx, event_rx, run)
 }
 
+/// Added to the agent's system prompt: in this app a plan belongs in the
+/// Context panel, which is fed by the agent's task-list tools, not in a file.
+const PLANNING_PROMPT: &str = "You are running inside a chat app that shows your task list as the plan in its \
+Context panel. When the user asks you to plan, make a plan, or create a plan, record it with your task-list tools \
+(TodoWrite, or TaskCreate and TaskUpdate), one task per step, and keep their status current as you work. Do not \
+write the plan to a Markdown or other file in the project unless the user explicitly asks for a file or document.";
+
+/// Session `_meta` for the agent. The Claude adapter appends
+/// `systemPrompt.append` to Claude Code's own prompt on new, resumed and
+/// loaded sessions alike.
+fn session_meta(spec: &AgentSpec) -> Option<serde_json::Map<String, serde_json::Value>> {
+    spec.uses_claude_adapter().then(|| {
+        let mut meta = serde_json::Map::new();
+        meta.insert("systemPrompt".into(), serde_json::json!({ "append": PLANNING_PROMPT }));
+        meta
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     spec: AgentSpec,
@@ -403,6 +421,7 @@ async fn run(
         .map(|(args, exe)| McpServer::Stdio(McpServerStdio::new("chat", exe).args(args)))
         .into_iter()
         .collect();
+    let meta = session_meta(&spec);
     let mut agent = AcpAgent::new(config);
     if std::env::var_os("CHAT_ACP_LOG").is_some() {
         agent = agent.with_debug(|line, direction| {
@@ -481,14 +500,14 @@ async fn run(
             // quietly, load replays it.
             let reopened = match previous.clone() {
                 Some(id) if capabilities.session_capabilities.resume.is_some() => connection
-                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone()))
+                    .send_request(ResumeSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone()).meta(meta.clone()))
                     .block_task()
                     .await
                     .ok()
                     .map(|r| (id, r.config_options, r.modes)),
                 Some(id) if capabilities.load_session => {
                     replaying.store(true, Ordering::SeqCst);
-                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone())).block_task().await;
+                    let loaded = connection.send_request(LoadSessionRequest::new(id.clone(), cwd.clone()).additional_directories(extra.clone()).mcp_servers(servers.clone()).meta(meta.clone())).block_task().await;
                     replaying.store(false, Ordering::SeqCst);
                     loaded.ok().map(|r| (id, r.config_options, r.modes))
                 }
@@ -497,7 +516,7 @@ async fn run(
             let (session_id, options, modes, history) = match reopened {
                 Some((id, options, modes)) => (id.into(), options, modes, History::Kept),
                 None => {
-                    let session = connection.send_request(NewSessionRequest::new(cwd).additional_directories(extra).mcp_servers(servers)).block_task().await?;
+                    let session = connection.send_request(NewSessionRequest::new(cwd).additional_directories(extra).mcp_servers(servers).meta(meta)).block_task().await?;
                     let history = if previous.is_some() { History::Lost } else { History::New };
                     (session.session_id, session.config_options, session.modes, history)
                 }

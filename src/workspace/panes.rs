@@ -2,9 +2,11 @@
 use super::ui::*;
 use super::*;
 use crate::icons::Glyph;
-use gpui_component::{ActiveTheme, Icon, scroll::ScrollableElement};
+use gpui_component::{ActiveTheme, Icon, IconName, scroll::ScrollableElement};
 
 const LINE: f32 = 20.;
+/// The file header's Open with button, where its list opens.
+pub(super) const OPEN_WITH: &str = "open-with";
 /// Unchanged lines kept around each change in a diff.
 const CONTEXT: usize = 3;
 
@@ -45,6 +47,11 @@ impl LineSelection {
     fn rows(&self) -> std::ops::RangeInclusive<usize> {
         self.anchor.min(self.head)..=self.anchor.max(self.head)
     }
+}
+
+/// The tint over selected code, as the transcript draws its selection.
+fn text_tint(colors: Palette) -> Hsla {
+    Hsla::from(rgb(colors.blue)).opacity(0.28)
 }
 
 /// Width of the column the line-selection controls sit in.
@@ -217,6 +224,7 @@ fn diff_body(
     offset: Pixels,
     select: Option<Select>,
     decor: Decor,
+    code_text: &select::Shared,
     window: &Window,
 ) -> Option<(Div, usize, f32)> {
     let (before, after) = (syntax::cached(name, old), syntax::cached(name, new));
@@ -283,7 +291,7 @@ fn diff_body(
             _ => None,
         };
         let text = SharedString::from(line.text);
-        let pick = select.as_ref().map(|(this, source, _)| Pick { this: (*this).clone(), source: (*source).clone(), line: text.clone(), row: n, linked });
+        let pick = select.as_ref().map(|(this, source, _)| Pick { this: (*this).clone(), source: (*source).clone(), line: text.clone(), row: n, linked, text: code_text.clone(), tint: text_tint(colors) });
         let cells = code_row(colors, select.as_ref(), n)
             .when_some(bg, |s, bg| s.bg(rgb(bg)))
             .child(div().w(px(3.)).h_full().flex_shrink_0().when_some(bars[n], |s, hue| s.bg(rgb(hue))))
@@ -331,6 +339,9 @@ struct Pick {
     row: usize,
     /// The word under the pointer here is a link (⌘ held).
     linked: bool,
+    /// Text selected in the pane.
+    text: select::Shared,
+    tint: Hsla,
 }
 
 /// The marks code views draw over their lines: the picked symbol and the link
@@ -367,6 +378,12 @@ fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick
     });
     let layout = text.layout().clone();
     let id = pick.as_ref().map_or(0, |p| p.row);
+    let text = match &pick {
+        Some(p) => select::selectable(&p.text, (p.row, 0), layout.clone(), p.line.clone(), text.into_any_element(), p.tint)
+            .cursor(!p.linked)
+            .into_any_element(),
+        None => text.into_any_element(),
+    };
     div()
         .id(("code-cell", id))
         .flex()
@@ -387,6 +404,9 @@ fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick
                 let (source, row) = (source.clone(), *row);
                 this.update(cx, |s, cx| {
                     s.place_cursor(&source, row, cx);
+                    if !m.platform {
+                        s.press_text(&source, e.position, e.click_count, m.shift, window, cx);
+                    }
                     match (m.platform, m.shift, m.alt || m.control) {
                     (true, true, false) => s.find_references_at(source, row, line, at, e.position, window, cx),
                     (true, false, false) => s.go_to_definition_at(source, row, line, at, e.position, window, cx),
@@ -399,7 +419,10 @@ fn code_cell(offset: Pixels, text: StyledText, guides: Guides, pick: Option<Pick
             .on_mouse_move(move |e: &MouseMoveEvent, _, cx| {
                 // The text hasn't been laid out yet on the frame it first shows.
                 let at = l2.index_for_position(e.position).ok();
-                let Pick { this, source, line, row, .. } = &*moved;
+                let Pick { this, source, line, row, text, .. } = &*moved;
+                if text.borrow().dragging {
+                    return;
+                }
                 this.update(cx, |s, cx| s.hover_code(source, *row, line, at, e.modifiers.platform, e.position, cx)).ok();
             })
             .on_hover(move |hovered: &bool, _, cx| {
@@ -575,8 +598,11 @@ impl Workspace {
         let cursor = self.cursor_line.get(&path).copied();
         let blame = git.clone().filter(|_| has_blame && self.show_blame).zip(cursor);
         let now = chrono::Utc::now().timestamp();
+        let code_text = self.code_text_for(&source);
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
+            // Rows paint themselves back in; ones scrolled away must not answer the pointer.
+            code_text.borrow_mut().forget_layout();
             range
                 .map(|i| {
                     let line = file.lines[i].clone();
@@ -585,7 +611,7 @@ impl Workspace {
                     let row_marks = decor.row(&source, i);
                     let linked = row_marks.link.is_some();
                     let marks = symbols::overlay(marks, &line, row_marks, tints);
-                    let pick = Pick { this: this.clone(), source: source.clone(), line: line.clone(), row: i, linked };
+                    let pick = Pick { this: this.clone(), source: source.clone(), line: line.clone(), row: i, linked, text: code_text.clone(), tint: text_tint(colors) };
                     code_row(colors, Some(&(&this, &source, selected.clone())), i)
                         .when_some(flash.as_ref().filter(|(rows, _)| rows.contains(&i)), |s, (_, k)| {
                             s.bg(Hsla::from(rgb(colors.amber)).opacity(0.22 * k))
@@ -637,6 +663,7 @@ impl Workspace {
                         )
                     })
                     .child(label(colors, format!("{count} lines")))
+                    .child(self.open_with_button(&path, cx))
                     .when(has_blame, |s| {
                         s.child(
                             toggle(colors, "file-blame", Glyph::Branch, "Blame", self.show_blame)
@@ -653,9 +680,35 @@ impl Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.scroll_sideways(key, longest, GUTTER + 65., window, list, cx))
-                    .vertical_scrollbar(&scroll),
+                    .vertical_scrollbar(&scroll)
+                    .on_mouse_move(cx.listener(Self::drag_text))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|s, _, _, cx| s.release_text(cx)))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, cx| s.release_text(cx))),
             )
             .into_any_element()
+    }
+
+    /// The header's way out to another editor: a list of the installed ones.
+    fn open_with_button(&self, path: &Path, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let trigger = row()
+            .id(OPEN_WITH)
+            .debug_selector(|| OPEN_WITH.into())
+            .h(px(22.))
+            .px(px(6.))
+            .gap(px(4.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .text_size(px(crate::theme::scaled_ui(12.)))
+            .text_color(rgb(colors.muted))
+            .hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
+            .child(icon(IconName::ExternalLink).size(px(13.)))
+            .child("Open with")
+            .child(icon(IconName::ChevronDown).size(px(12.)));
+        let path = path.to_path_buf();
+        self.popover_trigger(OPEN_WITH, trigger, Corner::TopRight, 220., None, move |s, _, _| {
+            super::chrome::open_with_entries(&s.editors, &path, false)
+        }, cx)
     }
 
     pub(super) fn sideways_offset(&self, key: &SharedString) -> Pixels {
@@ -797,12 +850,18 @@ impl Workspace {
         let this = cx.weak_entity();
         let select = Some((&this, &source, self.selected_rows(&source)));
         let decor = Decor { symbol: self.symbol.as_ref(), link: self.servers.link.as_ref(), tints: tints(colors) };
-        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, decor, window) else {
+        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, decor, &self.code_text_for(&source), window) else {
             return empty(colors, Glyph::FileDiff, "No changes", "The two sides are the same.").into_any_element();
         };
         let scroll = self.sideways.borrow_mut().entry(key.clone()).or_default().scroll.clone();
         let list = div().id(key.clone()).size_full().overflow_y_scroll().track_scroll(&scroll).child(rows);
-        self.scroll_sideways(key, longest, gutter, window, list, cx).vertical_scrollbar(&scroll).into_any_element()
+        self.code_text.borrow_mut().forget_layout();
+        self.scroll_sideways(key, longest, gutter, window, list, cx)
+            .vertical_scrollbar(&scroll)
+            .on_mouse_move(cx.listener(Self::drag_text))
+            .on_mouse_up(MouseButton::Left, cx.listener(|s, _, _, cx| s.release_text(cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, cx| s.release_text(cx)))
+            .into_any_element()
     }
 
     /// Put a file's cursor on line `row`, where its blame shows.
@@ -812,6 +871,91 @@ impl Workspace {
         {
             cx.notify();
         }
+    }
+
+    /// The text selection for a pane showing `source`: a selection made in
+    /// another pane no longer shows.
+    fn code_text_for(&self, source: &LineSource) -> select::Shared {
+        if self.code_text_source.as_ref() != Some(source) {
+            self.code_text.borrow_mut().clear();
+        }
+        self.code_text.clone()
+    }
+
+    /// A press on a line's code: places the text cursor, takes a word on a
+    /// double click and the line on a triple, and extends with shift.
+    fn press_text(&mut self, source: &LineSource, at: Point<Pixels>, clicks: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let same = self.code_text_source.as_ref() == Some(source);
+        if !same {
+            self.code_text.borrow_mut().clear();
+            self.code_text_source = Some(source.clone());
+        }
+        self.line_selection = None;
+        self.selection.borrow_mut().clear();
+        self.code_text.borrow_mut().press_at(at, clicks, extend && same, false);
+        // Away from the composer, so ⌘ C reaches the workspace.
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    fn drag_text(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if e.pressed_button == Some(MouseButton::Left) && self.code_text.borrow_mut().drag(e.position) {
+            cx.notify();
+        }
+    }
+
+    fn release_text(&mut self, cx: &mut Context<Self>) {
+        let mut text = self.code_text.borrow_mut();
+        if text.dragging {
+            text.dragging = false;
+            cx.notify();
+        }
+    }
+
+    /// The code selected in a file or diff pane, as the lines show it.
+    pub(super) fn code_text_selected(&self) -> Option<String> {
+        let (((first, _), from), ((last, _), to)) = self.code_text.borrow().span()?;
+        let source = self.code_text_source.as_ref()?;
+        // Each row as drawn and as written, which differ where tabs were expanded.
+        let lines: Vec<Option<(String, String)>> = match source {
+            LineSource::File(path) => {
+                let Some(Ok(file)) = self.files.get(path) else { return None };
+                let shown = file.lines.get(first..=last.min(file.lines.len().checked_sub(1)?))?;
+                shown.iter().zip(file.text.lines().skip(first)).map(|(s, raw)| Some((s.to_string(), raw.to_string()))).collect()
+            }
+            _ => {
+                let (old, new) = self.diff_sides(source)?;
+                let all = diff_lines(&old, &new);
+                let raw = |text: &str, n: Option<usize>| n.and_then(|n| text.lines().nth(n - 1)).map(str::to_string);
+                // Hunk headers aren't drawn, so they aren't copied.
+                all.get(first..=last.min(all.len().checked_sub(1)?))?
+                    .iter()
+                    .map(|l| match l.kind {
+                        LineKind::Hunk => None,
+                        LineKind::Del => Some((l.text.clone(), raw(&old, l.old).unwrap_or_else(|| l.text.clone()))),
+                        _ => Some((l.text.clone(), raw(&new, l.new).unwrap_or_else(|| l.text.clone()))),
+                    })
+                    .collect()
+            }
+        };
+        let picked: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(k, line)| {
+                let (shown, raw) = line.as_ref()?;
+                let i = first + k;
+                let a = if i == first { from.min(shown.len()) } else { 0 };
+                let b = if i == last { to.min(shown.len()) } else { shown.len() };
+                Some(syntax::source_span(raw, a, b.max(a)))
+            })
+            .collect();
+        Some(picked.join("\n"))
+    }
+
+    /// The rows the code selection runs over, as whole lines to add to the chat.
+    pub(super) fn code_text_lines(&self) -> Option<LineSelection> {
+        let (((first, _), _), ((last, _), _)) = self.code_text.borrow().span()?;
+        Some(LineSelection { source: self.code_text_source.clone()?, anchor: first, head: last, dragging: false })
     }
 
     /// The selected rows, when they are in `source`.
@@ -832,6 +976,7 @@ impl Workspace {
     fn press_line(&mut self, source: LineSource, n: usize, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.place_cursor(&source, n, cx);
         self.selection.borrow_mut().clear();
+        self.code_text.borrow_mut().clear();
         match &mut self.line_selection {
             Some(lines) if extend && lines.source == source => {
                 lines.head = n;
@@ -924,9 +1069,9 @@ impl Workspace {
             .into_any_element()
     }
 
-    pub(super) fn terminal_view(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn terminal_view(&self, cwd: &Path, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        match &self.terminal {
+        match self.terminals.get(cwd) {
             Some(Ok(terminal)) => terminal.clone().into_any_element(),
             Some(Err(error)) => empty(colors, Glyph::Terminal, "Could not start terminal", error.clone()).into_any_element(),
             None => empty(colors, Glyph::Terminal, "Terminal", "Open a terminal to start a shell.").into_any_element(),
