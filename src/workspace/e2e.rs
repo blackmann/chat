@@ -897,3 +897,49 @@ fn selects_text_in_code_panes(cx: &mut TestAppContext) {
     d.settle();
     assert_eq!(selected(&mut d).as_deref(), Some("\tlet again = util::twice(total);"));
 }
+
+/// The agent's questions show as a card: a choice is picked, the "Other" box
+/// takes typing, and Submit sends both back, after which the card shows them.
+#[gpui::test]
+fn answers_the_agents_questions(cx: &mut TestAppContext) {
+    use crate::model::{AskOutcome, Block};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let ws = d.ws.clone();
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| {
+            s.composer.update(cx, |c, cx| c.set_value("ask me a question", window, cx));
+            s.submit(&super::Submit, window, cx);
+        })
+    });
+    let ask = |s: &Workspace| {
+        s.current_thread()?.blocks.iter().find_map(|b| match b {
+            Block::Ask(a) => Some((a.id, a.outcome.is_some())),
+            _ => None,
+        })
+    };
+    d.wait("the question", 30, |d| d.read(|s| ask(s).is_some()));
+    let (id, _) = d.read(|s| ask(s).unwrap());
+    // The card drew, and with it the input for the "Other" box.
+    let other = d.read(|s| s.ask_inputs.iter().find(|((_, a, f), _)| *a == id && f == "question_0_custom").map(|(_, i)| i.clone()));
+    let other = other.expect("the free-text answer gets an input");
+    d.act(|s, cx| s.pick(id, "question_0".into(), "Redis".into(), cx));
+    d.cx.update(|window, cx| other.update(cx, |i, cx| i.set_value("for caching", window, cx)));
+    d.act(|s, cx| s.reply(id, false, cx));
+    let shown = d.read(|s| {
+        s.current_thread().unwrap().blocks.iter().find_map(|b| match b {
+            Block::Ask(a) => match &a.outcome {
+                Some(AskOutcome::Answered(answers)) => Some(answers.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+    });
+    assert_eq!(shown, Some(vec![("Database".into(), "Redis".into()), ("Other".into(), "for caching".into())]));
+    assert!(d.read(|s| s.ask_inputs.is_empty()), "a settled card lets go of its inputs");
+    let said = |s: &Workspace| s.current_thread().unwrap().blocks.iter().any(|b| matches!(b, Block::Text(t) if t.contains(r#""question_0": "Redis""#) && t.contains("for caching")));
+    d.wait("the agent to read the answers", 30, |d| d.read(said));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

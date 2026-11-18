@@ -10,7 +10,8 @@ mod server;
 pub use client::{Client, Incoming};
 pub use registry::{ServerSpec, language_id, root_for};
 #[cfg(test)]
-pub use registry::{proxy_missing, which};
+pub use registry::proxy_missing;
+pub use registry::which;
 pub use registry::{path, unique, uri};
 pub use server::Encoding;
 pub use server::{Server, Status, initialize_params, install_hint};

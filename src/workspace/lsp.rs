@@ -1025,7 +1025,7 @@ impl Workspace {
     // ── Floating bits ───────────────────────────────────────────────────────
 
     /// A short note by the pointer that fades on its own.
-    fn notice(&mut self, text: impl Into<SharedString>, point: Point<Pixels>, cx: &mut Context<Self>) {
+    pub(super) fn notice(&mut self, text: impl Into<SharedString>, point: Point<Pixels>, cx: &mut Context<Self>) {
         self.servers.ticket += 1;
         let ticket = self.servers.ticket;
         self.servers.notice = Some((text.into(), point, ticket));

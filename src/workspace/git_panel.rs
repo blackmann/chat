@@ -245,6 +245,7 @@ impl Workspace {
                 }
                 s.sync_git_watch();
                 // Commits and edits move open files' marks and blame.
+                s.diff_blame.borrow_mut().clear();
                 for path in s.files.keys().cloned().collect::<Vec<_>>() {
                     s.load_file_git(path, cx);
                 }

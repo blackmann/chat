@@ -7,7 +7,11 @@ use alacritty_terminal::{
     index::{Column, Direction, Line, Point as CellPoint},
     selection::{Selection, SelectionType},
     sync::FairMutex,
-    term::{Config, Term, TermMode, cell::Flags},
+    term::{
+        Config, Term, TermMode,
+        cell::Flags,
+        search::{Match, RegexIter, RegexSearch},
+    },
     tty,
     vte::ansi::{Color, CursorShape, NamedColor},
 };
@@ -15,6 +19,8 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use std::sync::Arc;
 
 const HEIGHT: f32 = 20.;
+/// What reads as a URL in plain output; programs can also mark links themselves (OSC 8).
+const URL: &str = r#"(https?://|file://|mailto:|ftp://|ssh://|git://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{}\^`]+"#;
 actions!(terminal, [SendTab, SendBackTab]);
 
 pub fn init_terminal_keys(cx: &mut App) {
@@ -72,6 +78,11 @@ pub(super) struct TerminalView {
     /// The pointer is over the scrollbar.
     bar_hover: bool,
     marked: String,
+    url_search: Option<RegexSearch>,
+    /// Where the pointer last was over the grid, to look again when ⌘ goes down.
+    pointer: Option<Point<Pixels>>,
+    /// The link under the pointer while ⌘ is held: its cells and where it goes.
+    link: Option<(Match, String)>,
     pub(super) request_focus: bool,
     _events: Task<()>,
 }
@@ -165,6 +176,9 @@ impl TerminalView {
                 bar_drag: None,
                 bar_hover: false,
                 marked: String::new(),
+                url_search: RegexSearch::new(URL).ok(),
+                pointer: None,
+                link: None,
                 request_focus: true,
                 _events: events,
             }
@@ -212,6 +226,46 @@ impl TerminalView {
                     .min(self.size.cols - 1),
             ),
         )
+    }
+    /// The link at `point`: one the program marked (OSC 8), or else a URL in the text.
+    fn link_at(&mut self, point: CellPoint) -> Option<(Match, String)> {
+        let term = self.term.lock();
+        let grid = term.grid();
+        if let Some(link) = grid[point].hyperlink() {
+            // Its extent is the run of cells, on this row, carrying the same link.
+            let row = &grid[point.line];
+            let same = |c: usize| row[Column(c)].hyperlink().as_ref() == Some(&link);
+            let mut start = point.column.0;
+            while start > 0 && same(start - 1) {
+                start -= 1;
+            }
+            let mut end = point.column.0;
+            while end + 1 < grid.columns() && same(end + 1) {
+                end += 1;
+            }
+            let span = CellPoint::new(point.line, Column(start))..=CellPoint::new(point.line, Column(end));
+            return Some((span, link.uri().to_string()));
+        }
+        let regex = self.url_search.as_mut()?;
+        let (start, end) = (term.line_search_left(point), term.line_search_right(point));
+        let found = RegexIter::new(start, end, Direction::Right, &term, regex).find(|m| m.contains(&point))?;
+        let text = term.bounds_to_string(*found.start(), *found.end());
+        let url = trim_url(&text);
+        // Trimmed characters are all narrow, one cell each.
+        let cut = text.chars().count() - url.chars().count();
+        let last = found.end().sub(&*term, alacritty_terminal::index::Boundary::Grid, cut);
+        (point <= last).then(|| (*found.start()..=last, url.to_string()))
+    }
+    /// Track the link under the pointer while ⌘ is held, to underline it.
+    fn hover_link(&mut self, held: bool, cx: &mut Context<Self>) {
+        let link = match self.pointer {
+            Some(position) if held && self.bounds.contains(&position) => self.link_at(self.cell(position)),
+            _ => None,
+        };
+        if link.as_ref().map(|l| &l.0) != self.link.as_ref().map(|l| &l.0) {
+            self.link = link;
+            cx.notify();
+        }
     }
     fn key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
@@ -530,6 +584,13 @@ impl Render for TerminalView {
                         cx.listener(|s, e: &MouseDownEvent, window, cx| {
                             s.focus.focus(window);
                             let point = s.cell(e.position);
+                            // ⌘-click opens a link rather than starting a selection.
+                            if e.modifiers.platform {
+                                if let Some((_, url)) = s.link_at(point) {
+                                    cx.open_url(&url);
+                                    return;
+                                }
+                            }
                             let ty = if e.click_count >= 3 {
                                 SelectionType::Lines
                             } else if e.click_count == 2 {
@@ -543,7 +604,12 @@ impl Render for TerminalView {
                             cx.notify();
                         }),
                     )
+                    .on_modifiers_changed(cx.listener(|s, e: &ModifiersChangedEvent, _, cx| {
+                        s.hover_link(e.modifiers.platform, cx)
+                    }))
                     .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
+                        s.pointer = Some(e.position);
+                        s.hover_link(e.modifiers.platform && e.pressed_button.is_none(), cx);
                         if s.selecting && e.pressed_button == Some(MouseButton::Left) {
                             let point = s.cell(e.position);
                             if let Some(selection) = &mut s.term.lock().selection {
@@ -556,6 +622,13 @@ impl Render for TerminalView {
                         MouseButton::Left,
                         cx.listener(|s, _, _, _| s.selecting = false),
                     )
+                    .on_hover(cx.listener(|s, hovered: &bool, _, cx| {
+                        if !hovered {
+                            s.pointer = None;
+                            s.hover_link(false, cx);
+                        }
+                    }))
+                    .when(self.link.is_some(), |s| s.cursor_pointer())
                     .on_scroll_wheel(cx.listener(|s, e: &ScrollWheelEvent, _, cx| {
                         let delta = match e.delta {
                             ScrollDelta::Lines(p) => p.y,
@@ -678,9 +751,8 @@ impl Render for TerminalView {
                                             font,
                                             color: rgb(fg).into(),
                                             background_color: None,
-                                            underline: cell
-                                                .flags
-                                                .intersects(Flags::ALL_UNDERLINES)
+                                            underline: (cell.flags.intersects(Flags::ALL_UNDERLINES)
+                                                || s.link.as_ref().is_some_and(|(span, _)| span.contains(&cell.point)))
                                                 .then_some(UnderlineStyle {
                                                     thickness: px(1.),
                                                     color: Some(rgb(fg).into()),
@@ -733,6 +805,21 @@ impl Render for TerminalView {
     }
 }
 
+/// A URL without the punctuation that usually ends the sentence around it,
+/// nor a closing bracket it doesn't open.
+fn trim_url(text: &str) -> &str {
+    let mut url = text;
+    loop {
+        let Some(last) = url.chars().last() else { return url };
+        let unopened = |open, close| last == close && url.matches(open).count() < url.matches(close).count();
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') || unopened('(', ')') || unopened('[', ']') {
+            url = &url[..url.len() - 1];
+        } else {
+            return url;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,6 +836,14 @@ mod tests {
         assert_eq!(thumb(600., 50, 100, 100).unwrap().0, 0.);
         // Long histories keep a thumb big enough to grab.
         assert_eq!(thumb(600., 50, 100_000, 0).unwrap().1, MIN_THUMB);
+    }
+
+    #[::core::prelude::v1::test]
+    fn urls_drop_the_punctuation_around_them() {
+        assert_eq!(trim_url("https://example.com."), "https://example.com");
+        assert_eq!(trim_url("https://example.com/a),"), "https://example.com/a");
+        assert_eq!(trim_url("https://en.wikipedia.org/wiki/Rust_(language)"), "https://en.wikipedia.org/wiki/Rust_(language)");
+        assert_eq!(trim_url("http://localhost:3000/"), "http://localhost:3000/");
     }
 
     #[::core::prelude::v1::test]

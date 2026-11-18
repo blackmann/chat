@@ -962,6 +962,7 @@ dependencies = [
  "agent-client-protocol",
  "alacritty_terminal",
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "gpui",

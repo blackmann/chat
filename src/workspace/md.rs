@@ -76,6 +76,22 @@ struct Inline {
     links: Vec<(Range<usize>, String)>,
     /// Mentions drawn as chips: their range and icon.
     chips: Vec<(Range<usize>, SharedString)>,
+    /// Local images, drawn below the text: as written, and where they are.
+    images: Vec<(String, std::path::PathBuf)>,
+}
+
+/// Where an image link points on this machine: an absolute path, `~/…` or
+/// `file://…`. Only images GPUI can draw count; other files stay links.
+pub fn local_image(url: &str) -> Option<std::path::PathBuf> {
+    let url = url.strip_prefix('<').and_then(|u| u.strip_suffix('>')).unwrap_or(url);
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        std::path::PathBuf::from(rest.replace("%20", " "))
+    } else if let Some(rest) = url.strip_prefix("~/") {
+        std::env::home_dir()?.join(rest)
+    } else {
+        std::path::PathBuf::from(url)
+    };
+    (path.is_absolute() && super::media::kind(&path) == Some(super::media::Kind::Image)).then_some(path)
 }
 impl Inline {
     fn push(&mut self, s: &str, style: &Style) {
@@ -151,6 +167,7 @@ impl Inline {
                     breaks,
                 ),
                 Node::LinkReference(l) => self.walk(&l.children, style, breaks),
+                Node::Image(i) if let Some(path) = local_image(&i.url) => self.images.push((i.url.clone(), path)),
                 Node::Image(i) => self.push(
                     &format!("[{}]", if i.alt.is_empty() { "image" } else { &i.alt }),
                     &Style {
@@ -173,6 +190,14 @@ impl Inline {
         }
     }
     fn element(mut self, cx: &Ctx) -> AnyElement {
+        let images = std::mem::take(&mut self.images);
+        if images.is_empty() {
+            return self.text_element(cx);
+        }
+        let text = (!self.text.trim().is_empty()).then(|| self.text_element(cx));
+        col().w_full().gap_2().children(text).children(images.into_iter().map(|(url, path)| image(url, path, cx))).into_any_element()
+    }
+    fn text_element(mut self, cx: &Ctx) -> AnyElement {
         let colors = cx.colors;
         let runs = self
             .runs
@@ -290,6 +315,28 @@ impl Element for Chips {
             let _ = window.paint_svg(Bounds { origin: at, size: Size { width: size, height: size } }, icon.clone(), TransformationMatrix::unit(), self.ink, cx);
         }
     }
+}
+
+/// An image in the transcript, at most a comfortable size; clicking it opens
+/// it in a tab, as its link would.
+fn image(url: String, path: std::path::PathBuf, cx: &Ctx) -> AnyElement {
+    let on_link = cx.on_link.clone();
+    div()
+        .id(cx.id("image"))
+        .flex_shrink_0()
+        .max_w_full()
+        .rounded(px(6.))
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(cx.colors.border))
+        .cursor_pointer()
+        .on_click(move |_, window, cx| {
+            if let Some(f) = &on_link {
+                f(&url, window, cx);
+            }
+        })
+        .child(img(path).max_w(px(560.)).max_h(px(420.)).object_fit(ObjectFit::Contain))
+        .into_any_element()
 }
 
 fn inline(nodes: &[Node], cx: &Ctx) -> AnyElement {
@@ -560,6 +607,13 @@ mod tests {
         i.walk(&p.children, &Style::default(), breaks);
         i
     }
+    #[test]
+    fn local_images_leave_the_text() {
+        let i = flatten("See ![chart](/tmp/chart.png) and ![remote](https://x.dev/a.png) and ![v](/tmp/a.mp4)", Breaks::Soft);
+        assert_eq!(i.images, [("/tmp/chart.png".to_string(), std::path::PathBuf::from("/tmp/chart.png"))]);
+        assert_eq!(i.text, "See  and [remote] and [v]");
+    }
+
     #[test]
     fn styles_inline_code_and_links() {
         let i = flatten("Run `cargo test` or see [the docs](https://x.dev) now", Breaks::Soft);

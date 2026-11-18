@@ -2,10 +2,10 @@
 use super::ui::*;
 use super::*;
 use crate::{
-    agent::{Answer, Kind, Status},
+    agent::{Answer, Kind, QuestionKind, Status},
     icons::Glyph,
     menu::{Entry, Item},
-    model::{Permission, ToolCall},
+    model::{Ask, AskOutcome, Permission, ToolCall},
 };
 use gpui_component::{Icon, IconName, Rope, scroll::ScrollableElement, input::{DocumentColorProvider, Input}, tooltip::Tooltip};
 use lsp_types::{Color, ColorInformation, Position, Range};
@@ -166,6 +166,31 @@ fn activity_runs(blocks: &[Block]) -> Vec<std::ops::Range<usize>> {
         runs.push(s..blocks.len());
     }
     runs
+}
+
+/// A choice's mark: a round one for pick-one, a square one for pick-any.
+fn mark(colors: Palette, square: bool, on: bool) -> Div {
+    div()
+        .size(px(13.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(if square { px(3.) } else { px(7.) })
+        .border_1()
+        .border_color(rgb(if on { colors.blue } else { colors.quiet }))
+        .when(on, |s| s.bg(rgb(colors.blue)))
+        .when(on && square, |s| s.child(icon(IconName::Check).size(px(10.)).text_color(rgb(colors.primary_text))))
+        .when(on && !square, |s| s.child(div().size(px(5.)).rounded(px(3.)).bg(rgb(colors.primary_text))))
+}
+
+/// "Question: answer", the question muted.
+fn span_pair(colors: Palette, name: &str, answer: &str) -> Div {
+    row()
+        .items_start()
+        .gap_1()
+        .child(div().flex_shrink_0().text_color(rgb(colors.muted)).child(format!("{name}:")))
+        .child(div().flex_1().min_w_0().child(answer.to_string()))
 }
 
 /// One line for a run of activity, in the order things first happened:
@@ -791,6 +816,169 @@ impl Workspace {
             )
     }
 
+    /// The agent's questions: one-of and many-of choices, yes or no, and
+    /// typed answers, sent together. Once settled, the answers given.
+    fn ask_block(&self, colors: Palette, thread: usize, ask: &Ask, cx: &mut Context<Self>) -> Div {
+        let id = ask.id;
+        let small = px(crate::theme::scaled_ui(12.5));
+        let header = row()
+            .items_start()
+            .gap_2()
+            .child(row().h(px(20.)).child(icon(Glyph::Message).text_color(rgb(if ask.outcome.is_none() { colors.blue } else { colors.quiet }))))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .line_height(relative(1.5))
+                    .when(ask.outcome.is_some(), |s| s.text_color(rgb(colors.muted)))
+                    .child(ask.message.clone()),
+            );
+        let mut body = col().px_3().py(px(8.)).gap(px(10.)).child(header);
+        match &ask.outcome {
+            Some(AskOutcome::Answered(answers)) if !answers.is_empty() => {
+                let mut list = col().pl(px(22.)).gap(px(2.)).text_size(small);
+                for (name, answer) in answers {
+                    list = list.child(
+                        div()
+                            .line_height(relative(1.5))
+                            .child(span_pair(colors, name, answer)),
+                    );
+                }
+                return card(colors).my_1().child(body.child(list));
+            }
+            Some(outcome) => {
+                let said = match outcome {
+                    AskOutcome::Answered(_) => "Sent with no answers",
+                    AskOutcome::Skipped => "Skipped",
+                    AskOutcome::Dismissed => "Dismissed",
+                };
+                return card(colors).my_1().child(body.child(label(colors, said).pl(px(22.))));
+            }
+            None => {}
+        }
+        let several = ask.questions.len() > 1;
+        for q in &ask.questions {
+            let field = q.field.clone();
+            let picked = ask.picks.get(&q.field).cloned().unwrap_or_default();
+            let mut section = col().pl(px(22.)).gap(px(4.));
+            let mut heading = row().gap_1().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.muted));
+            if let Some(title) = &q.title {
+                heading = heading.child(div().font_weight(FontWeight::MEDIUM).child(title.clone()));
+            }
+            if q.required {
+                heading = heading.child(div().text_color(rgb(colors.quiet)).child("required"));
+            }
+            section = section.child(heading);
+            let choice_kind = matches!(q.kind, QuestionKind::Single(_) | QuestionKind::Multi(_) | QuestionKind::Yes);
+            if let Some(prompt) = &q.prompt
+                && choice_kind
+                && (several || q.title.is_none())
+            {
+                section = section.child(div().line_height(relative(1.5)).child(prompt.clone()));
+            }
+            match &q.kind {
+                QuestionKind::Single(choices) | QuestionKind::Multi(choices) => {
+                    let multi = matches!(q.kind, QuestionKind::Multi(_));
+                    for (n, choice) in choices.iter().enumerate() {
+                        let on = picked.contains(&choice.value);
+                        let (field, value) = (field.clone(), choice.value.clone());
+                        section = section.child(
+                            row()
+                                .id(SharedString::from(format!("ask-{thread}-{id}-{}-{n}", q.field)))
+                                .items_start()
+                                .gap_2()
+                                .px_2()
+                                .py(px(5.))
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(rgb(if on { colors.blue } else { colors.border }))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(colors.hover)))
+                                .child(row().h(px(19.)).child(mark(colors, multi, on)))
+                                .child(
+                                    col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .line_height(relative(1.5))
+                                        .child(choice.label.clone())
+                                        .when_some(choice.description.clone(), |s, d| {
+                                            s.child(div().text_size(small).text_color(rgb(colors.muted)).child(d))
+                                        }),
+                                )
+                                .on_click(cx.listener(move |s, _, _, cx| s.pick(id, field.clone(), value.clone(), cx))),
+                        );
+                    }
+                }
+                QuestionKind::Yes => {
+                    let mut buttons = row().gap_2();
+                    for (value, name) in [("true", "Yes"), ("false", "No")] {
+                        let on = picked.iter().any(|p| p == value);
+                        let field = field.clone();
+                        buttons = buttons.child(
+                            row()
+                                .id(SharedString::from(format!("ask-{thread}-{id}-{}-{value}", q.field)))
+                                .h(px(26.))
+                                .px(px(10.))
+                                .gap_1()
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(rgb(if on { colors.blue } else { colors.border }))
+                                .text_size(small)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(colors.hover)))
+                                .child(mark(colors, false, on))
+                                .child(name)
+                                .on_click(cx.listener(move |s, _, _, cx| s.pick(id, field.clone(), value.into(), cx))),
+                        );
+                    }
+                    section = section.child(buttons);
+                }
+                QuestionKind::Text | QuestionKind::Number { .. } => {
+                    if let Some(input) = self.ask_inputs.get(&(thread, id, q.field.clone())) {
+                        section = section.child(
+                            div()
+                                .px_2()
+                                .py(px(3.))
+                                .rounded(px(5.))
+                                .border_1()
+                                .border_color(rgb(colors.border))
+                                .child(Input::new(input).appearance(false).p_0()),
+                        );
+                    }
+                }
+            }
+            body = body.child(section);
+        }
+        if let Some(error) = self.ask_errors.get(&(thread, id)) {
+            body = body.child(div().pl(px(22.)).text_size(small).text_color(rgb(colors.red)).child(error.clone()));
+        }
+        let button = |name: &'static str, primary: bool| {
+            row()
+                .id(SharedString::from(format!("ask-{thread}-{id}-{name}")))
+                .h(px(26.))
+                .px(px(10.))
+                .rounded(px(5.))
+                .text_size(small)
+                .cursor_pointer()
+                .map(|s| {
+                    if primary {
+                        s.bg(rgb(colors.blue)).text_color(rgb(colors.primary_text)).font_weight(FontWeight::MEDIUM).hover(|s| s.opacity(0.9))
+                    } else {
+                        s.border_1().border_color(rgb(colors.border)).hover(|s| s.bg(rgb(colors.hover)))
+                    }
+                })
+                .child(name)
+        };
+        body = body.child(
+            row()
+                .pl(px(22.))
+                .gap_2()
+                .child(button("Submit", true).on_click(cx.listener(move |s, _, _, cx| s.reply(id, false, cx))))
+                .child(button("Skip", false).on_click(cx.listener(move |s, _, _, cx| s.reply(id, true, cx)))),
+        );
+        card(colors).my_1().border_color(rgb(colors.blue)).child(body)
+    }
+
     /// What a finished turn left behind, with the way into reviewing it.
     fn changes_card(&self, colors: Palette, files: usize, adds: usize, dels: usize, cx: &mut Context<Self>) -> Div {
         card(colors).mt_2().child(
@@ -1054,6 +1242,7 @@ impl Workspace {
                 Block::Thought(text) => self.thought_block(colors, thread.id, i, text, cx),
                 Block::Tool(tool) => self.tool_block(window, colors, thread.id, i, tool, cx),
                 Block::Permission(permission) => self.permission_block(colors, permission, cx),
+                Block::Ask(ask) => self.ask_block(colors, thread.id, ask, cx),
                 Block::Notice(text) => row()
                     .items_start()
                     .py(px(4.))

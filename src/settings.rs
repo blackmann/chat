@@ -10,9 +10,9 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum FollowUpMode {
     /// Hold the message until the current turn finishes.
-    #[default]
     Queue,
     /// Deliver the message to the running turn immediately.
+    #[default]
     Steer,
 }
 
@@ -143,9 +143,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn old_settings_default_to_queue_mode() {
+    fn old_settings_default_to_steer_mode() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings.follow_up_mode, FollowUpMode::Queue);
+        assert_eq!(settings.follow_up_mode, FollowUpMode::Steer);
     }
 
     #[test]
@@ -170,9 +170,9 @@ mod tests {
 
     #[test]
     fn follow_up_mode_round_trips() {
-        let settings = Settings { follow_up_mode: FollowUpMode::Steer, ..Default::default() };
+        let settings = Settings { follow_up_mode: FollowUpMode::Queue, ..Default::default() };
         let restored: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
-        assert_eq!(restored.follow_up_mode, FollowUpMode::Steer);
+        assert_eq!(restored.follow_up_mode, FollowUpMode::Queue);
     }
 
     #[test]

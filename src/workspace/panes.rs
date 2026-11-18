@@ -25,8 +25,30 @@ pub(super) struct DiffLine {
     pub text: String,
 }
 
+/// Blame for both sides of a diff pane, and which texts it was read for.
+#[derive(Clone)]
+pub(super) struct DiffBlame {
+    sides: (u64, u64),
+    old: Option<Rc<crate::git::FileInfo>>,
+    new: Option<Rc<crate::git::FileInfo>>,
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// Where a diff pane's cursor is, and what to say about who wrote that line.
+pub(super) struct Cursor {
+    row: usize,
+    blame: Option<DiffBlame>,
+    now: i64,
+}
+
 /// The pane whose lines are selected.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum LineSource {
     File(PathBuf),
     /// A file's change in the current thread.
@@ -225,6 +247,7 @@ fn diff_body(
     select: Option<Select>,
     decor: Decor,
     code_text: &select::Shared,
+    cursor: Option<Cursor>,
     window: &Window,
 ) -> Option<(Div, usize, f32)> {
     let (before, after) = (syntax::cached(name, old), syntax::cached(name, new));
@@ -284,12 +307,23 @@ fn diff_body(
             None => marks,
         };
         let selected = select.as_ref().and_then(|(_, _, rows)| rows.as_ref()).is_some_and(|rows| rows.contains(&n));
+        let here = cursor.as_ref().filter(|c| c.row == n);
         let bg = match line.kind {
             _ if selected => Some(colors.selected),
             LineKind::Add => Some(colors.green_tint),
             LineKind::Del => Some(colors.red_tint),
+            _ if here.is_some() => Some(colors.hover),
             _ => None,
         };
+        // A removed line was last written in the old side; the rest, in the new.
+        let note = here.and_then(|c| {
+            let blame = c.blame.as_ref()?;
+            let (side, at) = match line.kind {
+                LineKind::Del => (blame.old.as_deref()?, line.old?),
+                _ => (blame.new.as_deref()?, line.new?),
+            };
+            blame_note(colors, side, at - 1, c.now)
+        });
         let text = SharedString::from(line.text);
         let pick = select.as_ref().map(|(this, source, _)| Pick { this: (*this).clone(), source: (*source).clone(), line: text.clone(), row: n, linked, text: code_text.clone(), tint: text_tint(colors) });
         let cells = code_row(colors, select.as_ref(), n)
@@ -297,7 +331,7 @@ fn diff_body(
             .child(div().w(px(3.)).h_full().flex_shrink_0().when_some(bars[n], |s, hue| s.bg(rgb(hue))))
             // Removed lines have no place in the new file, so no number.
             .child(number(colors, if line.kind == LineKind::Del { None } else { line.new }, width).pr_3())
-            .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(levels[n]), pick, None));
+            .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(levels[n]), pick, note));
         rows = rows.child(cells);
     }
     let gutter = if select.is_some() { GUTTER } else { 0. };
@@ -570,6 +604,9 @@ impl Workspace {
 
     pub(super) fn file_view(&self, path: PathBuf, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
+        if let Some(media) = self.media.get(&path) {
+            return self.media_view(&path, media, cx);
+        }
         let relative = self.relative(&path);
         let file = match self.files.get(&path) {
             Some(Ok(file)) => file.clone(),
@@ -595,10 +632,11 @@ impl Workspace {
         let tints = tints(colors);
         let git = self.file_git.get(&path).cloned();
         let has_blame = git.as_ref().is_some_and(|g| !g.blame.is_empty());
-        let cursor = self.cursor_line.get(&path).copied();
+        let cursor = self.cursor_line.get(&source).copied();
         let blame = git.clone().filter(|_| has_blame && self.show_blame).zip(cursor);
         let now = chrono::Utc::now().timestamp();
         let code_text = self.code_text_for(&source);
+        let file_path = path.clone();
         // Only the lines on screen are built, so long files stay cheap.
         let list = uniform_list(key.clone(), count, move |range, _, _| {
             // Rows paint themselves back in; ones scrolled away must not answer the pointer.
@@ -617,6 +655,15 @@ impl Workspace {
                             s.bg(Hsla::from(rgb(colors.amber)).opacity(0.22 * k))
                         })
                         .when(cursor == Some(i), |s| s.bg(rgb(colors.hover)))
+                        .on_mouse_down(MouseButton::Right, {
+                            let (this, path, selected) = (this.clone(), file_path.clone(), selected.clone());
+                            move |e: &MouseDownEvent, window, cx| {
+                                // The lines picked, when the press is on them; else this one.
+                                let rows = selected.clone().filter(|rows| rows.contains(&i)).unwrap_or(i..=i);
+                                let lines = (rows.start() + 1, rows.end() + 1);
+                                this.update(cx, |s, cx| s.code_menu(path.clone(), lines, e.position, window, cx)).ok();
+                            }
+                        })
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
                         .child(number(colors, Some(i + 1), 44.).mr_2())
                         .child(change_bar(colors, git.as_ref().and_then(|g| g.marks.get(i).copied().flatten())))
@@ -850,7 +897,14 @@ impl Workspace {
         let this = cx.weak_entity();
         let select = Some((&this, &source, self.selected_rows(&source)));
         let decor = Decor { symbol: self.symbol.as_ref(), link: self.servers.link.as_ref(), tints: tints(colors) };
-        let Some((rows, longest, gutter)) = diff_body(colors, &name, old, new, self.sideways_offset(&key), select, decor, &self.code_text_for(&source), window) else {
+        let cursor = self.cursor_line.get(&source).map(|&row| Cursor {
+            row,
+            blame: self.show_blame.then(|| self.diff_blame_for(&source, old, new, cx)).flatten(),
+            now: chrono::Utc::now().timestamp(),
+        });
+        let Some((rows, longest, gutter)) =
+            diff_body(colors, &name, old, new, self.sideways_offset(&key), select, decor, &self.code_text_for(&source), cursor, window)
+        else {
             return empty(colors, Glyph::FileDiff, "No changes", "The two sides are the same.").into_any_element();
         };
         let scroll = self.sideways.borrow_mut().entry(key.clone()).or_default().scroll.clone();
@@ -864,13 +918,45 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// Put a file's cursor on line `row`, where its blame shows.
+    /// Put a pane's cursor on row `row`, where its blame shows.
     fn place_cursor(&mut self, source: &LineSource, row: usize, cx: &mut Context<Self>) {
-        if let LineSource::File(path) = source
-            && self.cursor_line.insert(path.clone(), row) != Some(row)
-        {
+        if self.cursor_line.insert(source.clone(), row) != Some(row) {
             cx.notify();
         }
+    }
+
+    /// Blame for a diff pane's sides, as last read; reads it again in the
+    /// background when the sides have changed since.
+    fn diff_blame_for(&self, source: &LineSource, old: &str, new: &str, cx: &mut Context<Self>) -> Option<DiffBlame> {
+        let (LineSource::Diff(path) | LineSource::GitDiff(path, _)) = source else { return None };
+        let sides = (hash_text(old), hash_text(new));
+        let mut all = self.diff_blame.borrow_mut();
+        match all.get(source) {
+            Some(known) if known.sides == sides => return Some(known.clone()),
+            _ => {}
+        }
+        // Marked as read, so the frames until it lands don't read it again.
+        all.insert(source.clone(), DiffBlame { sides, old: None, new: None });
+        let (source, path, old, new) = (source.clone(), path.clone(), old.to_owned(), new.to_owned());
+        cx.spawn(async move |this, cx| {
+            let read = cx.background_executor().spawn(async move {
+                // A new file has no old side worth blaming.
+                let old = (!old.is_empty()).then(|| crate::git::blame_text(&path, &old)).flatten();
+                (old, crate::git::blame_text(&path, &new))
+            });
+            let (old, new) = read.await;
+            let (old, new) = (old.map(Rc::new), new.map(Rc::new));
+            let _ = this.update(cx, |s, cx| {
+                let mut all = s.diff_blame.borrow_mut();
+                // Unless the sides moved on meanwhile.
+                if let Some(known) = all.get_mut(&source).filter(|k| k.sides == sides) {
+                    (known.old, known.new) = (old, new);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        None
     }
 
     /// The text selection for a pane showing `source`: a selection made in

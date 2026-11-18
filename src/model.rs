@@ -1,6 +1,6 @@
 //! Projects, threads and what a thread has gathered from its agent. A thread is
 //! a fold over the agent's events; every panel reads from it.
-use crate::agent::{Answer, Command, Event, Failure, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
+use crate::agent::{Answer, Command, Question, QuestionKind, Reply, Event, Failure, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
 use serde::{Deserialize, Serialize};
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{SharedString, Task};
@@ -11,7 +11,7 @@ pub enum ThreadState {
     /// Nothing asked yet, or the last turn was stopped.
     Idle,
     Running,
-    /// The agent is waiting on a permission answer.
+    /// The agent is waiting on a permission answer or on its questions.
     Waiting,
     Done,
     Failed,
@@ -42,6 +42,106 @@ pub struct Permission {
     pub answers: Vec<Answer>,
     /// The answer given, by name; `None` while the agent waits.
     pub chosen: Option<String>,
+}
+
+/// Questions the agent asked, with what's been picked so far.
+#[derive(Serialize, Deserialize)]
+pub struct Ask {
+    pub id: u64,
+    pub message: String,
+    pub questions: Vec<Question>,
+    /// What's picked so far, by field; text fields are read from their inputs.
+    pub picks: std::collections::BTreeMap<String, Vec<String>>,
+    /// `None` while the agent waits.
+    pub outcome: Option<AskOutcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum AskOutcome {
+    /// Each answered question, by its label, and the answer as shown.
+    Answered(Vec<(String, String)>),
+    Skipped,
+    Dismissed,
+}
+
+impl Ask {
+    /// How a question is named in its answer: its label, else its prompt, else its key.
+    pub fn label(question: &Question) -> String {
+        question.title.clone().or_else(|| question.prompt.clone()).unwrap_or_else(|| question.field.clone())
+    }
+    /// Tap a choice: picks it for a one-of question (tapping it again clears
+    /// it), toggles it for a many-of one.
+    pub fn toggle(&mut self, field: &str, value: &str) {
+        let Some(question) = self.questions.iter().find(|q| q.field == field) else { return };
+        let picks = self.picks.entry(field.to_string()).or_default();
+        let had = picks.iter().any(|p| p == value);
+        match question.kind {
+            QuestionKind::Multi(_) => {
+                if had {
+                    picks.retain(|p| p != value);
+                } else {
+                    picks.push(value.to_string());
+                }
+            }
+            _ => {
+                picks.clear();
+                if !had {
+                    picks.push(value.to_string());
+                }
+            }
+        }
+    }
+    /// The replies to send, given what's typed in each text field; `Err`
+    /// names a required question left blank or a number that isn't one.
+    pub fn replies(&self, typed: impl Fn(&str) -> String) -> Result<Vec<(String, Reply)>, String> {
+        let mut replies = Vec::new();
+        for q in &self.questions {
+            let picks = self.picks.get(&q.field).cloned().unwrap_or_default();
+            let reply = match &q.kind {
+                QuestionKind::Single(_) => picks.into_iter().next().map(Reply::Text),
+                QuestionKind::Multi(_) => (!picks.is_empty()).then_some(Reply::Picks(picks)),
+                QuestionKind::Yes => picks.first().map(|p| Reply::Yes(p == "true")),
+                QuestionKind::Text => Some(typed(&q.field).trim().to_string()).filter(|t| !t.is_empty()).map(Reply::Text),
+                QuestionKind::Number { integer } => {
+                    let text = typed(&q.field).trim().to_string();
+                    if text.is_empty() {
+                        None
+                    } else if *integer {
+                        Some(Reply::Integer(text.parse().map_err(|_| format!("{} needs a whole number", Self::label(q)))?))
+                    } else {
+                        Some(Reply::Number(text.parse().map_err(|_| format!("{} needs a number", Self::label(q)))?))
+                    }
+                }
+            };
+            match reply {
+                Some(reply) => replies.push((q.field.clone(), reply)),
+                None if q.required => return Err(format!("{} needs an answer", Self::label(q))),
+                None => {}
+            }
+        }
+        Ok(replies)
+    }
+    /// The answers as they read in the transcript once sent.
+    pub fn shown(&self, replies: &[(String, Reply)]) -> Vec<(String, String)> {
+        replies
+            .iter()
+            .filter_map(|(field, reply)| {
+                let q = self.questions.iter().find(|q| &q.field == field)?;
+                let name = |v: &String| match &q.kind {
+                    QuestionKind::Single(c) | QuestionKind::Multi(c) => c.iter().find(|c| &c.value == v).map_or(v.clone(), |c| c.label.clone()),
+                    _ => v.clone(),
+                };
+                let text = match reply {
+                    Reply::Text(t) => name(t),
+                    Reply::Picks(p) => p.iter().map(name).collect::<Vec<_>>().join(", "),
+                    Reply::Yes(y) => if *y { "Yes" } else { "No" }.into(),
+                    Reply::Integer(n) => n.to_string(),
+                    Reply::Number(n) => n.to_string(),
+                };
+                Some((Self::label(q), text))
+            })
+            .collect()
+    }
 }
 
 /// Milliseconds since the Unix epoch, by the wall clock.
@@ -89,6 +189,7 @@ pub enum Block {
     Thought(String),
     Tool(ToolCall),
     Permission(Permission),
+    Ask(Ask),
     /// Something the app has to say: a stop, a failure.
     Notice(String),
     /// The agent isn't signed in, with the command that signs it in when there is one.
@@ -245,7 +346,20 @@ impl Thread {
             {
                 p.chosen = Some("Dismissed".into());
             }
+            if let Block::Ask(a) = block
+                && a.outcome.is_none()
+            {
+                a.outcome = Some(AskOutcome::Dismissed);
+            }
         }
+    }
+    /// Whether a permission or a question still waits on the user.
+    pub fn awaiting_user(&self) -> bool {
+        self.blocks.iter().any(|b| match b {
+            Block::Permission(p) => p.chosen.is_none(),
+            Block::Ask(a) => a.outcome.is_none(),
+            _ => false,
+        })
     }
     /// Close the running turn with when it ended and how long it took.
     fn stamp_turn(&mut self) {
@@ -363,6 +477,10 @@ impl Thread {
             }
             Event::Permission { id, title, answers, .. } => {
                 self.blocks.push(Block::Permission(Permission { id, title, answers, chosen: None }));
+                self.state = ThreadState::Waiting;
+            }
+            Event::Ask { id, message, questions } => {
+                self.blocks.push(Block::Ask(Ask { id, message, questions, picks: Default::default(), outcome: None }));
                 self.state = ThreadState::Waiting;
             }
             Event::TurnEnded(result) => {
@@ -659,6 +777,39 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!((changes[0].old.as_deref(), changes[0].new.as_str()), (Some("a\nb\n"), "a\nB\nc\n"));
         assert_eq!((changes[0].adds, changes[0].dels), (2, 1));
+    }
+
+    #[test]
+    fn questions_gather_picks_and_check_whats_required() {
+        use crate::agent::{Pick, Question};
+        let pick = |v: &str| Pick { value: v.into(), label: v.to_uppercase(), description: None };
+        let question = |field: &str, kind, required| Question { field: field.into(), title: Some(field.into()), prompt: None, kind, required };
+        let mut t = Thread::new(1, 0);
+        t.state = ThreadState::Running;
+        t.apply(Event::Ask { id: 7, message: "?".into(), questions: vec![
+            question("one", QuestionKind::Single(vec![pick("a"), pick("b")]), true),
+            question("many", QuestionKind::Multi(vec![pick("x"), pick("y")]), false),
+            question("n", QuestionKind::Number { integer: true }, false),
+        ]});
+        assert!(t.state == ThreadState::Waiting && t.awaiting_user());
+        let Some(Block::Ask(ask)) = t.blocks.last_mut() else { panic!() };
+        assert_eq!(ask.replies(|_| String::new()), Err("one needs an answer".into()));
+        ask.toggle("one", "a");
+        ask.toggle("one", "b");
+        ask.toggle("many", "x");
+        ask.toggle("many", "y");
+        ask.toggle("many", "x");
+        assert_eq!(ask.replies(|_| "two".into()), Err("n needs a whole number".into()));
+        let replies = ask.replies(|_| " 2 ".into()).unwrap();
+        assert_eq!(replies, [
+            ("one".into(), Reply::Text("b".into())),
+            ("many".into(), Reply::Picks(vec!["y".into()])),
+            ("n".into(), Reply::Integer(2)),
+        ]);
+        assert_eq!(ask.shown(&replies), [("one".into(), "B".into()), ("many".into(), "Y".into()), ("n".into(), "2".into())]);
+        t.apply(Event::TurnEnded(Ok(Stop::Cancelled)));
+        assert!(!t.awaiting_user());
+        assert!(matches!(&t.blocks[0], Block::Ask(a) if matches!(a.outcome, Some(AskOutcome::Dismissed))));
     }
 
     #[test]

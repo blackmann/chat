@@ -128,9 +128,13 @@ impl Workspace {
     /// A right-click on a file or folder in the Files page.
     pub(super) fn file_menu(&mut self, path: PathBuf, dir: bool, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let editors = self.editors.clone();
+        let weak = cx.weak_entity();
         let build: crate::menu::Builder = Rc::new(move |_: &App| {
             let mut entries = vec![open_with_item(&editors, &path, dir)];
             entries.push(reveal_item(&editors, &path));
+            if !dir {
+                entries.extend(link_entries(&weak, &path, None, position));
+            }
             entries
         });
         self.open_popover("file-menu", position, Corner::TopLeft, 200., None, build, window, cx);
@@ -150,6 +154,7 @@ impl Workspace {
             )];
             if path.is_file() {
                 entries.push(open_with_item(&editors, &path, false));
+                entries.extend(link_entries(&weak, &path, None, position));
             }
             entries
         });
@@ -189,6 +194,7 @@ impl Workspace {
                 && path.is_file()
             {
                 entries.push(open_with_item(&editors, path, false));
+                entries.extend(link_entries(&weak, path, None, position));
             }
             if matches!(kind, TabKind::Terminal(_)) {
                 entries.push(crate::menu::Entry::Item(
@@ -204,6 +210,30 @@ impl Workspace {
             entries
         });
         self.open_popover("tab-menu", position, Corner::TopLeft, 180., None, build, window, cx);
+    }
+
+    /// A right-click on a file's code: links to the lines picked, or the one under the pointer.
+    pub(super) fn code_menu(&mut self, path: PathBuf, lines: (usize, usize), position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let build: crate::menu::Builder = Rc::new(move |_: &App| {
+            let mut entries = link_entries(&weak, &path, Some(lines), position);
+            if entries.is_empty() {
+                entries.push(crate::menu::Entry::Item(crate::menu::Item::new("Not in a Git repository").disabled(true)));
+            }
+            entries
+        });
+        self.open_popover("code-menu", position, Corner::TopLeft, 200., None, build, window, cx);
+    }
+
+    /// Copy a link to `path` on its remote, saying how it went by the pointer.
+    fn copy_link(&mut self, path: &Path, lines: Option<(usize, usize)>, permalink: bool, point: Point<Pixels>, cx: &mut Context<Self>) {
+        match crate::git::remote_link(path, lines, permalink) {
+            Ok(url) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(url));
+                self.notice(if permalink { "Permalink copied" } else { "Link copied" }, point, cx);
+            }
+            Err(why) => self.notice(why, point, cx),
+        }
     }
 
     pub(super) fn title(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -889,6 +919,26 @@ pub(super) fn open_with_item(editors: &Rc<crate::editors::Editors>, path: &Path,
     let (editors, path) = (editors.clone(), path.to_path_buf());
     let sub: crate::menu::Builder = Rc::new(move |_: &App| editor_entries(&editors, &path, dir));
     crate::menu::Entry::Item(crate::menu::Item::new("Open with").icon(IconName::ExternalLink).submenu(sub))
+}
+
+/// "Copy link" (to the branch HEAD tracks) and "Copy permalink" (to HEAD's
+/// commit), for a file in a Git repository; nothing otherwise.
+fn link_entries(weak: &WeakEntity<Workspace>, path: &Path, lines: Option<(usize, usize)>, point: Point<Pixels>) -> Vec<crate::menu::Entry> {
+    if !path.ancestors().skip(1).any(|dir| dir.join(".git").exists()) {
+        return Vec::new();
+    }
+    let item = |label: &'static str, permalink: bool| {
+        let (weak, path) = (weak.clone(), path.to_path_buf());
+        crate::menu::Entry::Item(crate::menu::Item::new(label).icon(IconName::ExternalLink).on_click(move |_, cx| {
+            let _ = weak.update(cx, |s, cx| s.copy_link(&path, lines, permalink, point, cx));
+        }))
+    };
+    let (link, permalink) = match lines {
+        Some((a, b)) if a == b => ("Copy link to line", "Copy permalink to line"),
+        Some(_) => ("Copy link to lines", "Copy permalink to lines"),
+        None => ("Copy link", "Copy permalink"),
+    };
+    vec![crate::menu::Entry::Separator, item(link, false), item(permalink, true)]
 }
 
 fn reveal_item(editors: &crate::editors::Editors, path: &Path) -> crate::menu::Entry {

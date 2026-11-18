@@ -8,7 +8,9 @@ use agent_client_protocol::{
     v1::{
         ConnectionTo,
         schema::{
-            CancelNotification, ContentBlock, McpServer, McpServerStdio, Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+            CancelNotification, ClientCapabilities, ContentBlock, CreateElicitationRequest, CreateElicitationResponse,
+            ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities, ElicitationContentValue,
+            ElicitationFormCapabilities, ElicitationMode, ElicitationPropertySchema, MultiSelectItems, McpServer, McpServerStdio, Implementation, InitializeRequest, LoadSessionRequest, NewSessionRequest,
             PermissionOptionKind, PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
             RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
             SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionNotification,
@@ -23,13 +25,13 @@ use futures::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     ffi::OsStr,
     future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -201,6 +203,88 @@ pub struct Answer {
     pub allow: bool,
 }
 
+/// One field of a form the agent asks the user to fill in, such as one of
+/// Claude's questions.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    /// The key its answer goes back under.
+    pub field: String,
+    /// A short label (Claude's question header).
+    pub title: Option<String>,
+    /// The question itself, or what to type.
+    pub prompt: Option<String>,
+    pub kind: QuestionKind,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum QuestionKind {
+    /// Pick one.
+    Single(Vec<Pick>),
+    /// Pick any.
+    Multi(Vec<Pick>),
+    Text,
+    Yes,
+    Number { integer: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pick {
+    /// What goes back when it's picked.
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// An answer to one field of a form.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Reply {
+    Text(String),
+    Picks(Vec<String>),
+    Yes(bool),
+    Integer(i64),
+    Number(f64),
+}
+
+/// The fields of a form request the app can draw; `None` when one can't be,
+/// since a form missing a field it requires can't be answered.
+fn questions(mode: ElicitationMode) -> Option<Vec<Question>> {
+    let ElicitationMode::Form(form) = mode else { return None };
+    let required = form.requested_schema.required.unwrap_or_default();
+    let mut questions = Vec::new();
+    for (field, property) in form.requested_schema.properties {
+        let choices = |options: Vec<agent_client_protocol::v1::schema::EnumOption>| {
+            options.into_iter().map(|o| Pick { value: o.value, label: o.title, description: o.description }).collect()
+        };
+        let plain = |values: Vec<String>| values.into_iter().map(|v| Pick { value: v.clone(), label: v, description: None }).collect();
+        let (title, prompt, kind) = match property {
+            ElicitationPropertySchema::String(s) => {
+                let kind = match (s.one_of, s.enum_values) {
+                    (Some(options), _) => QuestionKind::Single(choices(options)),
+                    (None, Some(values)) => QuestionKind::Single(plain(values)),
+                    (None, None) => QuestionKind::Text,
+                };
+                (s.title, s.description, kind)
+            }
+            ElicitationPropertySchema::Array(a) => {
+                let options = match a.items {
+                    MultiSelectItems::Titled(t) => choices(t.options),
+                    MultiSelectItems::String(s) => plain(s.values),
+                    _ => return None,
+                };
+                (a.title, a.description, QuestionKind::Multi(options))
+            }
+            ElicitationPropertySchema::Boolean(b) => (b.title, b.description, QuestionKind::Yes),
+            ElicitationPropertySchema::Number(n) => (n.title, n.description, QuestionKind::Number { integer: false }),
+            ElicitationPropertySchema::Integer(n) => (n.title, n.description, QuestionKind::Number { integer: true }),
+            _ if !required.contains(&field) => continue,
+            _ => return None,
+        };
+        questions.push(Question { required: required.contains(&field), field, title, prompt, kind });
+    }
+    Some(questions)
+}
+
 /// What became of a thread's earlier conversation when its session opened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum History {
@@ -313,6 +397,8 @@ pub enum Event {
     Title(String),
     /// The agent wants a decision before it goes on.
     Permission { id: u64, tool: String, title: String, answers: Vec<Answer> },
+    /// The agent asks questions (a form) before it goes on.
+    Ask { id: u64, message: String, questions: Vec<Question> },
     /// The turn is over; `Err` carries why it failed.
     TurnEnded(Result<Stop, Failure>),
     /// The steering request settled independently of the running turn.
@@ -347,6 +433,8 @@ pub enum Command {
     Set { setting: String, choice: String },
     /// Answer a permission request; `None` dismisses it.
     Answer { id: u64, answer: Option<String> },
+    /// Answer an `Ask`; `None` skips it, leaving every question unanswered.
+    Reply { id: u64, replies: Option<Vec<(String, Reply)>> },
 }
 
 /// Open a connection: returns the command and event ends, and the future that
@@ -374,7 +462,11 @@ pub fn connect(
 const PLANNING_PROMPT: &str = "You are running inside a chat app that shows your task list as the plan in its \
 Context panel. When the user asks you to plan, make a plan, or create a plan, record it with your task-list tools \
 (TodoWrite, or TaskCreate and TaskUpdate), one task per step, and keep their status current as you work. Do not \
-write the plan to a Markdown or other file in the project unless the user explicitly asks for a file or document.";
+write the plan to a Markdown or other file in the project unless the user explicitly asks for a file or document.
+
+The chat draws images inline. To show the user an image file (a screenshot, a chart, a rendered design), write a \
+Markdown image with its absolute path, such as ![chart](/abs/path/chart.png); PNG, JPEG, GIF, WebP, BMP and TIFF \
+are drawn. Do this only when seeing the image helps the user, not for every image you touch.";
 
 /// Session `_meta` for the agent. The Claude adapter appends
 /// `systemPrompt.append` to Claude Code's own prompt on new, resumed and
@@ -398,8 +490,16 @@ async fn run(
     mut commands: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) -> Result<(), agent_client_protocol::Error> {
-    let mut config = AcpAgentConfig::new(&spec.command).args(spec.args.iter().cloned());
-    if let Some(path) = shell_path() {
+    let path = shell_path();
+    // Found here rather than at spawn, so a missing command is named along with
+    // where it was looked for instead of surfacing as a bare "os error 2".
+    let Some(command) = crate::lsp::which(&spec.command, path.as_deref()) else {
+        let searched = path.or_else(|| std::env::var("PATH").ok()).unwrap_or_default();
+        let message = format!("`{}` wasn't found on PATH ({searched})", spec.command);
+        return Err(agent_client_protocol::Error::new(ErrorCode::INTERNAL_ERROR, message));
+    };
+    let mut config = AcpAgentConfig::new(command).args(spec.args.iter().cloned());
+    if let Some(path) = path {
         config = config.env("PATH", path);
     }
     // Claude Code leaves its task-list tools out for newer models unless asked;
@@ -435,10 +535,12 @@ async fn run(
     }
     // Permission requests wait here until the user answers.
     let waiting = Arc::new(Mutex::new(HashMap::new()));
+    // And questions, likewise; both share one run of ids.
+    let asking = Arc::new(Mutex::new(HashMap::new()));
+    let next_id = Arc::new(AtomicU64::new(0));
     // Loading a session replays it as updates; the transcript is already on
     // screen, so those are dropped until the load answers.
     let replaying = Arc::new(AtomicBool::new(false));
-    let mut next_permission = 0u64;
     Client
         .v1()
         .name("chat")
@@ -459,12 +561,12 @@ async fn run(
         )
         .on_receive_request(
             {
-                let (events, waiting) = (events.clone(), waiting.clone());
+                let (events, waiting, next_id) = (events.clone(), waiting.clone(), next_id.clone());
                 async move |request: RequestPermissionRequest, responder, _cx| {
-                    next_permission += 1;
-                    waiting.lock().unwrap().insert(next_permission, responder);
+                    let id = next_id.fetch_add(1, Ordering::SeqCst) + 1;
+                    waiting.lock().unwrap().insert(id, responder);
                     let _ = events.unbounded_send(Event::Permission {
-                        id: next_permission,
+                        id,
                         tool: request.tool_call.tool_call_id.to_string(),
                         title: request.tool_call.fields.title.clone().unwrap_or_else(|| "Allow this action?".into()),
                         answers: request
@@ -487,11 +589,33 @@ async fn run(
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let (events, asking, next_id) = (events.clone(), asking.clone(), next_id.clone());
+                async move |request: CreateElicitationRequest, responder, _cx| {
+                    let Some(questions) = questions(request.mode) else {
+                        // Only forms are advertised; anything else can't be shown.
+                        let _ = responder.respond(CreateElicitationResponse::new(ElicitationAction::Decline));
+                        return Ok(());
+                    };
+                    let id = next_id.fetch_add(1, Ordering::SeqCst) + 1;
+                    asking.lock().unwrap().insert(id, responder);
+                    let _ = events.unbounded_send(Event::Ask { id, message: request.message, questions });
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
             let ready = connection
                 .send_request(
                     InitializeRequest::new(ProtocolVersion::V1)
-                        .client_info(Implementation::new("chat", env!("CARGO_PKG_VERSION"))),
+                        .client_info(Implementation::new("chat", env!("CARGO_PKG_VERSION")))
+                        // Forms are how the agent asks questions (Claude's AskUserQuestion).
+                        .client_capabilities(
+                            ClientCapabilities::new()
+                                .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new())),
+                        ),
                 )
                 .block_task()
                 .await?;
@@ -579,6 +703,9 @@ async fn run(
                         for (_, responder) in waiting.lock().unwrap().drain() {
                             let _ = responder.respond(RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled));
                         }
+                        for (_, responder) in asking.lock().unwrap().drain() {
+                            let _ = responder.respond(CreateElicitationResponse::new(ElicitationAction::Cancel));
+                        }
                         connection.send_notification(CancelNotification::new(session_id.clone()))?;
                     }
                     Command::Answer { id, answer } => {
@@ -587,6 +714,29 @@ async fn run(
                                 Some(option) => RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(option)),
                                 None => RequestPermissionOutcome::Cancelled,
                             }));
+                        }
+                    }
+                    Command::Reply { id, replies } => {
+                        if let Some(responder) = asking.lock().unwrap().remove(&id) {
+                            let action = match replies {
+                                Some(replies) => {
+                                    let content: BTreeMap<String, ElicitationContentValue> = replies
+                                        .into_iter()
+                                        .map(|(field, reply)| {
+                                            (field, match reply {
+                                                Reply::Text(text) => ElicitationContentValue::String(text),
+                                                Reply::Picks(picks) => ElicitationContentValue::StringArray(picks),
+                                                Reply::Yes(yes) => ElicitationContentValue::Boolean(yes),
+                                                Reply::Integer(n) => ElicitationContentValue::Integer(n),
+                                                Reply::Number(n) => ElicitationContentValue::Number(n),
+                                            })
+                                        })
+                                        .collect();
+                                    ElicitationAction::Accept(ElicitationAcceptAction::new().content(content))
+                                }
+                                None => ElicitationAction::Decline,
+                            };
+                            let _ = responder.respond(CreateElicitationResponse::new(action));
                         }
                     }
                     Command::Set { setting, choice } => {
@@ -681,8 +831,45 @@ fn settings(options: Vec<SessionConfigOption>, modes: Option<SessionModeState>) 
 fn text(block: ContentBlock) -> Option<String> {
     match block {
         ContentBlock::Text(t) => Some(t.text),
+        // Images reach the transcript as Markdown, which draws local ones.
+        ContentBlock::Image(i) => {
+            let path = save_image(&i.data, &i.mime_type)?;
+            Some(format!("\n\n![image](<{}>)\n\n", path.display()))
+        }
+        ContentBlock::ResourceLink(link) if is_image(&link.uri) => Some(format!("\n\n![{}](<{}>)\n\n", link.name, link.uri)),
         _ => None,
     }
+}
+
+fn is_image(uri: &str) -> bool {
+    let ext = uri.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff")
+}
+
+/// Write an agent's image to disk, named by its contents so a resumed thread
+/// that replays it finds the same file.
+fn save_image(data: &str, mime: &str) -> Option<PathBuf> {
+    use base64::Engine;
+    use std::hash::{Hash, Hasher};
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => return None,
+    };
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hash);
+    let dir = crate::settings::dir().unwrap_or_else(std::env::temp_dir).join("images");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{:016x}.{ext}", hash.finish()));
+    if !path.exists() {
+        std::fs::write(&path, bytes).ok()?;
+    }
+    Some(path)
 }
 
 fn patch(fields: ToolCallUpdateFields) -> ToolPatch {
@@ -857,6 +1044,75 @@ mod tests {
         assert_eq!(other.failure(refused()), Failure::SignedOut { agent: "Mock".into(), command: None });
         let broken = agent_client_protocol::Error::from(ErrorCode::INTERNAL_ERROR);
         assert!(matches!(claude.failure(broken), Failure::Other(_)));
+    }
+
+    #[test]
+    fn reads_claudes_questions_from_a_form() {
+        let request: CreateElicitationRequest = serde_json::from_value(serde_json::json!({
+            "sessionId": "s", "toolCallId": "t", "mode": "form", "message": "Pick",
+            "requestedSchema": { "type": "object", "required": ["question_1"], "properties": {
+                "question_0": { "type": "string", "title": "Db", "oneOf": [{ "const": "pg", "title": "Postgres", "description": "SQL" }] },
+                "question_0_custom": { "type": "string", "title": "Other", "description": "Type your own" },
+                "question_1": { "type": "array", "description": "Which?", "items": { "anyOf": [{ "const": "a", "title": "A" }] } },
+                "question_2": { "type": "boolean" },
+                "question_3": { "type": "integer" },
+            }},
+        }))
+        .unwrap();
+        let questions = questions(request.mode).unwrap();
+        let kinds: Vec<_> = questions.iter().map(|q| (q.field.as_str(), &q.kind, q.required)).collect();
+        let pg = Pick { value: "pg".into(), label: "Postgres".into(), description: Some("SQL".into()) };
+        let a = Pick { value: "a".into(), label: "A".into(), description: None };
+        assert_eq!(kinds, [
+            ("question_0", &QuestionKind::Single(vec![pg]), false),
+            ("question_0_custom", &QuestionKind::Text, false),
+            ("question_1", &QuestionKind::Multi(vec![a]), true),
+            ("question_2", &QuestionKind::Yes, false),
+            ("question_3", &QuestionKind::Number { integer: true }, false),
+        ]);
+        assert_eq!(questions[1].prompt.as_deref(), Some("Type your own"));
+    }
+
+    #[test]
+    fn answers_the_mock_agents_question() {
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mock-agent.py");
+        if std::process::Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let spec = AgentSpec::new("Mock", "python3", &[script]);
+        let (commands, mut events, run) = connect(spec, std::env::temp_dir(), Vec::new(), None, Vec::new(), None);
+        std::thread::spawn(move || block_on(run));
+        let mut next = move || block_on(events.next()).expect("connection closed early");
+        for skip in [false, true] {
+            commands.unbounded_send(Command::Prompt("ask me a question".into())).unwrap();
+            let mut said = String::new();
+            loop {
+                match next() {
+                    Event::Ask { id, message, questions } => {
+                        assert_eq!(message, "Which database?");
+                        assert!(matches!(&questions[0].kind, QuestionKind::Single(p) if p.len() == 2));
+                        let replies = (!skip).then(|| vec![
+                            ("question_0".to_string(), Reply::Text("Redis".into())),
+                            ("question_0_custom".to_string(), Reply::Text("for caching".into())),
+                        ]);
+                        commands.unbounded_send(Command::Reply { id, replies }).unwrap();
+                    }
+                    Event::Text(t) => said.push_str(&t),
+                    Event::TurnEnded(result) => {
+                        assert_eq!(result, Ok(Stop::Finished));
+                        break;
+                    }
+                    Event::Closed(why) => panic!("closed: {why:?}"),
+                    _ => {}
+                }
+            }
+            let expected = if skip {
+                r#"Answer: {"action": "decline"}"#
+            } else {
+                r#"Answer: {"action": "accept", "content": {"question_0": "Redis", "question_0_custom": "for caching"}}"#
+            };
+            assert_eq!(said.trim(), expected);
+        }
     }
 
     #[test]

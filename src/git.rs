@@ -149,6 +149,11 @@ fn command(root: &Path) -> Command {
         .arg("-C")
         .arg(root)
         .env("GIT_OPTIONAL_LOCKS", "0");
+    // Hooks (husky's pre-commit, pre-push) run tools like pnpm that live on the
+    // shell's PATH, not the bare one an app from the Dock starts with.
+    if let Some(path) = crate::agent::shell_path() {
+        cmd.env("PATH", path);
+    }
     cmd
 }
 fn checked(output: std::io::Result<Output>) -> Result<Vec<u8>, String> {
@@ -471,6 +476,35 @@ pub fn file_info(file: &Path) -> Option<FileInfo> {
     Some(FileInfo { marks, commits, blame })
 }
 
+/// Blame for `text` as if it were `file`'s contents, which may differ from
+/// what's on disk: a diff's old or new side. Lines HEAD doesn't have are
+/// uncommitted. `None` outside a repository or for a file HEAD doesn't have.
+pub fn blame_text(file: &Path, text: &str) -> Option<FileInfo> {
+    use std::io::Write;
+    // The file may be gone, as one a diff deletes, but its folder usually isn't.
+    let folder = std::fs::canonicalize(file.parent()?).ok()?;
+    let top = run(&folder, &["rev-parse", "--show-toplevel"]).ok()?;
+    let root = path(top.trim_ascii_end());
+    let relative = folder.join(file.file_name()?);
+    let relative = relative.strip_prefix(&root).ok()?;
+    let mut child = command(&root)
+        .args(["blame", "--porcelain", "--contents", "-", "--"])
+        .arg(relative)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let text = text.to_owned();
+    // Written alongside the read, so a large file can't fill both pipes.
+    let writer = std::thread::spawn(move || stdin.write_all(text.as_bytes()));
+    let out = checked(child.wait_with_output()).ok()?;
+    let _ = writer.join();
+    let (commits, blame) = parse_blame(&out);
+    Some(FileInfo { marks: Vec::new(), commits, blame })
+}
+
 pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
     match operation {
         Operation::Stage(paths) | Operation::Unstage(paths) if paths.is_empty() => return Ok(()),
@@ -521,8 +555,127 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
     Ok(())
 }
 
+// ── Links to the remote ─────────────────────────────────────────────────────
+
+/// A repository's web home, from a remote URL in any of git's spellings:
+/// `git@host:owner/repo.git`, `ssh://git@host:22/owner/repo`, `https://user@host/owner/repo.git`.
+fn web_base(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let (host, path) = if let Some((_, rest)) = remote.split_once("://") {
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+        // An ssh port isn't the web one.
+        let host = if remote.starts_with("http") { host } else { host.split(':').next()? };
+        (host, path)
+    } else {
+        // scp-like: [user@]host:path
+        let (authority, path) = remote.split_once(':')?;
+        (authority.rsplit_once('@').map_or(authority, |(_, h)| h), path)
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    // GitHub's ssh-over-https host serves the same repositories.
+    let host = if host == "ssh.github.com" { "github.com" } else { host };
+    Some(format!("https://{host}/{path}"))
+}
+
+/// Percent-encodes what can't sit in a URL path as is, keeping `/`.
+fn encode_path(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The page showing `path` at `reference`, its lines (1-based) marked as each
+/// host spells them.
+fn web_url(base: &str, reference: &str, commit: bool, path: &str, lines: Option<(usize, usize)>) -> String {
+    let host = base.trim_start_matches("https://").split('/').next().unwrap_or_default();
+    let (reference, path) = (encode_path(reference), encode_path(path));
+    let range = |first: usize, last: usize, sep: &str, again: &str| {
+        if first == last { format!("{first}") } else { format!("{first}{sep}{again}{last}") }
+    };
+    if host.contains("gitlab") {
+        let hash = lines.map(|(a, b)| format!("#L{}", range(a, b, "-", ""))).unwrap_or_default();
+        format!("{base}/-/blob/{reference}/{path}{hash}")
+    } else if host.contains("bitbucket") {
+        let hash = lines.map(|(a, b)| format!("#lines-{}", range(a, b, ":", ""))).unwrap_or_default();
+        format!("{base}/src/{reference}/{path}{hash}")
+    } else if host.contains("codeberg") || host.contains("gitea") || host.contains("forgejo") {
+        let kind = if commit { "commit" } else { "branch" };
+        let hash = lines.map(|(a, b)| format!("#L{}", range(a, b, "-", "L"))).unwrap_or_default();
+        format!("{base}/src/{kind}/{reference}/{path}{hash}")
+    } else {
+        // GitHub, and the many hosts that copy its layout.
+        let hash = lines.map(|(a, b)| format!("#L{}", range(a, b, "-", "L"))).unwrap_or_default();
+        format!("{base}/blob/{reference}/{path}{hash}")
+    }
+}
+
+/// A link to `file` (and `lines`, 1-based) on its repository's remote. It
+/// names the branch the remote tracks for HEAD, or — as a `permalink`, or when
+/// the branch isn't on the remote — the commit HEAD is at.
+pub fn remote_link(file: &Path, lines: Option<(usize, usize)>, permalink: bool) -> Result<String, String> {
+    let dir = if file.is_dir() { file } else { file.parent().ok_or("No folder.")? };
+    let text = |root: &Path, args: &[&str]| run(root, args).map(|out| String::from_utf8_lossy(&out).trim().to_owned());
+    let root = PathBuf::from(text(dir, &["rev-parse", "--show-toplevel"]).map_err(|_| "Not in a Git repository.")?);
+    let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let relative = canonical(file)
+        .strip_prefix(canonical(&root))
+        .map_err(|_| "Outside the repository.")?
+        .to_string_lossy()
+        .into_owned();
+    // `origin/feature/x`: the remote, then its name for the branch.
+    let upstream = text(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).ok().filter(|u| !u.is_empty());
+    let remotes = text(&root, &["remote"]).unwrap_or_default();
+    let remotes: Vec<&str> = remotes.lines().collect();
+    let tracked = upstream.as_deref().and_then(|u| {
+        let remote = remotes.iter().filter(|r| u.starts_with(&format!("{r}/"))).max_by_key(|r| r.len())?;
+        Some((remote.to_string(), u[remote.len() + 1..].to_string()))
+    });
+    let remote = match &tracked {
+        Some((remote, _)) => remote.clone(),
+        None if remotes.contains(&"origin") => "origin".into(),
+        None => remotes.first().ok_or("This repository has no remote.")?.to_string(),
+    };
+    let url = text(&root, &["remote", "get-url", &remote])?;
+    let base = web_base(&url).ok_or_else(|| format!("Can't make a web link from {url}"))?;
+    let (reference, commit) = match tracked {
+        Some((_, branch)) if !permalink => (branch, false),
+        _ => (text(&root, &["rev-parse", "HEAD"]).map_err(|_| "Nothing has been committed yet.")?, true),
+    };
+    Ok(web_url(&base, &reference, commit, &relative, lines))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_links_from_remote_urls() {
+        for url in [
+            "git@github.com:blackmann/chat.git",
+            "ssh://git@ssh.github.com:443/blackmann/chat.git",
+            "https://token@github.com/blackmann/chat",
+            "https://github.com/blackmann/chat.git/",
+        ] {
+            assert_eq!(web_base(url).as_deref(), Some("https://github.com/blackmann/chat"), "{url}");
+        }
+        assert_eq!(web_base("https://gitlab.example.com:8443/group/sub/repo.git").as_deref(), Some("https://gitlab.example.com:8443/group/sub/repo"));
+        assert_eq!(web_base("/local/path"), None);
+        let gh = "https://github.com/o/r";
+        assert_eq!(web_url(gh, "main", false, "src/a b.rs", Some((3, 7))), "https://github.com/o/r/blob/main/src/a%20b.rs#L3-L7");
+        assert_eq!(web_url(gh, "feat/x", false, "a.rs", Some((3, 3))), "https://github.com/o/r/blob/feat/x/a.rs#L3");
+        assert_eq!(web_url("https://gitlab.com/o/r", "main", false, "a.rs", Some((3, 7))), "https://gitlab.com/o/r/-/blob/main/a.rs#L3-7");
+        assert_eq!(web_url("https://bitbucket.org/o/r", "abc", true, "a.rs", Some((3, 7))), "https://bitbucket.org/o/r/src/abc/a.rs#lines-3:7");
+        assert_eq!(web_url("https://codeberg.org/o/r", "abc", true, "a.rs", None), "https://codeberg.org/o/r/src/commit/abc/a.rs");
+    }
+
     use super::*;
     struct Repo(PathBuf);
     impl Repo {
@@ -731,6 +884,23 @@ mod tests {
         let info = file_info(&r.0.join("new")).unwrap();
         assert_eq!(info.marks, [Some(Mark::Added)]);
         assert!(info.blame.is_empty());
+    }
+    #[test]
+    fn blame_text_blames_given_contents() {
+        let r = Repo::new();
+        r.write("a", "one\ntwo\n");
+        r.stage("a");
+        r.commit();
+        // Neither the file on disk nor HEAD: a diff's side, with a line of its own.
+        r.write("a", "something else\n");
+        let info = blame_text(&r.0.join("a"), "one\nnew\ntwo\n").unwrap();
+        let commit = |n: usize| &info.commits[info.blame[n].unwrap()];
+        assert_eq!(info.blame.len(), 3);
+        assert!(commit(0).committed() && commit(2).committed());
+        assert!(!commit(1).committed());
+        // A deleted file's old side still blames, from its folder.
+        std::fs::remove_file(r.0.join("a")).unwrap();
+        assert!(blame_text(&r.0.join("a"), "one\ntwo\n").unwrap().commits[0].committed());
     }
     #[test]
     fn status_reads_upstream_and_ahead() {

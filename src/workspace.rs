@@ -6,6 +6,7 @@ mod effort;
 mod file_kind;
 mod chrome;
 mod md;
+mod media;
 mod mentions;
 mod panes;
 mod preferences;
@@ -120,6 +121,8 @@ struct ProjectView {
     terminals: Terminals,
     /// The thread that was showing, by id: indexes shift as threads are added.
     thread: Option<usize>,
+    /// The folder picked on the Changes page.
+    git_repo: Option<PathBuf>,
 }
 
 /// Shells by the folder each started in, or why one couldn't start.
@@ -184,12 +187,16 @@ pub struct Workspace {
     listings: HashMap<PathBuf, Vec<Entry>>,
     /// The lines of each file open in a tab, or why it couldn't be shown.
     files: HashMap<PathBuf, Result<Rc<FileView>, SharedString>>,
+    /// Open images and videos, shown as pictures rather than lines.
+    media: HashMap<PathBuf, media::Media>,
     /// Where each open file is scrolled, so a link can jump to a line.
     file_scroll: HashMap<PathBuf, UniformListScrollHandle>,
     /// Each open file's changes since HEAD and blame, read in the background.
     file_git: HashMap<PathBuf, Rc<crate::git::FileInfo>>,
-    /// The line last clicked in each open file, where its blame shows.
-    cursor_line: HashMap<PathBuf, usize>,
+    /// The row last clicked in each file or diff pane, where its blame shows.
+    cursor_line: HashMap<panes::LineSource, usize>,
+    /// Blame for each diff pane's two sides, read in the background.
+    diff_blame: RefCell<HashMap<panes::LineSource, panes::DiffBlame>>,
     /// File views show who last changed the cursor's line.
     show_blame: bool,
     /// Lines a link jumped to, lit briefly so the eye finds them.
@@ -288,6 +295,10 @@ pub struct Workspace {
     /// The project being renamed, and the field its new name is typed in.
     renaming: Option<usize>,
     rename_input: Entity<InputState>,
+    /// The text fields of questions still waiting, by thread, question set and field.
+    ask_inputs: HashMap<(usize, u64, String), Entity<InputState>>,
+    /// Why a set of questions couldn't be sent yet, by thread and question set.
+    ask_errors: HashMap<(usize, u64), String>,
     rename_position: Point<Pixels>,
     /// The thread the composer's text belongs to, and what other threads had
     /// typed when they were left: text and the files mentioned in it.
@@ -380,9 +391,11 @@ impl Workspace {
             expanded: HashSet::new(),
             listings: HashMap::new(),
             files: HashMap::new(),
+            media: HashMap::new(),
             file_scroll: HashMap::new(),
             file_git: HashMap::new(),
             cursor_line: HashMap::new(),
+            diff_blame: RefCell::new(HashMap::new()),
             show_blame: true,
             flash: None,
             terminals: HashMap::new(),
@@ -444,6 +457,8 @@ impl Workspace {
             effort_dragging: false,
             renaming: None,
             rename_input,
+            ask_inputs: HashMap::new(),
+            ask_errors: HashMap::new(),
             rename_position: Point::default(),
             draft_owner: None,
             drafts: HashMap::new(),
@@ -544,13 +559,13 @@ impl Workspace {
             expanded: std::mem::take(&mut self.expanded),
             terminals: std::mem::take(&mut self.terminals),
             thread: self.current_thread().map(|t| t.id),
+            git_repo: self.git_repo.take(),
         };
         self.views.insert(self.project, leaving);
         let inputs = (self.commit_message.read(cx).value().to_string(), self.thread_search.read(cx).value().to_string());
         self.project_inputs.insert(self.project, inputs);
         self.restore_project_inputs = true;
         self.project = index;
-        self.git_repo = None;
         let back = self.views.remove(&index);
         let thread = back.as_ref().and_then(|v| v.thread);
         match back {
@@ -558,6 +573,7 @@ impl Workspace {
                 self.tabs = view.tabs;
                 self.expanded = view.expanded;
                 self.terminals = view.terminals;
+                self.git_repo = view.git_repo;
                 self.active = view.active.min(self.tabs.len().saturating_sub(1));
             }
             None => {
@@ -1000,11 +1016,100 @@ impl Workspace {
             }
         }
         thread.send(Command::Answer { id, answer: answer.map(|(id, _)| id) });
-        let waiting = thread.blocks.iter().any(|b| matches!(b, Block::Permission(p) if p.chosen.is_none()));
-        if !waiting && thread.state == ThreadState::Waiting {
+        if !thread.awaiting_user() && thread.state == ThreadState::Waiting {
             thread.state = ThreadState::Running;
         }
         cx.notify();
+    }
+    /// Pick or unpick one choice of a question the agent asked.
+    fn pick(&mut self, ask: u64, field: String, value: String, cx: &mut Context<Self>) {
+        let Some(thread) = self.current_thread_mut() else { return };
+        let id = thread.id;
+        for block in &mut thread.blocks {
+            if let Block::Ask(a) = block
+                && a.id == ask
+                && a.outcome.is_none()
+            {
+                a.toggle(&field, &value);
+            }
+        }
+        self.ask_errors.remove(&(id, ask));
+        cx.notify();
+    }
+    /// Send the answers to a set of questions, or with `skip`, decline them.
+    fn reply(&mut self, ask: u64, skip: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.current_thread().map(|t| t.id) else { return };
+        let typed: HashMap<String, String> = self
+            .ask_inputs
+            .iter()
+            .filter(|((t, a, _), _)| *t == id && *a == ask)
+            .map(|((_, _, field), input)| (field.clone(), input.read(cx).value().to_string()))
+            .collect();
+        let Some(thread) = self.current_thread_mut() else { return };
+        let Some(a) = thread.blocks.iter_mut().find_map(|b| match b {
+            Block::Ask(a) if a.id == ask && a.outcome.is_none() => Some(a),
+            _ => None,
+        }) else {
+            return;
+        };
+        let replies = if skip {
+            None
+        } else {
+            match a.replies(|field| typed.get(field).cloned().unwrap_or_default()) {
+                Ok(replies) => Some(replies),
+                Err(error) => {
+                    self.ask_errors.insert((id, ask), error);
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        a.outcome = Some(match &replies {
+            Some(replies) => crate::model::AskOutcome::Answered(a.shown(replies)),
+            None => crate::model::AskOutcome::Skipped,
+        });
+        thread.send(Command::Reply { id: ask, replies });
+        if !thread.awaiting_user() && thread.state == ThreadState::Waiting {
+            thread.state = ThreadState::Running;
+        }
+        self.ask_errors.remove(&(id, ask));
+        self.ask_inputs.retain(|(t, a, _), _| !(*t == id && *a == ask));
+        self.save_soon(cx);
+        cx.notify();
+    }
+    /// Give each text field of the showing thread's waiting questions an input,
+    /// and let go of those whose questions are settled.
+    fn prepare_ask_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.current_thread() else { return };
+        let id = thread.id;
+        let mut wanted = Vec::new();
+        for block in &thread.blocks {
+            if let Block::Ask(a) = block
+                && a.outcome.is_none()
+            {
+                for q in &a.questions {
+                    if matches!(q.kind, agent::QuestionKind::Text | agent::QuestionKind::Number { .. }) {
+                        wanted.push((a.id, q.field.clone(), q.prompt.clone()));
+                    }
+                }
+            }
+        }
+        self.ask_inputs.retain(|(t, a, f), _| *t != id || wanted.iter().any(|(w, g, _)| w == a && g == f));
+        for (ask, field, prompt) in wanted {
+            let key = (id, ask, field);
+            if self.ask_inputs.contains_key(&key) {
+                continue;
+            }
+            let placeholder = prompt.unwrap_or_else(|| "Type an answer…".into());
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+            cx.subscribe_in(&input, window, move |s, _, e: &gpui_component::input::InputEvent, _, cx| {
+                if let gpui_component::input::InputEvent::PressEnter { .. } = e {
+                    s.reply(ask, false, cx);
+                }
+            })
+            .detach();
+            self.ask_inputs.insert(key, input);
+        }
     }
     fn stop(&mut self, cx: &mut Context<Self>) {
         if let Some(thread) = self.current_thread() {
@@ -1055,9 +1160,15 @@ impl Workspace {
             self.terminals.insert(cwd.clone(), view);
         }
         if let TabKind::File(path) = &kind {
-            self.files.insert(path.clone(), read_lines(path));
-            self.file_scroll.entry(path.clone()).or_default();
-            self.load_file_git(path.clone(), cx);
+            if let Some(media) = media::kind(path) {
+                // Kept so the tab counts as open, but never read as text.
+                self.files.insert(path.clone(), Err("This file isn't text.".into()));
+                self.open_media(path.clone(), media, cx);
+            } else {
+                self.files.insert(path.clone(), read_lines(path));
+                self.file_scroll.entry(path.clone()).or_default();
+                self.load_file_git(path.clone(), cx);
+            }
         }
         // A diff's file goes to its server too, so its lines can be looked up.
         if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind {
@@ -1158,6 +1269,7 @@ impl Workspace {
         let kind = self.tabs.remove(index).kind;
         if let TabKind::File(path) = &kind {
             self.files.remove(path);
+            self.media.remove(path);
             self.file_scroll.remove(path);
             self.file_git.remove(path);
         }
@@ -1419,6 +1531,7 @@ impl Render for Workspace {
         if window.focused(cx).is_none() {
             self.focus.focus(window);
         }
+        self.prepare_ask_inputs(window, cx);
         if std::mem::take(&mut self.clear_composer) {
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         }

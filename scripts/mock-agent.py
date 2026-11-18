@@ -23,6 +23,7 @@ replies = {}  # request id -> (event, result holder), for requests we send
 next_id = [1000]
 state = {"model": "large", "effort": "high", "mode": "ask"}
 turns = [0]
+client = {"forms": False}  # what the client said it can do
 
 
 def send(message):
@@ -149,6 +150,19 @@ def turn(rid, session, prompt, cwd):
             for i, p in enumerate(plan)
         ]})
 
+    if "question" in prompt.lower() and client["forms"]:
+        # Asked the way the Claude adapter forwards AskUserQuestion: one pick-one
+        # question and its free-text "Other" companion.
+        answer = ask("elicitation/create", {"sessionId": session, "mode": "form", "message": "Which database?",
+                                            "requestedSchema": {"type": "object", "properties": {
+                                                "question_0": {"type": "string", "title": "Database", "oneOf": [
+                                                    {"const": "Postgres", "title": "Postgres", "description": "Relational"},
+                                                    {"const": "Redis", "title": "Redis"}]},
+                                                "question_0_custom": {"type": "string", "title": "Other",
+                                                                      "description": "Type your own answer (optional)."}}}})
+        say(session, "agent_message_chunk", "Answer: " + json.dumps(answer, sort_keys=True))
+        return finish(rid, session)
+
     if "explain" in prompt.lower():
         # A long written answer, to exercise Markdown and scrolling.
         for line in ESSAY.split("\n"):
@@ -216,6 +230,7 @@ def main():
                 holder["result"] = message.get("result")
                 done.set()
         elif method == "initialize":
+            client["forms"] = "form" in ((params.get("clientCapabilities") or {}).get("elicitation") or {})
             send({"id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}, "authMethods": [],
                                         "_meta": {"steering": {"supported": True}},
                                         "agentInfo": {"name": "mock", "title": "Mock Agent", "version": "0.1.0"}}})
