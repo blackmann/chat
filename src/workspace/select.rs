@@ -25,6 +25,40 @@ pub struct Selection {
     pub dragging: bool,
     /// What the find bar looks for, marked wherever it shows.
     pub find: Option<Find>,
+    /// A search result picked: the paragraph to bring into view once drawn.
+    pub reveal: Option<Reveal>,
+    /// A paragraph just brought into view, lit for a moment.
+    pub flash: Option<Flash>,
+}
+
+/// Where a picked search result sits: its block, which of the block's
+/// paragraphs holding `needle` (lowercase) it is, and frames left to wait for
+/// it to be drawn. A block folded away is never drawn, so the wait runs out.
+pub struct Reveal {
+    pub block: usize,
+    pub nth: usize,
+    pub needle: String,
+    pub frames: u8,
+}
+
+/// A segment lit for a moment, the needle marked in it, fading out.
+pub struct Flash {
+    pub key: Key,
+    pub needle: String,
+    pub tint: Hsla,
+    pub began: std::time::Instant,
+}
+
+/// How long a flash holds, then how long it takes to fade.
+const FLASH_HOLD: f32 = 0.9;
+const FLASH_FADE: f32 = 0.9;
+
+impl Flash {
+    /// How lit it is now: whole while it holds, then down to nothing.
+    fn strength(&self) -> f32 {
+        let t = self.began.elapsed().as_secs_f32();
+        if t <= FLASH_HOLD { 1. } else { (1. - (t - FLASH_HOLD) / FLASH_FADE).max(0.) }
+    }
 }
 
 /// Text being found in the segments: the needle (lowercase), the match that's
@@ -84,6 +118,18 @@ impl Selection {
     }
 
     /// Every match of the find bar's needle, in reading order, as of the last paint.
+    /// The segment a pending reveal points at, once it has been drawn: the
+    /// block's `nth` segment holding the needle, else its last such, else its first.
+    pub fn revealed(&self, reveal: &Reveal) -> Option<Key> {
+        let mut block = self.segments.range((reveal.block, 0)..=(reveal.block, usize::MAX)).peekable();
+        let first = *block.peek()?.0;
+        let holding: Vec<Key> = block.filter(|(_, s)| !super::search::find(&s.text, &reveal.needle).is_empty()).map(|(k, _)| *k).collect();
+        Some(holding.get(reveal.nth).or(holding.last()).copied().unwrap_or(first))
+    }
+    /// Where a segment was drawn.
+    pub fn bounds(&self, key: Key) -> Option<Bounds<Pixels>> {
+        self.segments.get(&key).map(|s| s.bounds)
+    }
     pub fn matches(&self) -> Vec<(Key, Range<usize>)> {
         let Some(find) = &self.find else { return Vec::new() };
         self.segments
@@ -238,9 +284,17 @@ impl Element for Selectable {
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), hitbox: &mut Hitbox, window: &mut Window, cx: &mut App) {
-        let (range, found) = {
+        let (range, found, flash) = {
             let mut state = self.state.borrow_mut();
             state.segments.insert(self.key, Segment { layout: self.layout.clone(), bounds, text: self.text.clone() });
+            if state.flash.as_ref().is_some_and(|f| f.strength() <= 0.) {
+                state.flash = None;
+            }
+            let flash = state.flash.as_ref().filter(|f| f.key == self.key).map(|f| {
+                let strength = f.strength();
+                let marks = super::search::find(&self.text, &f.needle);
+                (f.tint.opacity(f.tint.a * strength), marks)
+            });
             let found: Vec<(Range<usize>, Hsla)> = match &state.find {
                 Some(find) => super::search::find(&self.text, &find.needle)
                     .into_iter()
@@ -251,12 +305,26 @@ impl Element for Selectable {
                     .collect(),
                 None => Vec::new(),
             };
-            (state.range(self.key, self.text.len()), found)
+            (state.range(self.key, self.text.len()), found, flash)
         };
         if self.cursor {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
         }
+        // Lit behind the text, a little past its edges, the needle marked over it.
+        if let Some((tint, _)) = &flash {
+            let pad = px(4.);
+            let around = Bounds::from_corners(point(bounds.left() - pad, bounds.top() - pad / 2.), point(bounds.right() + pad, bounds.bottom() + pad / 2.));
+            window.paint_quad(fill(around, tint.opacity(tint.a * 0.45)).corner_radii(px(4.)));
+            window.request_animation_frame();
+        }
         self.child.paint(window, cx);
+        if let Some((tint, marks)) = flash {
+            for range in marks {
+                for rect in highlight(&self.layout, bounds, range) {
+                    window.paint_quad(fill(rect, tint).corner_radii(px(2.)));
+                }
+            }
+        }
         for (range, tint) in found {
             for rect in highlight(&self.layout, bounds, range) {
                 window.paint_quad(fill(rect, tint).corner_radii(px(2.)));

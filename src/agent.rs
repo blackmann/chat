@@ -14,7 +14,7 @@ use agent_client_protocol::{
             PermissionOptionKind, PlanEntryStatus, PromptRequest, RequestPermissionOutcome, RequestPermissionRequest,
             RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
             SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionNotification,
-            SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent,
+            SessionUpdate, SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason, TextContent, ImageContent,
             ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
         },
     },
@@ -640,6 +640,7 @@ async fn run(
                 .block_task()
                 .await?;
             let capabilities = &ready.agent_capabilities;
+            let images = capabilities.prompt_capabilities.image;
             // Reopen the earlier session where the agent can: resume reattaches
             // quietly, load replays it.
             let reopened = match previous.clone() {
@@ -679,7 +680,7 @@ async fn run(
             while let Some(command) = commands.next().await {
                 match command {
                     Command::Prompt(text) => {
-                        let request = PromptRequest::new(session_id.clone(), vec![ContentBlock::Text(TextContent::new(text))]);
+                        let request = PromptRequest::new(session_id.clone(), prompt(text, images));
                         let response = connection.send_request(request);
                         let (events, spec) = (events.clone(), spec.clone());
                         connection.spawn(async move {
@@ -705,7 +706,7 @@ async fn run(
                     Command::Steer(text) => {
                         let params = serde_json::json!({
                             "sessionId": session_id,
-                            "prompt": [ContentBlock::Text(TextContent::new(text))],
+                            "prompt": prompt(text, images),
                             "_meta": { "steering": { "idleBehavior": "promptRequired" } },
                         });
                         let request = UntypedMessage::new("_session/steering", params)?;
@@ -870,7 +871,6 @@ fn is_image(uri: &str) -> bool {
 /// that replays it finds the same file.
 fn save_image(data: &str, mime: &str) -> Option<PathBuf> {
     use base64::Engine;
-    use std::hash::{Hash, Hasher};
     let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).ok()?;
     let ext = match mime {
         "image/png" => "png",
@@ -881,15 +881,65 @@ fn save_image(data: &str, mime: &str) -> Option<PathBuf> {
         "image/tiff" => "tiff",
         _ => return None,
     };
+    store_image(&bytes, ext)
+}
+
+/// Where images in threads are kept: the agent's, and ones pasted in.
+fn images_dir() -> PathBuf {
+    crate::settings::dir().unwrap_or_else(std::env::temp_dir).join("images")
+}
+
+/// Keep an image in the images folder, named by its contents.
+pub fn store_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hash);
-    let dir = crate::settings::dir().unwrap_or_else(std::env::temp_dir).join("images");
+    let dir = images_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join(format!("{:016x}.{ext}", hash.finish()));
     if !path.exists() {
         std::fs::write(&path, bytes).ok()?;
     }
     Some(path)
+}
+
+/// A message as the agent gets it: the text, then each pasted image it
+/// mentions (`@` and a path in the images folder) as the image itself, for
+/// agents that take images. The mention stays in the text so the agent can
+/// still refer to the file.
+fn prompt(text: String, images: bool) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if images {
+        let marker = format!("@{}/", images_dir().display());
+        let mut seen = Vec::new();
+        for (at, _) in text.match_indices(&marker) {
+            let rest = &text[at + 1..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let path = PathBuf::from(&rest[..end]);
+            if seen.contains(&path) {
+                continue;
+            }
+            if let Some(block) = image_block(&path) {
+                blocks.push(block);
+            }
+            seen.push(path);
+        }
+    }
+    blocks.insert(0, ContentBlock::Text(TextContent::new(text)));
+    blocks
+}
+
+fn image_block(path: &Path) -> Option<ContentBlock> {
+    use base64::Engine;
+    let mime = match path.extension()?.to_str()? {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    };
+    let bytes = std::fs::read(path).ok()?;
+    Some(ContentBlock::Image(ImageContent::new(base64::engine::general_purpose::STANDARD.encode(bytes), mime)))
 }
 
 fn patch(fields: ToolCallUpdateFields) -> ToolPatch {

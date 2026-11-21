@@ -13,6 +13,59 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
+/// Threads with nothing new for this long fade back in the list: three days.
+const STALE_THREAD_MS: i64 = 3 * 24 * 60 * 60 * 1000;
+
+/// The thread list's sections, by the day a thread's sort time falls on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Day {
+    Today,
+    Yesterday,
+    Older,
+}
+impl Day {
+    fn title(self) -> &'static str {
+        match self {
+            Day::Today => "Today",
+            Day::Yesterday => "Yesterday",
+            Day::Older => "Older",
+        }
+    }
+}
+
+/// The order the list shows `threads` in, newest first by `sort`, each with
+/// its section. A thread with nothing in it yet is new: it leads. One with no
+/// times to go on goes last, among the older ones. Ties keep the stored order.
+pub(super) fn thread_order(threads: &[Thread], sort: ThreadSort, now: chrono::DateTime<chrono::Local>) -> Vec<(Day, usize)> {
+    use chrono::TimeZone;
+    let key = |t: &Thread| {
+        if t.is_blank() {
+            return Some(now.timestamp_millis());
+        }
+        match sort {
+            ThreadSort::LastActive => t.last_active(),
+            ThreadSort::Created => t.started(),
+        }
+    };
+    let today = now.date_naive();
+    let day = |at: Option<i64>| {
+        let Some(date) = at.and_then(|ms| chrono::Local.timestamp_millis_opt(ms).single()).map(|d| d.date_naive()) else {
+            return Day::Older;
+        };
+        if date >= today {
+            Day::Today
+        } else if Some(date) == today.pred_opt() {
+            Day::Yesterday
+        } else {
+            Day::Older
+        }
+    };
+    let mut order: Vec<(Option<i64>, usize)> = threads.iter().enumerate().map(|(i, t)| (key(t), i)).collect();
+    // `None` sorts below every time.
+    order.sort_by(|a, b| b.0.cmp(&a.0));
+    order.into_iter().map(|(at, i)| (day(at), i)).collect()
+}
+
 pub fn tab_glyph(kind: &TabKind) -> Icon {
     match kind {
         TabKind::Chat => Glyph::Message.into(),
@@ -536,6 +589,46 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The thread at the top of the list as it's sorted.
+    pub(super) fn first_listed(&self) -> usize {
+        thread_order(&self.current_project().threads, self.settings.thread_sort, chrono::Local::now()).first().map_or(0, |(_, i)| *i)
+    }
+
+    /// The button that picks what orders the thread list.
+    fn thread_sort_menu(&self, colors: Palette, cx: &mut Context<Self>) -> Div {
+        let tip = match self.settings.thread_sort {
+            ThreadSort::LastActive => "Sorted by last active",
+            ThreadSort::Created => "Sorted by created",
+        };
+        let trigger = row()
+            .id("thread-sort-button")
+            .size(px(24.))
+            .justify_center()
+            .rounded(px(5.))
+            .cursor_pointer()
+            .text_color(rgb(colors.muted))
+            .hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
+            .child(icon(IconName::SortDescending))
+            .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx));
+        self.popover_trigger("thread-sort", trigger, Corner::TopLeft, 180., None, |s, weak, _| {
+            let item = |label: &'static str, sort: ThreadSort| {
+                let weak = weak.clone();
+                crate::menu::Entry::Item(crate::menu::Item::new(label).checked(s.settings.thread_sort == sort).on_click(move |_, cx| {
+                    let _ = weak.update(cx, |s, cx| {
+                        s.settings.thread_sort = sort;
+                        let _ = s.settings.save();
+                        cx.notify();
+                    });
+                }))
+            };
+            vec![
+                crate::menu::Entry::Label("Sort threads by".into()),
+                item("Last active", ThreadSort::LastActive),
+                item("Created", ThreadSort::Created),
+            ]
+        }, cx)
+    }
+
     pub(super) fn threads_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let project = self.current_project();
@@ -546,13 +639,34 @@ impl Workspace {
         let searching = !q.is_empty() && hits.is_none();
         let mut list = col().py_1();
         let mut shown = 0;
-        for (i, t) in project.threads.iter().enumerate() {
+        let mut section = None;
+        for (day, i) in thread_order(&project.threads, self.settings.thread_sort, chrono::Local::now()) {
+            let t = &project.threads[i];
             let hit = hits.and_then(|h| h.get(t.id));
             if !q.is_empty() && hit.is_none() && search::find(&t.title, &q).is_empty() {
                 continue;
             }
             shown += 1;
+            if section != Some(day) {
+                section = Some(day);
+                list = list.child(
+                    div()
+                        .px_3()
+                        .pt(px(if shown == 1 { 6. } else { 14. }))
+                        .pb(px(4.))
+                        .text_size(px(crate::theme::scaled_ui(11.)))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(colors.quiet))
+                        .child(day.title()),
+                );
+            }
             let active = self.thread == i;
+            // Threads left alone for a while fade back, unless showing or asking
+            // for attention. One with no times to go on stays as it is.
+            let stale = !active
+                && !t.unread
+                && !t.state.busy()
+                && t.last_active().is_some_and(|at| crate::model::now_ms() - at > STALE_THREAD_MS);
             // The row is just state and title; the rest waits in the tooltip.
             let tip = format!(
                 "{} · {}",
@@ -576,6 +690,7 @@ impl Workspace {
                     .cursor_pointer()
                     .when(active, |s| s.bg(rgb(colors.selected)))
                     .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                    .when(stale, |s| s.opacity(0.5))
                     .child(row().w(px(14.)).flex_shrink_0().justify_center().child(state_mark(colors, t.state, t.unread)))
                     .child(one_line(t.title.clone(), 18.).flex_1().min_w_0())
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -603,7 +718,10 @@ impl Workspace {
                         .cursor_pointer()
                         .hover(|s| s.bg(rgb(colors.hover)))
                         .child(StyledText::new(snippet.text.clone()).with_highlights(marks))
-                        .on_click(cx.listener(move |s, _, _, cx| s.select_thread(i, cx))),
+                        .on_click(cx.listener({
+                            let (block, nth) = (snippet.block, snippet.nth);
+                            move |s, _, _, cx| s.reveal_hit(i, block, nth, cx)
+                        })),
                 );
             }
             if hit.more > 0 {
@@ -646,6 +764,7 @@ impl Workspace {
                             .prefix(icon(IconName::Search).text_color(rgb(colors.muted)))
                             .cleanable(true),
                     )
+                    .child(self.thread_sort_menu(colors, cx))
                     .child(
                         icon_button("new-thread", Glyph::Compose, "New thread · ⌘ N")
                             .on_click(cx.listener(|s, _, w, cx| s.new_thread(&NewThread, w, cx))),
@@ -1051,4 +1170,48 @@ fn reveal_item(editors: &crate::editors::Editors, path: &Path) -> crate::menu::E
         Some(png) => item.image(png.clone()),
         None => item.icon(IconName::FolderOpen),
     })
+}
+
+#[cfg(test)]
+mod thread_order_tests {
+    use super::{Day, thread_order};
+    use crate::model::{Block, Message, Thread};
+    use crate::settings::ThreadSort;
+    use chrono::TimeZone;
+
+    fn thread(id: usize, sent: &[i64]) -> Thread {
+        let mut t = Thread::new(id, 0);
+        for at in sent {
+            t.blocks.push(Block::User(Message { text: "hi".into(), at: Some(*at) }));
+            t.mark_active(*at);
+        }
+        t
+    }
+
+    #[test]
+    fn sorts_newest_first_and_sections_by_day() {
+        let now = chrono::Local.with_ymd_and_hms(2026, 11, 21, 15, 0, 0).unwrap();
+        let at = |d: u32, h: u32| chrono::Local.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap().timestamp_millis();
+        let threads = vec![
+            thread(1, &[at(10, 9), at(21, 8)]), // began long ago, active this morning
+            thread(2, &[at(20, 23)]),           // yesterday, late
+            thread(3, &[at(21, 10)]),           // began this morning, after 1 was active
+            Thread::new(4, 0),                  // empty: just made
+            {
+                // From before times were kept.
+                let mut t = Thread::new(5, 0);
+                t.blocks.push(Block::User(Message { text: "old".into(), at: None }));
+                t
+            },
+        ];
+        let ids = |sort| thread_order(&threads, sort, now).into_iter().map(|(d, i)| (d, threads[i].id)).collect::<Vec<_>>();
+        assert_eq!(
+            ids(ThreadSort::LastActive),
+            [(Day::Today, 4), (Day::Today, 3), (Day::Today, 1), (Day::Yesterday, 2), (Day::Older, 5)]
+        );
+        assert_eq!(
+            ids(ThreadSort::Created),
+            [(Day::Today, 4), (Day::Today, 3), (Day::Yesterday, 2), (Day::Older, 1), (Day::Older, 5)]
+        );
+    }
 }

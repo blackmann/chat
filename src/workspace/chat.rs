@@ -253,9 +253,8 @@ fn activity_summary(blocks: &[Block]) -> String {
     line
 }
 
-fn dropped_paths(paths: &ExternalPaths, root: Option<&Path>, mentions: &mut Vec<FileMention>, window: &Window) -> String {
+fn dropped_paths(paths: &[PathBuf], root: Option<&Path>, mentions: &mut Vec<FileMention>, window: &Window) -> String {
     let added = paths
-        .paths()
         .iter()
         .map(|path| super::mentions::fit(super::mentions::path_mention(path, root), window))
         .collect::<Vec<_>>();
@@ -382,7 +381,8 @@ pub(super) fn choices(setting: &Setting, weak: WeakEntity<Workspace>, describe: 
 }
 
 impl Workspace {
-    fn insert_dropped_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+    /// Dropped or pasted files and folders, as chips at the caret.
+    fn insert_dropped_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
         let root = self.current_project().path.as_deref();
         let text = dropped_paths(paths, root, &mut self.file_mentions.borrow_mut(), window);
         if text.is_empty() {
@@ -393,6 +393,27 @@ impl Workspace {
             input.replace_text_in_range(None, &text, window, cx);
             input.focus(window, cx);
         });
+    }
+
+    /// Files copied in Finder go into the message as chips, as if dropped. An
+    /// image on the clipboard goes in as a chip for a copy of it in the images
+    /// folder, unless the text beside it is what was meant.
+    fn paste_image(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let files = crate::pasteboard::files();
+        if !files.is_empty() {
+            self.insert_dropped_paths(&files, window, cx);
+            return true;
+        }
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        if text.as_deref().is_some_and(crate::pasteboard::prefers_text) {
+            return false;
+        }
+        let Some(path) = crate::pasteboard::image(cx).and_then(|(bytes, ext)| crate::agent::store_image(&bytes, ext)) else {
+            return false;
+        };
+        let added = super::mentions::mention("Pasted image", super::mentions::sent_path(&path, None), super::mentions::icon_path(&path, false));
+        self.insert_mention(added, window, cx);
+        true
     }
 
     /// Put a snippet's chip at the composer's caret, on the chat tab.
@@ -1154,7 +1175,13 @@ impl Workspace {
             .bg(rgb(colors.panel))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(rgb(colors.blue_tint)).border_color(rgb(colors.blue)))
             .on_drop(cx.listener(|s, paths: &ExternalPaths, window, cx| {
-                s.insert_dropped_paths(paths, window, cx);
+                s.insert_dropped_paths(paths.paths(), window, cx);
+            }))
+            // Ahead of the input's own paste, which only knows text.
+            .capture_action(cx.listener(|s, _: &gpui_component::input::Paste, window, cx| {
+                if s.paste_image(window, cx) {
+                    cx.stop_propagation();
+                }
             }))
             .child(
                 div().key_context("Composer").flex_1().px(px(14.)).pt(px(12.)).pb(px(6.)).child(
@@ -1221,6 +1248,8 @@ impl Workspace {
         };
         // Built before the segments are forgotten: it counts matches in them.
         let find_bar = self.thread_find_open.then(|| self.thread_find_bar(colors, cx));
+        // A picked search result is found among them too.
+        self.resolve_reveal(window, colors);
         self.selection.borrow_mut().forget_layout();
         let mut list = col().px_5().pt_3().pb_5().gap(px(6.)).map(|s| {
             if available > px(0.) { s.w(available.min(px(COLUMN))) } else { s.w_full().max_w(px(COLUMN)) }

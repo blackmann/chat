@@ -22,6 +22,12 @@ lsp-types = "0.97"
 notify = "7"
 ignore = "0.4"
 base64 = "0.22"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa = "0.26"
+objc = "0.2"
 
 [dev-dependencies]
 gpui = { version = "=0.2.2", features = ["test-support"] }

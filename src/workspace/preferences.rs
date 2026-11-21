@@ -1,6 +1,6 @@
-//! Settings, laid out like Gitflow's: a titled page of rows, each a name, a
-//! description and a control. Only appearance for now; a section list joins
-//! once there is a second page.
+//! Settings: sections listed down the left under a search box, and the
+//! section picked as a titled page of rows, each a name, a description and a
+//! control. Searching lists the matching rows from every section.
 use super::ui::*;
 use super::*;
 use crate::{
@@ -50,6 +50,49 @@ const TAB_WIDTHS: &[usize] = &[2, 4, 8];
 const ACTIVITY_MODES: &[(ActivityMode, &str)] =
     &[(ActivityMode::Summary, "Summary"), (ActivityMode::Visible, "Visible"), (ActivityMode::Hidden, "Hidden")];
 
+/// The sidebar beside the page.
+const SIDEBAR: f32 = 210.;
+
+/// The pages of settings, in the sidebar's order.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Section {
+    #[default]
+    Appearance,
+    Editor,
+    Chat,
+}
+impl Section {
+    const ALL: [Section; 3] = [Section::Appearance, Section::Editor, Section::Chat];
+    fn title(self) -> &'static str {
+        match self {
+            Section::Appearance => "Appearance",
+            Section::Editor => "Editor",
+            Section::Chat => "Chat",
+        }
+    }
+    fn icon(self) -> IconName {
+        match self {
+            Section::Appearance => IconName::Palette,
+            Section::Editor => IconName::File,
+            Section::Chat => IconName::Bot,
+        }
+    }
+}
+
+/// One setting: where it lives, what it's called and does, and its control.
+struct Row {
+    section: Section,
+    group: &'static str,
+    title: &'static str,
+    description: &'static str,
+    control: AnyElement,
+}
+impl Row {
+    fn matches(&self, query: &str) -> bool {
+        [self.title, self.description, self.group, self.section.title()].iter().any(|t| t.to_lowercase().contains(query))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FontRole {
     Ui,
@@ -57,7 +100,9 @@ pub enum FontRole {
 }
 
 fn setting(colors: Palette, title: &str, description: &str, control: impl IntoElement) -> Div {
+    let name = title.to_string();
     row()
+        .debug_selector(move || format!("pref-row:{name}"))
         .w(px(PAGE))
         .gap(px(GAP))
         .py(px(14.))
@@ -77,7 +122,8 @@ fn setting(colors: Palette, title: &str, description: &str, control: impl IntoEl
                         .child(description.to_string()),
                 ),
         )
-        .child(div().flex_shrink_0().child(control))
+        // Controls sit against the right edge, whatever their width.
+        .child(row().flex_1().min_w_0().justify_end().child(control))
 }
 
 fn group(colors: Palette, title: &str) -> Div {
@@ -114,8 +160,27 @@ impl Workspace {
     pub(super) fn open_prefs(&mut self, _: &OpenPreferences, window: &mut Window, cx: &mut Context<Self>) {
         self.prefs_open = true;
         self.popup = None;
-        self.prefs_focus.focus(window);
+        self.prefs_search.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
         cx.notify();
+    }
+    /// Show `section`'s page, leaving any search.
+    fn show_prefs_section(&mut self, section: Section, window: &mut Window, cx: &mut Context<Self>) {
+        self.prefs_section = section;
+        self.prefs_search.update(cx, |s, cx| s.set_value("", window, cx));
+        self.prefs_page_scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+    /// Open the settings file itself in a tab, for what has no control here.
+    fn edit_settings_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = crate::settings::dir().map(|d| d.join("settings.json")) else { return };
+        if !path.exists() {
+            let _ = self.settings.save();
+        }
+        self.close_prefs(window, cx);
+        self.open(TabKind::File(path), cx);
     }
     fn close_prefs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prefs_open = false;
@@ -241,7 +306,7 @@ impl Workspace {
 
     fn tab_width_picker(&self, cx: &mut Context<Self>) -> Div {
         let current = syntax::tab_width();
-        TAB_WIDTHS.iter().fold(row().w(px(CONTROL)).gap_4(), |row, &width| {
+        TAB_WIDTHS.iter().fold(row().gap_4(), |row, &width| {
             row.child(
                 Radio::new(("tab-width", width))
                     .label(width.to_string())
@@ -253,7 +318,7 @@ impl Workspace {
 
     fn indent_guides_switch(&self, cx: &mut Context<Self>) -> Div {
         let this = cx.weak_entity();
-        row().w(px(CONTROL)).child(Switch::new("indent-guides").checked(syntax::show_guides()).on_click(move |on, _, cx| {
+        row().child(Switch::new("indent-guides").checked(syntax::show_guides()).on_click(move |on, _, cx| {
             let on = *on;
             let _ = this.update(cx, |s, cx| s.set_indent_guides(on, cx));
         }))
@@ -268,7 +333,6 @@ impl Workspace {
     fn follow_up_picker(&self, cx: &mut Context<Self>) -> Div {
         let mode = self.settings.follow_up_mode;
         row()
-            .w(px(CONTROL))
             .gap_4()
             .child(
                 Radio::new("follow-up-queue")
@@ -421,43 +485,125 @@ impl Workspace {
             )
     }
 
+    /// Every setting, in the order the pages list them.
+    fn pref_rows(&self, cx: &mut Context<Self>) -> Vec<Row> {
+        use Section::*;
+        let row = |section, group, title, description, control: AnyElement| Row { section, group, title, description, control };
+        vec![
+            row(Appearance, "Fonts", "Interface font", "Everything outside code: the transcript, menus, tabs and panels.", self.font_picker(FontRole::Ui, cx).into_any_element()),
+            row(Appearance, "Fonts", "Code font", "Code blocks in replies, open files, diffs and paths.", self.font_picker(FontRole::Mono, cx).into_any_element()),
+            row(Appearance, "Fonts", "Interface font size", "The base size for chat text, controls, menus, tabs and panels.", self.font_size_picker(FontRole::Ui, cx).into_any_element()),
+            row(Appearance, "Fonts", "Code font size", "The base size for code, paths and chip-style inlays.", self.font_size_picker(FontRole::Mono, cx).into_any_element()),
+            row(Editor, "Code", "Tab width", "How many columns a tab character spans in open files, diffs and code blocks.", self.tab_width_picker(cx).into_any_element()),
+            row(Editor, "Code", "Indent guides", "Faint vertical lines at each indent level in open files and diffs.", self.indent_guides_switch(cx).into_any_element()),
+            row(
+                Chat,
+                "Messages",
+                "While the agent is working",
+                "Queue waits for the current turn to finish. Steer sends the message to the running turn when the agent supports it.",
+                self.follow_up_picker(cx).into_any_element(),
+            ),
+            row(
+                Chat,
+                "Messages",
+                "Thinking and tool calls",
+                "Summary shows them while the agent works, then folds them into one line at the end of the turn. Edits stay listed either way.",
+                self.activity_picker(cx).into_any_element(),
+            ),
+        ]
+    }
+
+    /// The sidebar: search, then a row per section.
+    fn prefs_sidebar(&self, searching: bool, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let mut nav = col().px_2().gap(px(2.));
+        for section in Section::ALL {
+            let on = !searching && self.prefs_section == section;
+            nav = nav.child(
+                row()
+                    .id(SharedString::from(format!("prefs-section-{}", section.title())))
+                    .h(px(30.))
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(6.))
+                    .cursor_pointer()
+                    .text_color(rgb(if on { colors.text } else { colors.muted }))
+                    .when(on, |s| s.bg(rgb(colors.selected)))
+                    .when(!on, |s| s.hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text))))
+                    .child(icon(section.icon()).size(px(14.)).text_color(rgb(if on { colors.blue } else { colors.muted })))
+                    .child(section.title())
+                    .on_click(cx.listener(move |s, _, window, cx| s.show_prefs_section(section, window, cx))),
+            );
+        }
+        col()
+            .w(px(SIDEBAR))
+            .flex_shrink_0()
+            .h_full()
+            .bg(rgb(colors.chrome))
+            .border_r_1()
+            .border_color(rgb(colors.border))
+            .child(
+                div().p_3().child(
+                    gpui_component::input::Input::new(&self.prefs_search)
+                        .small()
+                        .prefix(icon(IconName::Search).text_color(rgb(colors.muted)))
+                        .cleanable(true),
+                ),
+            )
+            .child(nav)
+            .child(div().flex_1())
+            .child(
+                row()
+                    .mx_3()
+                    .py_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .text_size(px(crate::theme::scaled_ui(11.5)))
+                    .text_color(rgb(colors.quiet))
+                    .child(Kbd::new(Keystroke::parse("escape").expect("valid keystroke")))
+                    .child("to close"),
+            )
+    }
+
     pub(super) fn preferences_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let customised = self.settings.ui_font.is_some()
-            || self.settings.mono_font.is_some()
-            || self.settings.ui_font_size.is_some()
-            || self.settings.mono_font_size.is_some();
-        let page = col()
-            .w(px(PAGE))
-            .child(div().text_size(px(crate::theme::scaled_ui(20.))).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-            .child(group(colors, "Fonts"))
-            .child(setting(
-                colors,
-                "Interface font",
-                "Everything outside code: the transcript, menus, tabs and panels.",
-                self.font_picker(FontRole::Ui, cx),
-            ))
-            .child(setting(
-                colors,
-                "Code font",
-                "Code blocks in replies, open files, diffs and paths.",
-                self.font_picker(FontRole::Mono, cx),
-            ))
-            .child(setting(
-                colors,
-                "Interface font size",
-                "The base size for chat text, controls, menus, tabs and panels.",
-                self.font_size_picker(FontRole::Ui, cx),
-            ))
-            .child(setting(
-                colors,
-                "Code font size",
-                "The base size for code, paths and chip-style inlays.",
-                self.font_size_picker(FontRole::Mono, cx),
-            ))
-            .child(self.font_preview(colors))
-            .child(
-                row().pt_4().child(div().flex_1()).when(customised, |s| {
+        let query = self.prefs_search.read(cx).value().trim().to_lowercase();
+        let searching = !query.is_empty();
+        let rows = self.pref_rows(cx);
+        let title = |text: String| div().pt_1().text_size(px(crate::theme::scaled_ui(20.))).font_weight(FontWeight::SEMIBOLD).child(text);
+        let mut page = col().w(px(PAGE));
+        if searching {
+            let found: Vec<Row> = rows.into_iter().filter(|r| r.matches(&query)).collect();
+            page = page.child(title("Search results".into()));
+            if found.is_empty() {
+                page = page.child(label(colors, format!("No settings match “{query}”.")).pt_4());
+            }
+            let mut last = None;
+            for r in found {
+                if last != Some(r.section) {
+                    last = Some(r.section);
+                    page = page.child(group(colors, &format!("{} · {}", r.section.title(), r.group)));
+                }
+                page = page.child(setting(colors, r.title, r.description, r.control));
+            }
+        } else {
+            let section = self.prefs_section;
+            page = page.child(title(section.title().into()));
+            let mut last = None;
+            for r in rows.into_iter().filter(|r| r.section == section) {
+                if last != Some(r.group) {
+                    last = Some(r.group);
+                    page = page.child(group(colors, r.group));
+                }
+                page = page.child(setting(colors, r.title, r.description, r.control));
+            }
+            if section == Section::Appearance {
+                let customised = self.settings.ui_font.is_some()
+                    || self.settings.mono_font.is_some()
+                    || self.settings.ui_font_size.is_some()
+                    || self.settings.mono_font_size.is_some();
+                page = page.child(self.font_preview(colors)).child(row().pt_4().child(div().flex_1()).when(customised, |s| {
                     s.child(
                         Button::new("reset-fonts")
                             .label("Restore defaults")
@@ -465,34 +611,48 @@ impl Workspace {
                             .small()
                             .on_click(cx.listener(|s, _, _, cx| s.reset_typography(cx))),
                     )
-                }),
+                }));
+            }
+        }
+        let main = col()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                row()
+                    .h(px(48.))
+                    .flex_shrink_0()
+                    .pl(px(40.))
+                    .pr_3()
+                    .gap_2()
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("edit-settings-file")
+                            .label("Edit in settings.json")
+                            .outline()
+                            .small()
+                            .on_click(cx.listener(|s, _, w, cx| s.edit_settings_file(w, cx))),
+                    )
+                    .child(
+                        Button::new("close-prefs")
+                            .icon(IconName::Close)
+                            .ghost()
+                            .small()
+                            .tooltip("Close · esc")
+                            .on_click(cx.listener(|s, _, w, cx| s.close_prefs(w, cx))),
+                    ),
             )
-            .child(group(colors, "Code"))
-            .child(setting(
-                colors,
-                "Tab width",
-                "How many columns a tab character spans in open files, diffs and code blocks.",
-                self.tab_width_picker(cx),
-            ))
-            .child(setting(
-                colors,
-                "Indent guides",
-                "Faint vertical lines at each indent level in open files and diffs.",
-                self.indent_guides_switch(cx),
-            ))
-            .child(group(colors, "Messages"))
-            .child(setting(
-                colors,
-                "While the agent is working",
-                "Queue waits for the current turn to finish. Steer sends the message to the running turn when the agent supports it.",
-                self.follow_up_picker(cx),
-            ))
-            .child(setting(
-                colors,
-                "Thinking and tool calls",
-                "Summary shows them while the agent works, then folds them into one line at the end of the turn. Edits stay listed either way.",
-                self.activity_picker(cx),
-            ));
+            .child(
+                div()
+                    .id("prefs-content")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.prefs_page_scroll)
+                    .px(px(40.))
+                    .pb(px(40.))
+                    .child(page),
+            );
         div()
             .id("prefs-scrim")
             .absolute()
@@ -512,10 +672,10 @@ impl Workspace {
             // A click outside the dialog closes it.
             .on_mouse_down(MouseButton::Left, cx.listener(|s, _, w, cx| s.close_prefs(w, cx)))
             .child(
-                col()
-                    .w(px(PAGE + 80.))
+                row()
+                    .w(px(SIDEBAR + PAGE + 80.))
                     .max_w(relative(0.94))
-                    .h(px(600.))
+                    .h(px(640.))
                     .max_h(relative(0.92))
                     .bg(rgb(colors.background))
                     .border_1()
@@ -524,28 +684,8 @@ impl Workspace {
                     .shadow_xl()
                     .overflow_hidden()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        row()
-                            .h(px(44.))
-                            .flex_shrink_0()
-                            .pl(px(40.))
-                            .pr_3()
-                            .gap_2()
-                            .text_size(px(crate::theme::scaled_ui(12.)))
-                            .text_color(rgb(colors.muted))
-                            .child("Settings")
-                            .child(div().flex_1())
-                            .child(Kbd::new(Keystroke::parse("escape").expect("valid keystroke")))
-                            .child(
-                                Button::new("close-prefs")
-                                    .icon(IconName::Close)
-                                    .ghost()
-                                    .small()
-                                    .tooltip("Close · esc")
-                                    .on_click(cx.listener(|s, _, w, cx| s.close_prefs(w, cx))),
-                            ),
-                    )
-                    .child(div().id("prefs-content").flex_1().min_h_0().overflow_y_scroll().px(px(40.)).pb(px(40.)).child(page)),
+                    .child(self.prefs_sidebar(searching, cx))
+                    .child(main),
             )
             .into_any_element()
     }

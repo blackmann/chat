@@ -6,6 +6,7 @@ mod git_watch;
 mod lsp;
 mod menu;
 mod model;
+mod pasteboard;
 mod settings;
 mod store;
 mod theme;
@@ -62,9 +63,11 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-g", FindNext, None),
         KeyBinding::new("cmd-shift-g", FindPrevious, None),
         KeyBinding::new("escape", CloseFind, Some("ThreadFind > Input")),
-        // Find in the project's files, on the Files page.
+        // Find a file by name, on the Files page.
         KeyBinding::new("cmd-shift-o", FindInFiles, None),
-        KeyBinding::new("enter", OpenFirstFound, Some("FileFind > Input")),
+        KeyBinding::new("enter", OpenFound, Some("FileFind > Input")),
+        KeyBinding::new("up", FoundUp, Some("FileFind > Input")),
+        KeyBinding::new("down", FoundDown, Some("FileFind > Input")),
         KeyBinding::new("escape", CloseFileFind, Some("FileFind > Input")),
     ]
 }

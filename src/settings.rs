@@ -16,6 +16,17 @@ pub enum FollowUpMode {
     Steer,
 }
 
+/// What orders the thread list, newest first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSort {
+    /// The latest message sent or turn finished.
+    #[default]
+    LastActive,
+    /// The first message sent.
+    Created,
+}
+
 /// How a turn's thinking and tool calls show in the transcript.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -81,6 +92,8 @@ pub struct Settings {
     pub follow_up_mode: FollowUpMode,
     /// How thinking and tool calls show in the transcript.
     pub activity: ActivityMode,
+    /// What orders the thread list.
+    pub thread_sort: ThreadSort,
     /// Columns per tab stop in code views; unset means the default (4).
     pub tab_width: Option<usize>,
     /// Whether code views draw indent guides; unset means they do.

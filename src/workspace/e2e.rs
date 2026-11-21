@@ -1061,30 +1061,148 @@ fn finds_text_in_the_thread(cx: &mut TestAppContext) {
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
 
-/// ⌘ ⇧ O searches the project's files from the Files page; ↵ opens the first
-/// line found, and esc goes back to the tree.
+/// After a restart, only the thread on show has its blocks read in; another
+/// is read when opened, and let go of again once put away and saved.
 #[gpui::test]
-fn finds_text_in_files(cx: &mut TestAppContext) {
+fn threads_load_when_opened(cx: &mut TestAppContext) {
+    use crate::model::{Block, Message};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    {
+        let mut d = boot(cx, &config);
+        d.settle();
+        for (n, at) in [("older", 1_000), ("newer", 2_000)] {
+            d.act(|s, cx| {
+                s.next_thread += 1;
+                let mut t = crate::model::Thread::new(s.next_thread, 0);
+                t.title = n.into();
+                t.blocks.push(Block::User(Message { text: format!("the {n} one").into(), at: Some(at) }));
+                t.mark_active(at);
+                s.projects[s.project].threads.push(t);
+                let _ = cx;
+            });
+        }
+        d.act(|s, _| s.save_now());
+    }
+    let mut d = boot(cx, &config);
+    d.settle();
+    let loaded = |d: &mut Driver| d.read(|s| s.current_project().threads.iter().map(|t| (t.title.to_string(), !t.unloaded)).collect::<Vec<_>>());
+    let state = loaded(&mut d);
+    assert!(state.contains(&("newer".into(), true)) && state.contains(&("older".into(), false)), "only the one on show: {state:?}");
+    let older = d.read(|s| s.current_project().threads.iter().position(|t| t.title.as_ref() == "older").unwrap());
+    d.act(|s, cx| s.select_thread(older, cx));
+    assert!(d.read(|s| matches!(s.current_thread().unwrap().blocks.first(), Some(Block::User(m)) if m.text.as_ref() == "the older one")));
+    // Back to the other; the one put away has no agent running, so the next
+    // save lets go of it.
+    let newer = d.read(|s| s.current_project().threads.iter().position(|t| t.title.as_ref() == "newer").unwrap());
+    d.act(|s, cx| {
+        s.select_thread(newer, cx);
+        for t in &mut s.projects[s.project].threads {
+            t.session = None;
+        }
+        s.save_now();
+    });
+    assert!(loaded(&mut d).contains(&("older".into(), false)), "put away and saved: let go of");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A search result picked from the thread list opens its thread at the
+/// paragraph it came from, scrolled into view and lit for a moment.
+#[gpui::test]
+fn search_results_open_at_their_paragraph(cx: &mut TestAppContext) {
+    use crate::model::{Block, Message};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let block = 31;
+    d.act(|s, cx| {
+        s.start_thread(cx);
+        let thread = s.current_thread_mut().unwrap();
+        thread.blocks.push(Block::User(Message { text: "Tell me a story".into(), at: None }));
+        for n in 0..30 {
+            thread.blocks.push(Block::Text(format!("Paragraph {n} says nothing much.")));
+        }
+        thread.blocks.push(Block::Text("Once.\n\nThe lighthouse keeper woke.\n\nThe end.".into()));
+        for n in 30..60 {
+            thread.blocks.push(Block::Text(format!("Paragraph {n} says nothing much.")));
+        }
+    });
+    let id = d.read(|s| s.current_thread().unwrap().id);
+    // Looking at another thread when the result is picked.
+    d.act(|s, cx| s.start_thread(cx));
+    let search = d.read(|s| s.thread_search.clone());
+    d.cx.update(|window, cx| search.update(cx, |i, cx| i.set_value("lighthouse", window, cx)));
+    d.settle();
+    let index = d.read(|s| s.current_project().threads.iter().position(|t| t.id == id).unwrap());
+    d.act(|s, cx| s.reveal_hit(index, block, 0, cx));
+    d.settle();
+    let (lit, shown) = d.read(|s| {
+        let selection = s.selection.borrow();
+        let flash = selection.flash.as_ref().map(|f| f.key);
+        let view = s.transcript.bounds();
+        let shown = flash.and_then(|k| selection.bounds(k)).is_some_and(|b| b.top() >= view.top() && b.bottom() <= view.bottom());
+        (flash, shown)
+    });
+    assert_eq!(d.read(|s| s.thread), index, "the result's thread opens");
+    assert_eq!(lit.map(|k| k.0), Some(block), "the paragraph's block is lit");
+    assert!(shown, "and scrolled into view");
+    let text = d.read(|s| s.selection.borrow().flash.as_ref().map(|f| f.needle.clone()));
+    assert_eq!(text.as_deref(), Some("lighthouse"));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// ⌘ ⇧ O finds files by name on the Files page: ↓ picks the next, ↵ opens
+/// the pick, and esc goes back to the tree.
+#[gpui::test]
+fn finds_files_by_name(cx: &mut TestAppContext) {
     let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
     let (project, config) = fixture();
     let mut d = boot(cx, &config);
     d.settle();
     d.keys("cmd-shift-o");
     assert!(d.read(|s| s.file_find_open && s.side_open && s.side == super::Side::Files));
-    d.keys("t w i c e");
-    // Past the pause that lets typing settle.
-    d.cx.executor().advance_clock(Duration::from_millis(500));
-    d.wait("the search", 10, |d| d.read(|s| s.file_hits.as_ref().is_some_and(|r| r.query == "twice")));
-    let found = d.read(|s| {
-        s.file_hits.as_ref().unwrap().files.iter().map(|f| (f.path.clone(), f.lines.iter().map(|l| l.number).collect::<Vec<_>>())).collect::<Vec<_>>()
-    });
-    assert_eq!(found, [(project.join("src/main.rs"), vec![4, 6]), (project.join("src/util.rs"), vec![2])]);
-    d.keys("enter");
-    assert_eq!(d.active(), TabKind::File(project.join("src/main.rs")));
-    // The box keeps the keys until esc.
+    d.keys("u t i l");
+    d.wait("the file index", 10, |d| d.read(|s| !s.mention_indexing && s.mention_index.is_some()));
+    let ws = d.ws.clone();
+    let found = |d: &mut Driver| d.cx.update(|_, cx| ws.read(cx).found_files(cx).iter().map(|c| c.path.clone()).collect::<Vec<_>>());
+    let names = found(&mut d);
+    assert_eq!(names.first(), Some(&project.join("src/util.rs")), "the name match comes first: {names:?}");
+    // Letters in order, not together: "smn" finds src/main.rs.
     let input = d.read(|s| s.file_find.clone());
+    d.cx.update(|window, cx| input.update(cx, |i, cx| i.set_value("smn", window, cx)));
+    d.settle();
+    let names = found(&mut d);
+    assert!(names.contains(&project.join("src/main.rs")), "{names:?}");
+    d.keys("down up enter");
+    assert_eq!(d.active(), TabKind::File(names[0].clone()));
     d.cx.update(|window, cx| input.update(cx, |i, cx| i.focus(window, cx)));
     d.keys("escape");
     assert!(d.read(|s| !s.file_find_open));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// ⌘ , opens settings with the search box taking the keys; typing filters
+/// across sections, and esc closes the dialog even from the search box.
+#[gpui::test]
+fn searches_and_closes_settings(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    d.keys("cmd-,");
+    assert!(d.read(|s| s.prefs_open));
+    let search = d.read(|s| s.prefs_search.clone());
+    let focused = d.cx.update(|window, cx| gpui::Focusable::focus_handle(search.read(cx), cx).is_focused(window));
+    assert!(focused, "the search box takes the keys");
+    // In one go: gpui keeps the bounds of rows drawn in earlier frames, so a
+    // letter at a time would leave every row's behind.
+    d.cx.update(|window, cx| search.update(cx, |i, cx| i.set_value("indent", window, cx)));
+    d.settle();
+    // The matching row drew, from another section; the others didn't.
+    assert!(d.cx.debug_bounds("pref-row:Indent guides").is_some());
+    assert!(d.cx.debug_bounds("pref-row:Tab width").is_none());
+    d.keys("escape");
+    assert!(d.read(|s| !s.prefs_open));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }

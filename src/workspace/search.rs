@@ -1,7 +1,7 @@
 //! Searching what threads say, not just what they're called. The text is
 //! copied out of the threads and matched on a background thread; hits come
 //! back grouped by thread, each paragraph that holds the query listed once.
-use crate::model::{Block, Project};
+use crate::model::{Block, Thread};
 use std::{collections::HashSet, ops::Range};
 
 /// Paragraphs listed under one thread; the rest are counted.
@@ -10,16 +10,21 @@ pub const SHOWN: usize = 4;
 const EXCERPT: usize = 180;
 const LEAD: usize = 50;
 
-/// One thread's searchable text: its id and its messages, in order.
+/// One thread's searchable text: its id and its messages, in order, each
+/// with the index of the block it's from.
 pub struct Doc {
     pub id: usize,
-    texts: Vec<String>,
+    texts: Vec<(usize, String)>,
 }
 
-/// A paragraph that holds the query, cut down to fit, with where it matched.
+/// A paragraph that holds the query, cut down to fit, with where it matched,
+/// and where it is: its block, and how many matching paragraphs come before
+/// it in that block, to find it again where the transcript draws it.
 pub struct Snippet {
     pub text: String,
     pub marks: Vec<Range<usize>>,
+    pub block: usize,
+    pub nth: usize,
 }
 
 pub struct Hit {
@@ -42,25 +47,27 @@ impl Results {
     }
 }
 
-/// The project's threads as text to search: what was said each way, leaving
-/// out tool output and the agent's private reasoning.
-pub fn docs(project: &Project) -> Vec<Doc> {
-    project
-        .threads
-        .iter()
-        .map(|t| Doc {
-            id: t.id,
-            texts: t
-                .blocks
-                .iter()
-                .filter_map(|b| match b {
-                    Block::User(m) => Some(m.text.to_string()),
-                    Block::Text(t) => Some(t.clone()),
-                    _ => None,
-                })
-                .collect(),
-        })
-        .collect()
+/// A thread's text to search, from its blocks in memory: what was said each
+/// way, leaving out tool output and the agent's private reasoning.
+pub fn doc(thread: &Thread) -> Doc {
+    Doc {
+        id: thread.id,
+        texts: thread
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b {
+                Block::User(m) => Some((i, m.text.to_string())),
+                Block::Text(t) => Some((i, t.clone())),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// A thread's text to search, as the database found it: (block, text) pairs.
+pub fn doc_from(id: usize, texts: Vec<(usize, String)>) -> Doc {
+    Doc { id, texts }
 }
 
 /// Every thread with a paragraph that holds `query`, ignoring case.
@@ -74,15 +81,22 @@ pub fn run(docs: &[Doc], query: &str) -> Vec<Hit> {
             let mut seen = HashSet::new();
             let mut snippets = Vec::new();
             let mut count = 0;
-            for paragraph in doc.texts.iter().flat_map(|t| paragraphs(t)) {
-                let text = collapse(paragraph);
-                let marks = find(&text, &needle);
-                if marks.is_empty() || !seen.insert(text.clone()) {
-                    continue;
-                }
-                count += 1;
-                if snippets.len() < SHOWN {
-                    snippets.push(excerpt(text, marks));
+            for (block, text) in &doc.texts {
+                let mut nth = 0;
+                for paragraph in paragraphs(text) {
+                    let text = collapse(paragraph);
+                    let marks = find(&text, &needle);
+                    if marks.is_empty() {
+                        continue;
+                    }
+                    nth += 1;
+                    if !seen.insert(text.clone()) {
+                        continue;
+                    }
+                    count += 1;
+                    if snippets.len() < SHOWN {
+                        snippets.push(excerpt(text, marks, *block, nth - 1));
+                    }
                 }
             }
             (count > 0).then(|| Hit { thread: doc.id, more: count - snippets.len(), snippets })
@@ -173,9 +187,9 @@ fn collapse(text: &str) -> String {
 }
 
 /// A long paragraph cut to the stretch around its first match.
-fn excerpt(text: String, marks: Vec<Range<usize>>) -> Snippet {
+fn excerpt(text: String, marks: Vec<Range<usize>>, block: usize, nth: usize) -> Snippet {
     if text.chars().count() <= EXCERPT {
-        return Snippet { text, marks };
+        return Snippet { text, marks, block, nth };
     }
     let first = marks[0].start;
     let lead = text[..first].chars().count();
@@ -189,7 +203,7 @@ fn excerpt(text: String, marks: Vec<Range<usize>>) -> Snippet {
         .filter(|m| m.start >= start && m.end <= end)
         .map(|m| m.start - start + shift..m.end - start + shift)
         .collect();
-    Snippet { text: format!("{pre}{}{post}", &text[start..end]), marks }
+    Snippet { text: format!("{pre}{}{post}", &text[start..end]), marks, block, nth }
 }
 
 #[cfg(test)]
@@ -197,7 +211,7 @@ mod tests {
     use super::*;
 
     fn doc(id: usize, texts: &[&str]) -> Doc {
-        Doc { id, texts: texts.iter().map(|t| t.to_string()).collect() }
+        Doc { id, texts: texts.iter().enumerate().map(|(i, t)| (i, t.to_string())).collect() }
     }
 
     #[test]
@@ -226,7 +240,7 @@ mod tests {
 
     #[test]
     fn counts_what_isnt_shown() {
-        let texts: Vec<String> = (0..7).map(|n| format!("match {n}")).collect();
+        let texts = (0..7).map(|n| (n, format!("match {n}"))).collect();
         let docs = [Doc { id: 1, texts }];
         let hits = run(&docs, "match");
         assert_eq!((hits[0].snippets.len(), hits[0].more), (SHOWN, 7 - SHOWN));
@@ -247,5 +261,12 @@ mod tests {
         let s = &hits[0].snippets[0];
         assert!(s.text.starts_with('…') && s.text.ends_with('…'));
         assert_eq!(&s.text[s.marks[0].clone()], "needle");
+    }
+
+    #[test]
+    fn snippets_know_where_they_are() {
+        let hits = run(&[doc(1, &["no", "a fox\n\nno fox here\n\nfox again", "the fox"])], "fox");
+        let at = hits[0].snippets.iter().map(|s| (s.block, s.nth)).collect::<Vec<_>>();
+        assert_eq!(at, [(1, 0), (1, 1), (1, 2), (2, 0)]);
     }
 }

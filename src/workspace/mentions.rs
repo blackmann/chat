@@ -416,7 +416,7 @@ impl Workspace {
     }
 
     /// Build the project's index in the background, unless a fresh one is there.
-    fn ensure_mention_index(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn ensure_mention_index(&mut self, cx: &mut Context<Self>) {
         let fresh = self.mention_index.as_ref().is_some_and(|i| i.project == self.current_project().path && i.built.elapsed() < STALE);
         if fresh || self.mention_indexing {
             return;
@@ -451,6 +451,18 @@ impl Workspace {
         let mut ranked: Vec<(i32, &Candidate)> = index.items.iter().filter_map(|c| score(&query, c).map(|s| (s, c))).collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.search.len().cmp(&b.1.search.len())));
         ranked.into_iter().take(SHOWN).map(|(_, c)| c).collect()
+    }
+
+    /// Files (not folders or symbols) whose path matches `query`, best first.
+    pub(super) fn file_matches(&self, query: &str, limit: usize) -> Vec<&Candidate> {
+        let Some(index) = self.mention_index.as_ref().filter(|i| i.project == self.current_project().path) else {
+            return Vec::new();
+        };
+        let query: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
+        let mut ranked: Vec<(i32, &Candidate)> =
+            index.items.iter().filter(|c| c.kind == Kind::File).filter_map(|c| score(&query, c).map(|s| (s, c))).collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.search.len().cmp(&b.1.search.len())));
+        ranked.into_iter().take(limit).map(|(_, c)| c).collect()
     }
 
     fn accept_mention(&mut self, pick: Option<usize>, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -551,6 +563,18 @@ impl Workspace {
                     for range in tokens(&text, &mentions) {
                         let inner = range.start + MARKER.len()..range.end - MARKER.len();
                         let lead = inner.start..inner.start + LEAD.len();
+                        // The token's markers and spaces are break points to the
+                        // wrapper, so it can split across rows. A range's bounds
+                        // only hold for one row, so a split chip is left as text.
+                        let last = inner.end - text[..inner.end].chars().next_back().map_or(0, char::len_utf8);
+                        let row_of = |ix: usize, state: &mut InputState, window: &mut Window, cx: &mut Context<InputState>| {
+                            let at = utf16(&text, ix);
+                            state.bounds_for_range(at..at, origin, window, cx).map(|b| b.top())
+                        };
+                        let first_row = row_of(inner.start, state, window, cx);
+                        if first_row.is_none() || first_row != row_of(last, state, window, cx) {
+                            continue;
+                        }
                         let whole = state.bounds_for_range(utf16(&text, inner.start)..utf16(&text, inner.end), origin, window, cx);
                         let pad = state.bounds_for_range(utf16(&text, lead.start)..utf16(&text, lead.end), origin, window, cx);
                         let mention = mentions.iter().find(|m| text[range.clone()] == m.token);

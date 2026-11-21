@@ -5,7 +5,6 @@ mod commands;
 mod effort;
 mod file_kind;
 mod find;
-mod grep;
 mod chrome;
 mod md;
 mod media;
@@ -31,7 +30,7 @@ use crate::{
     store,
     menu::{self as popover, Menu},
     model::{Block, Project, Session, Thread, ThreadState, tilde},
-    settings::{ActivityMode, FollowUpMode, Settings},
+    settings::{ActivityMode, FollowUpMode, Settings, ThreadSort},
     theme::{Palette, mono, palette},
 };
 use futures::StreamExt;
@@ -80,7 +79,9 @@ actions!(
         CloseFind,
         FindInFiles,
         CloseFileFind,
-        OpenFirstFound,
+        OpenFound,
+        FoundUp,
+        FoundDown,
     ]
 );
 
@@ -228,12 +229,9 @@ pub struct Workspace {
     /// The search box atop the Files page (⌘ ⇧ O), and whether it's showing.
     file_find: Entity<InputState>,
     file_find_open: bool,
-    /// What the last search of the files found, once it's done.
-    file_hits: Option<grep::Results>,
-    /// The search of the files under way.
-    file_searching: Option<Task<()>>,
-    /// Bumped by each new search, so older ones stop and their results are dropped.
-    file_search_generation: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The file picked among those found, and the list's scroll.
+    file_find_selected: usize,
+    file_find_scroll: ScrollHandle,
     /// What the last content search found, once it's done.
     thread_hits: Option<search::Results>,
     /// The search under way: for which project and query.
@@ -268,6 +266,10 @@ pub struct Workspace {
     anchors: Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>,
     prefs_open: bool,
     prefs_focus: FocusHandle,
+    /// The settings page showing, the search across them, and the page's scroll.
+    prefs_section: preferences::Section,
+    prefs_search: Entity<InputState>,
+    prefs_page_scroll: ScrollHandle,
     /// Installed font families, listed once when a font menu first opens.
     font_names: Rc<std::cell::OnceCell<Vec<String>>>,
     /// Instruction files found for each project (by folder; `None` for chats).
@@ -284,6 +286,9 @@ pub struct Workspace {
     live: Vec<usize>,
     /// A save is already scheduled.
     saving: bool,
+    /// Where threads are saved; `None` when the database couldn't be opened,
+    /// and nothing is.
+    store: Option<store::Store>,
     git_snapshots: HashMap<PathBuf, Result<crate::git::Snapshot, String>>,
     git_diffs: HashMap<(PathBuf, bool), Result<crate::git::Diff, String>>,
     git_refreshing: bool,
@@ -400,13 +405,15 @@ impl Workspace {
             }
         })
         .detach();
-        let file_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find in files"));
+        let file_find = cx.new(|cx| InputState::new(window, cx).placeholder("Go to file…"));
         cx.subscribe(&file_find, |s, _, e: &gpui_component::input::InputEvent, cx| {
             if let gpui_component::input::InputEvent::Change = e {
-                s.search_files(cx);
+                s.file_query_changed(cx);
             }
         })
         .detach();
+        let prefs_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search settings…"));
+        cx.observe(&prefs_search, |_, _, cx| cx.notify()).detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         cx.subscribe_in(&rename_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
             if let gpui_component::input::InputEvent::PressEnter { .. } = e {
@@ -419,8 +426,11 @@ impl Workspace {
         let mut projects = vec![Project::chats()];
         projects.extend(settings.projects.iter().filter(|p| p.path.is_dir()).cloned().map(Project::open));
         let mut next_thread = 0;
-        for project in &mut projects {
-            project.threads = store::load(project, &settings.agents, settings.agent, &mut next_thread);
+        let store = store::Store::open();
+        if let Some(store) = &store {
+            for project in &mut projects {
+                project.threads = store.load(project, &settings.agents, settings.agent, &mut next_thread);
+            }
         }
         let mut workspace = Self {
             focus: cx.focus_handle(),
@@ -453,9 +463,8 @@ impl Workspace {
             thread_find_open: false,
             file_find,
             file_find_open: false,
-            file_hits: None,
-            file_searching: None,
-            file_search_generation: Default::default(),
+            file_find_selected: 0,
+            file_find_scroll: ScrollHandle::new(),
             thread_hits: None,
             thread_searching: None,
             composer,
@@ -480,6 +489,9 @@ impl Workspace {
             anchors: Rc::default(),
             prefs_open: false,
             prefs_focus: cx.focus_handle(),
+            prefs_section: Default::default(),
+            prefs_search,
+            prefs_page_scroll: ScrollHandle::new(),
             font_names: Rc::default(),
             instructions: HashMap::new(),
             open_tools: HashSet::new(),
@@ -487,6 +499,7 @@ impl Workspace {
             thought_selection: HashMap::new(),
             live: Vec::new(),
             saving: false,
+            store,
             git_snapshots: HashMap::new(),
             git_diffs: HashMap::new(),
             git_refreshing: false,
@@ -567,7 +580,8 @@ impl Workspace {
         if workspace.current_project().threads.is_empty() {
             workspace.start_thread(cx);
         } else {
-            workspace.select_thread(0, cx);
+            let first = workspace.first_listed();
+            workspace.select_thread(first, cx);
         }
         workspace.start_git_watch(window, cx);
         cx.observe_window_activation(window, |s, window, cx| {
@@ -650,7 +664,7 @@ impl Workspace {
                 self.focus_terminal(cx);
             }
             None if threads.is_empty() => self.start_thread(cx),
-            None => self.select_thread(0, cx),
+            None => self.select_thread(self.first_listed(), cx),
         }
         self.refresh_git(cx);
     }
@@ -687,12 +701,37 @@ impl Workspace {
             let query = query.clone();
             async move |this, cx| {
                 cx.background_executor().timer(Duration::from_millis(150)).await;
-                let Ok(Some(docs)) = this.update(cx, |s, _| s.projects.get(project).map(search::docs)) else {
+                // Threads read in are searched as they are, saved or not; the
+                // rest through the database's index.
+                let Ok(Some((mut docs, db, ids))) = this.update(cx, |s, _| {
+                    let p = s.projects.get(project)?;
+                    let docs: Vec<search::Doc> = p.threads.iter().filter(|t| !t.unloaded).map(search::doc).collect();
+                    let ids: HashMap<i64, usize> = p.threads.iter().filter(|t| t.unloaded).filter_map(|t| Some((t.stored?, t.id))).collect();
+                    let db = s.store.as_ref().map(|st| (st.path().to_path_buf(), store::search_key(p)));
+                    Some((docs, db, ids))
+                }) else {
                     return;
                 };
                 let hits = cx.background_executor().spawn({
                     let query = query.clone();
-                    async move { search::run(&docs, &query) }
+                    async move {
+                        if let Some((path, key)) = db {
+                            let rows = store::search(&path, &key, &query).unwrap_or_else(|e| {
+                                eprintln!("chat: couldn't search threads: {e}");
+                                Vec::new()
+                            });
+                            let mut by_thread: Vec<(usize, Vec<(usize, String)>)> = Vec::new();
+                            for (stored, seq, text) in rows {
+                                let Some(&id) = ids.get(&stored) else { continue };
+                                match by_thread.last_mut() {
+                                    Some((last, texts)) if *last == id => texts.push((seq, text)),
+                                    _ => by_thread.push((id, vec![(seq, text)])),
+                                }
+                            }
+                            docs.extend(by_thread.into_iter().map(|(id, texts)| search::doc_from(id, texts)));
+                        }
+                        search::run(&docs, &query)
+                    }
                 });
                 let hits = hits.await;
                 let _ = this.update(cx, |s, cx| {
@@ -714,6 +753,10 @@ impl Workspace {
             self.restore_draft = true;
         }
         self.thread = index;
+        // A saved thread's blocks are read in when it's first shown.
+        if let (Some(store), Some(t)) = (&self.store, self.projects[self.project].threads.get_mut(index)) {
+            store.load_blocks(t);
+        }
         self.selection.borrow_mut().clear();
         self.active = 0;
         self.follow = true;
@@ -738,7 +781,7 @@ impl Workspace {
     /// so its models are there to pick from before the first message.
     fn start_thread(&mut self, cx: &mut Context<Self>) {
         // An untouched thread is already what a new one would be.
-        if let Some(blank) = self.current_project().threads.iter().position(|t| t.blocks.is_empty()) {
+        if let Some(blank) = self.current_project().threads.iter().position(|t| t.is_blank()) {
             return self.select_thread(blank, cx);
         }
         self.next_thread += 1;
@@ -769,7 +812,9 @@ impl Workspace {
                             let entry = crate::settings::ProjectEntry { path, name: None, folders: Vec::new() };
                             let mut project = Project::open(entry);
                             // A folder added back keeps the threads it had.
-                            project.threads = store::load(&project, &s.settings.agents, s.settings.agent, &mut s.next_thread);
+                            if let Some(store) = &s.store {
+                                project.threads = store.load(&project, &s.settings.agents, s.settings.agent, &mut s.next_thread);
+                            }
                             s.projects.push(project);
                             s.select_project(s.projects.len() - 1, cx);
                         }
@@ -905,7 +950,7 @@ impl Workspace {
         t.ready = false;
         t.supports_steering = false;
         t.problem = None;
-        if t.state == ThreadState::Failed && t.blocks.is_empty() {
+        if t.state == ThreadState::Failed && t.is_blank() {
             t.state = ThreadState::Idle;
         }
         t.settings.clear();
@@ -982,28 +1027,51 @@ impl Workspace {
         }
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(800)).await;
-            let Ok(snapshots) = this.update(cx, |s, _| {
+            let Ok(Some((writer, plan))) = this.update(cx, |s, _| {
                 s.saving = false;
-                s.snapshots()
+                s.save_plan()
             }) else {
                 return;
             };
             cx.background_executor()
                 .spawn(async move {
-                    for (path, bytes) in snapshots {
-                        let _ = store::write(&path, &bytes);
+                    if let Err(e) = store::write(&writer, &plan) {
+                        eprintln!("chat: couldn't save threads: {e}");
                     }
                 })
                 .await;
         })
         .detach();
     }
-    fn snapshots(&self) -> Vec<(PathBuf, Vec<u8>)> {
-        self.projects.iter().filter_map(|p| store::snapshot(p, &self.settings.agents)).collect()
+    /// What to write now, with the connection to write it on. Threads put
+    /// away a while are let go of here, once what they hold is in the plan.
+    fn save_plan(&mut self) -> Option<(std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>, store::Plan)> {
+        let store = self.store.as_mut()?;
+        let plan = store.plan(&mut self.projects, &self.settings.agents);
+        let writer = store.writer();
+        self.unload_put_away(&plan.untouched());
+        Some((writer, plan))
     }
     fn save_now(&mut self) {
-        for (path, bytes) in self.snapshots() {
-            let _ = store::write(&path, &bytes);
+        if let Some((writer, plan)) = self.save_plan()
+            && let Err(e) = store::write(&writer, &plan)
+        {
+            eprintln!("chat: couldn't save threads: {e}");
+        }
+    }
+    /// Let go of the blocks of saved threads nobody's looking at: not on
+    /// show, not the one a project goes back to, with no agent running. Only
+    /// those with nothing new to write, so a read can't race the write. They're
+    /// read back in when next opened.
+    fn unload_put_away(&mut self, saved: &HashSet<i64>) {
+        let showing = self.current_thread().map(|t| t.id);
+        let kept: HashSet<usize> = self.views.values().filter_map(|v| v.thread).chain(showing).collect();
+        for t in self.projects.iter_mut().flat_map(|p| &mut p.threads) {
+            if t.stored.is_some_and(|id| saved.contains(&id)) && !t.unloaded && t.session.is_none() && !t.is_active() && !kept.contains(&t.id) {
+                t.blocks = Vec::new();
+                t.saved = Vec::new();
+                t.unloaded = true;
+            }
         }
     }
     fn on_event(&mut self, id: usize, event: Event, cx: &mut Context<Self>) {
@@ -1834,7 +1902,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &CloseFind, window, cx| s.close_thread_find(window, cx)))
             .on_action(cx.listener(|s, _: &FindInFiles, window, cx| s.open_file_find(window, cx)))
             .on_action(cx.listener(|s, _: &CloseFileFind, window, cx| s.close_file_find(window, cx)))
-            .on_action(cx.listener(|s, _: &OpenFirstFound, _, cx| s.open_first_found(cx)))
+            .on_action(cx.listener(|s, _: &OpenFound, _, cx| s.open_found(cx)))
+            .on_action(cx.listener(|s, _: &FoundUp, _, cx| s.file_find_step(-1, cx)))
+            .on_action(cx.listener(|s, _: &FoundDown, _, cx| s.file_find_step(1, cx)))
             // Letting go of ⌘ takes the link away from the word under the pointer.
             .on_modifiers_changed(cx.listener(|s, e: &ModifiersChangedEvent, _, cx| s.lsp_modifiers(e.modifiers.platform, cx)))
             // Escape interrupts the agent, as the transcript says it will.

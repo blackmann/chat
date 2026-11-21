@@ -440,7 +440,7 @@ impl Workspace {
                 .child(label(colors, self.side.title()).flex_1())
                 .when(self.side == Side::Files && !self.current_project().roots().is_empty(), |s| {
                     s.child(
-                        icon_button("find-in-files", IconName::Search, "Find in files · ⌘ ⇧ O")
+                        icon_button("find-in-files", IconName::Search, "Go to file · ⌘ ⇧ O")
                             .on_click(cx.listener(|s, _, window, cx| s.open_file_find(window, cx))),
                     )
                 }),
@@ -456,12 +456,17 @@ impl Workspace {
                 .into_any_element();
         }
         let finding = self.side == Side::Files && self.file_find_open;
-        let page = match self.side {
-            Side::Context => self.context_page(cx),
-            Side::Changes => self.changes_page(cx),
-            // With something typed in the search box, what it found takes the tree's place.
-            Side::Files if finding && !self.file_find.read(cx).value().trim().is_empty() => self.file_results(cx),
-            Side::Files => self.files_page(cx),
+        // With something typed in the search box, the files it matches take the
+        // tree's place, in a list of their own so the pick can scroll into view.
+        let body = if finding && !self.file_find.read(cx).value().trim().is_empty() {
+            self.file_results(cx)
+        } else {
+            let page = match self.side {
+                Side::Context => self.context_page(cx),
+                Side::Changes => self.changes_page(cx),
+                Side::Files => self.files_page(cx),
+            };
+            div().id("side-page").flex_1().min_h_0().overflow_y_scroll().child(page).into_any_element()
         };
         col()
             .size_full()
@@ -470,7 +475,7 @@ impl Workspace {
             .border_color(rgb(colors.border))
             .child(strip)
             .when(finding, |s| s.child(self.file_find_box(colors, cx)))
-            .child(div().id("side-page").flex_1().min_h_0().overflow_y_scroll().child(page))
+            .child(body)
             .into_any_element()
     }
 }

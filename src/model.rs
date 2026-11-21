@@ -249,6 +249,17 @@ pub struct Thread {
     /// When the running turn began, to tell how long it worked once it ends.
     /// Saved, so a turn cut off by quitting can still say how long it ran.
     pub turn_began: Option<i64>,
+    /// When the first message was sent, in ms since the epoch. Saved, so the
+    /// list can sort without reading the transcript.
+    pub created_at: Option<i64>,
+    /// When a message was last sent or a turn last ended. Saved, like `created_at`.
+    pub active_at: Option<i64>,
+    /// Its row in the database, once saved.
+    pub stored: Option<i64>,
+    /// Saved, but its blocks not read back yet: they're read when it's opened.
+    pub unloaded: bool,
+    /// A hash of each block as last saved, so a save writes only what changed.
+    pub saved: Vec<u64>,
     /// One steer awaits a reply before the next follow-up can be dispatched.
     pending_steer: Option<(usize, QueuedMessage)>,
     pub queued: VecDeque<QueuedMessage>,
@@ -293,6 +304,11 @@ impl Thread {
             defaults: Vec::new(),
             turn_start: 0,
             turn_began: None,
+            created_at: None,
+            active_at: None,
+            stored: None,
+            unloaded: false,
+            saved: Vec::new(),
             pending_steer: None,
             queued: VecDeque::new(),
         }
@@ -302,6 +318,11 @@ impl Thread {
             let _ = session.commands.unbounded_send(command);
         }
     }
+    /// Nothing said in it yet: a new thread. One saved but not read back
+    /// has blocks, they just aren't here.
+    pub fn is_blank(&self) -> bool {
+        !self.unloaded && self.blocks.is_empty()
+    }
     pub fn notice(&mut self, text: impl Into<String>) {
         self.blocks.push(Block::Notice(text.into()));
     }
@@ -309,6 +330,7 @@ impl Thread {
         self.turn_start = self.blocks.len();
         self.blocks.push(Block::User(Message::now(shown)));
         self.turn_began = Some(now_ms());
+        self.mark_active(now_ms());
         self.state = ThreadState::Running;
         self.send(Command::Prompt(prompt));
     }
@@ -349,6 +371,7 @@ impl Thread {
         if busy {
             let index = self.blocks.len();
             self.blocks.push(Block::User(Message::now(message.shown.clone())));
+            self.mark_active(now_ms());
             self.send(Command::Steer(message.prompt.clone()));
             self.pending_steer = Some((index, message));
         } else {
@@ -385,6 +408,7 @@ impl Thread {
     fn stamp_turn_at(&mut self, at: i64) {
         if let Some(began) = self.turn_began.take() {
             self.blocks.push(Block::TurnEnded { at, worked_ms: (at - began).max(0) as u64 });
+            self.mark_active(at);
         }
     }
     /// A turn that ends leaves no tool call running.
@@ -575,6 +599,19 @@ impl Thread {
         }
         self.settings.iter().map(|s| (s.id.clone(), s.current.clone())).collect()
     }
+    /// Something happened at `at`: the thread's first time is when it began,
+    /// its latest when it was last active.
+    pub fn mark_active(&mut self, at: i64) {
+        self.created_at.get_or_insert(at);
+        self.active_at = Some(self.active_at.map_or(at, |a| a.max(at)));
+    }
+
+    /// When the thread began, in ms since the epoch: its first message sent.
+    /// `None` for a thread with no times to go on.
+    pub fn started(&self) -> Option<i64> {
+        self.created_at
+    }
+
     /// When anything last happened here, in ms since the epoch: now while a turn
     /// runs, else the latest message sent or turn ended. `None` for a thread
     /// with no times to go on.
@@ -582,14 +619,7 @@ impl Thread {
         if self.state.busy() {
             return Some(now_ms());
         }
-        self.blocks
-            .iter()
-            .filter_map(|b| match b {
-                Block::User(m) => m.at,
-                Block::TurnEnded { at, .. } => Some(*at),
-                _ => None,
-            })
-            .max()
+        self.active_at
     }
 
     /// Bring a thread read from disk to rest: nothing can still be running in a
@@ -749,9 +779,10 @@ mod tests {
     fn last_active_is_the_latest_time_or_now_while_busy() {
         let mut t = Thread::new(1, 0);
         assert_eq!(t.last_active(), None);
-        t.blocks.push(Block::User(Message { text: "hi".into(), at: Some(1_000) }));
-        t.blocks.push(Block::TurnEnded { at: 5_000, worked_ms: 4_000 });
-        t.blocks.push(Block::User(Message { text: "old".into(), at: None }));
+        t.mark_active(1_000);
+        t.mark_active(5_000);
+        t.mark_active(3_000);
+        assert_eq!(t.started(), Some(1_000));
         assert_eq!(t.last_active(), Some(5_000));
         t.state = ThreadState::Running;
         assert!(t.last_active().unwrap() > 5_000);

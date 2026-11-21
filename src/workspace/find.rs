@@ -1,13 +1,12 @@
-//! Finding text: in the thread showing (⌘ F), marked where it's drawn and
-//! stepped through with ↵ and ⇧ ↵; and in the project's files (⌘ ⇧ O), listed
-//! on the Files page.
+//! Finding things: text in the thread showing (⌘ F), marked where it's drawn
+//! and stepped through with ↵ and ⇧ ↵; and files by name (⌘ ⇧ O), listed on
+//! the Files page from the same index `@` mentions use.
 use super::ui::*;
 use super::*;
-use gpui_component::{Icon, IconName, Sizable, input::Input};
-use std::sync::atomic::Ordering;
+use gpui_component::{Icon, IconName, Sizable, input::Input, scroll::ScrollableElement};
 
-/// How long typing pauses before the files are searched.
-const SETTLE: Duration = Duration::from_millis(150);
+/// Files listed for a query; past these, typing more narrows it.
+const SHOWN_FILES: usize = 100;
 
 impl Workspace {
     // ── In the thread ───────────────────────────────────────────────────────
@@ -100,12 +99,49 @@ impl Workspace {
         if at.y >= view.top() + margin && at.y + line <= view.bottom() - margin {
             return;
         }
-        // A third of the way down, where the eye looks first.
-        let offset = self.transcript.offset();
-        let max = self.transcript.max_offset().height;
-        let y = (offset.y - (at.y - (view.top() + view.size.height / 3.))).clamp(-max, px(0.));
-        self.transcript.set_offset(point(offset.x, y));
+        scroll_to_third(&self.transcript, at.y);
         self.follow = false;
+    }
+
+    // ── From a search result ────────────────────────────────────────────────
+
+    /// Open thread `index` at the paragraph a search result came from: the
+    /// `nth` paragraph holding the query in block `block`. It's found once the
+    /// transcript has drawn, then scrolled to and lit for a moment.
+    pub(super) fn reveal_hit(&mut self, index: usize, block: usize, nth: usize, cx: &mut Context<Self>) {
+        self.select_thread(index, cx);
+        self.follow = false;
+        let needle = self.thread_search.read(cx).value().trim().to_lowercase();
+        let mut selection = self.selection.borrow_mut();
+        // What's recorded is the last thread's; wait for this one to draw.
+        selection.forget_layout();
+        selection.flash = None;
+        selection.reveal = Some(select::Reveal { block, nth, needle, frames: 4 });
+        cx.notify();
+    }
+
+    /// Bring a pending search result into view and light it, once drawn.
+    /// Run before the segments are forgotten for the next frame.
+    pub(super) fn resolve_reveal(&self, window: &Window, colors: Palette) {
+        let mut selection = self.selection.borrow_mut();
+        let Some(reveal) = selection.reveal.take() else { return };
+        let Some(key) = selection.revealed(&reveal) else {
+            if reveal.frames > 0 {
+                selection.reveal = Some(select::Reveal { frames: reveal.frames - 1, ..reveal });
+                window.request_animation_frame();
+            }
+            return;
+        };
+        if let Some(bounds) = selection.bounds(key) {
+            scroll_to_third(&self.transcript, bounds.top());
+        }
+        selection.flash = Some(select::Flash {
+            key,
+            needle: reveal.needle,
+            tint: Hsla::from(rgb(colors.amber)).opacity(0.6),
+            began: std::time::Instant::now(),
+        });
+        window.request_animation_frame();
     }
 
     /// Where the current match is among them all, as the bar shows it.
@@ -171,67 +207,68 @@ impl Workspace {
             )
     }
 
-    // ── In the files ────────────────────────────────────────────────────────
+}
+
+/// Scroll the transcript so what's drawn at `y` sits a third of the way down,
+/// where the eye looks first.
+fn scroll_to_third(transcript: &ScrollHandle, y: Pixels) {
+    let view = transcript.bounds();
+    let offset = transcript.offset();
+    let max = transcript.max_offset().height;
+    let to = (offset.y - (y - (view.top() + view.size.height / 3.))).clamp(-max, px(0.));
+    transcript.set_offset(point(offset.x, to));
+}
+
+impl Workspace {
+    // ── Files by name ───────────────────────────────────────────────────────
 
     pub(super) fn open_file_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.side_open = true;
         self.side = Side::Files;
         self.file_find_open = true;
+        self.file_find_selected = 0;
         self.file_find.update(cx, |s, cx| s.focus(window, cx));
         window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
-        // Files change between searches; look again.
-        self.search_files(cx);
+        self.ensure_mention_index(cx);
+        cx.notify();
     }
 
     pub(super) fn close_file_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.file_find_open = false;
-        self.file_searching = None;
-        self.file_search_generation.fetch_add(1, Ordering::Relaxed);
         self.focus.focus(window);
         cx.notify();
     }
 
-    /// Search the project's files for what the box holds, once typing settles.
-    pub(super) fn search_files(&mut self, cx: &mut Context<Self>) {
-        let query = self.file_find.read(cx).value().to_string();
-        let generation = self.file_search_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        if query.trim().is_empty() {
-            self.file_hits = None;
-            self.file_searching = None;
-            cx.notify();
-            return;
-        }
-        let roots = self.current_project().roots();
-        let project = self.project;
-        let counter = self.file_search_generation.clone();
-        self.file_searching = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SETTLE).await;
-            let q = query.clone();
-            let (files, truncated) =
-                cx.background_executor().spawn(async move { grep::run(&roots, &q, SKIPPED, &counter, generation) }).await;
-            let _ = this.update(cx, |s, cx| {
-                if s.file_search_generation.load(Ordering::Relaxed) != generation {
-                    return;
-                }
-                s.file_hits = Some(grep::Results { project, query, files, truncated });
-                s.file_searching = None;
-                cx.notify();
-            });
-        }));
+    pub(super) fn file_query_changed(&mut self, cx: &mut Context<Self>) {
+        self.file_find_selected = 0;
+        self.file_find_scroll.scroll_to_item(0);
+        self.ensure_mention_index(cx);
         cx.notify();
     }
 
-    /// Open the first file found, at its first matching line.
-    pub(super) fn open_first_found(&mut self, cx: &mut Context<Self>) {
-        let first = self
-            .file_hits
-            .as_ref()
-            .filter(|r| r.project == self.project)
-            .and_then(|r| r.files.first())
-            .and_then(|f| f.lines.first().map(|l| (f.path.clone(), l.number)));
-        if let Some((path, line)) = first {
-            self.open_at(path, Some((line, line)), cx);
+    /// The files matching what the box holds, best first.
+    pub(super) fn found_files(&self, cx: &App) -> Vec<&super::mentions::Candidate> {
+        self.file_matches(&self.file_find.read(cx).value(), SHOWN_FILES)
+    }
+
+    /// Move the pick up or down the list, stopping at its ends.
+    pub(super) fn file_find_step(&mut self, step: isize, cx: &mut Context<Self>) {
+        let n = self.found_files(cx).len();
+        if n == 0 {
+            return;
         }
+        self.file_find_selected = (self.file_find_selected as isize + step).clamp(0, n as isize - 1) as usize;
+        self.file_find_scroll.scroll_to_item(self.file_find_selected);
+        cx.notify();
+    }
+
+    /// Open the picked file.
+    pub(super) fn open_found(&mut self, cx: &mut Context<Self>) {
+        let found = self.found_files(cx);
+        let Some(path) = found.get(self.file_find_selected.min(found.len().saturating_sub(1))).map(|c| c.path.clone()) else {
+            return;
+        };
+        self.open(TabKind::File(path), cx);
     }
 
     /// The search box pinned atop the Files page.
@@ -252,98 +289,54 @@ impl Workspace {
                     .appearance(false)
                     .prefix(icon(IconName::Search).text_color(rgb(colors.muted))),
             )
-            .when(self.file_searching.is_some(), |s| s.child(spinner(colors)))
+            .when(self.mention_indexing, |s| s.child(spinner(colors)))
             .child(
                 icon_button("file-find-close", IconName::Close, "Close · esc")
                     .on_click(cx.listener(|s, _, window, cx| s.close_file_find(window, cx))),
             )
     }
 
-    /// What the search found, by file, each line a link to where it is.
-    pub(super) fn file_results(&self, cx: &mut Context<Self>) -> Div {
+    /// The files matching the box, the picked one lit; a click opens one.
+    pub(super) fn file_results(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
-        let Some(results) = self.file_hits.as_ref().filter(|r| r.project == self.project) else {
-            return col();
-        };
-        if results.files.is_empty() {
-            return label(colors, format!("Nothing matches “{}”.", results.query)).p_3();
+        let found = self.found_files(cx);
+        if found.is_empty() {
+            let why = if self.mention_indexing { "Looking through the files…" } else { "No file matches." };
+            return label(colors, why).p_3().into_any_element();
         }
-        let lines = results.lines();
-        let summary = format!(
-            "{}{lines} {} in {} {}",
-            if results.truncated { "First " } else { "" },
-            if lines == 1 { "line" } else { "lines" },
-            results.files.len(),
-            if results.files.len() == 1 { "file" } else { "files" },
-        );
-        let mut list = col().py_1().child(label(colors, summary).px_3().py(px(6.)));
-        let mono_size = px(crate::theme::scaled_mono(11.5));
-        for (f, file) in results.files.iter().enumerate() {
-            let relative = self.relative(&file.path);
-            let (name, dir) = match relative.rsplit_once('/') {
-                Some((dir, name)) => (name.to_string(), Some(SharedString::from(dir.to_string()))),
-                None => (relative.clone(), None),
-            };
+        let selected = self.file_find_selected.min(found.len() - 1);
+        let mut list = col().py_1();
+        for (i, file) in found.into_iter().enumerate() {
             let (glyph, tint) = super::file_kind::file_kind(&file.path);
+            let detail = (!file.detail.is_empty()).then(|| (SharedString::from(file.detail.clone()), Hsla::from(rgb(colors.quiet))));
             list = list.child(
                 row()
-                    .id(("found-file", f))
+                    .id(("found-file", i))
                     .h(px(26.))
                     .mx_1()
                     .px_2()
                     .gap(px(6.))
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .hover(|s| s.bg(rgb(colors.hover)))
+                    .when(i == selected, |s| s.bg(rgb(colors.selected)))
+                    .when(i != selected, |s| s.hover(|s| s.bg(rgb(colors.hover))))
                     .child(icon(Icon::empty().path(glyph)).text_color(rgb(tint.color(colors))))
-                    .child(
-                        line_with_detail(name, dir.map(|d| (d, Hsla::from(rgb(colors.quiet)))), 18.).flex_1().min_w_0(),
-                    )
-                    .child(count_badge(colors, file.lines.len()))
+                    .child(line_with_detail(file.label.clone(), detail, 18.).flex_1().min_w_0())
                     .on_click(cx.listener({
                         let path = file.path.clone();
-                        move |s, _, _, cx| s.open(TabKind::File(path.clone()), cx)
+                        move |s, _, _, cx| {
+                            s.file_find_selected = i;
+                            s.open(TabKind::File(path.clone()), cx)
+                        }
                     })),
             );
-            for (l, line) in file.lines.iter().enumerate() {
-                let highlights = line
-                    .marks
-                    .iter()
-                    .map(|m| {
-                        (m.clone(), HighlightStyle { background_color: Some(Hsla::from(rgb(colors.amber)).opacity(0.3)), ..Default::default() })
-                    })
-                    .collect::<Vec<_>>();
-                list = list.child(
-                    row()
-                        .id(SharedString::from(format!("found-{f}-{l}")))
-                        .items_start()
-                        .mx_1()
-                        .pl(px(28.))
-                        .pr_2()
-                        .py(px(3.))
-                        .gap_2()
-                        .rounded(px(5.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(colors.hover)))
-                        .font_family(mono())
-                        .text_size(mono_size)
-                        .child(div().flex_shrink_0().min_w(px(24.)).text_right().text_color(rgb(colors.quiet)).child(line.number.to_string()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .text_color(rgb(colors.muted))
-                                .child(StyledText::new(line.text.clone()).with_highlights(highlights)),
-                        )
-                        .on_click(cx.listener({
-                            let (path, number) = (file.path.clone(), line.number);
-                            move |s, _, _, cx| s.open_at(path.clone(), Some((number, number)), cx)
-                        })),
-                );
-            }
         }
-        list
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .child(div().id("found-files").size_full().overflow_y_scroll().track_scroll(&self.file_find_scroll).child(list))
+            .vertical_scrollbar(&self.file_find_scroll)
+            .into_any_element()
     }
 }
