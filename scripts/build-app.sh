@@ -36,11 +36,21 @@ PLIST
 # macOS remembers privacy grants (Documents, Screen Recording, ...) by the
 # app's signature. An ad-hoc signature is just a hash of this build, so every
 # update would look like a new app and ask again. A real identity keeps the
-# grants across builds: CHAT_SIGN_IDENTITY if set, else the first Developer ID
-# or Apple Development certificate in the keychain.
+# grants across builds. In order: CHAT_SIGN_IDENTITY if set, else the identity
+# saved by `install-app.sh --choose-identity` (if still in the keychain), else
+# the first Developer ID or Apple Development certificate.
+saved_identity_file=".signing-identity"
 identity="${CHAT_SIGN_IDENTITY:-}"
+identities=$(security find-identity -v -p codesigning 2>/dev/null || true)
+if [ -z "$identity" ] && [ -f "$saved_identity_file" ]; then
+  saved=$(tr -d '[:space:]' < "$saved_identity_file")
+  if [ -n "$saved" ] && printf '%s\n' "$identities" | grep -qF "$saved"; then
+    identity="$saved"
+  else
+    printf 'Saved signing identity %s is no longer in the keychain; run install-app.sh --choose-identity to pick another.\n' "$saved" >&2
+  fi
+fi
 if [ -z "$identity" ]; then
-  identities=$(security find-identity -v -p codesigning 2>/dev/null || true)
   for kind in "Developer ID Application" "Apple Development"; do
     identity=$(printf '%s\n' "$identities" | sed -n "s/.*\"\($kind: .*\)\"/\1/p" | head -n 1)
     [ -n "$identity" ] && break
