@@ -3,6 +3,8 @@
 use super::ui::*;
 use super::*;
 use crate::icons::Glyph;
+use gpui::{Animation, AnimationExt, ease_out_quint};
+use std::time::Duration;
 use gpui_component::{
     Icon, IconName, Sizable, TitleBar,
     button::{Button, ButtonVariants},
@@ -56,8 +58,13 @@ fn initials(name: &str) -> String {
     name.chars().take(2).collect::<String>().to_uppercase()
 }
 
+/// How long a project goes without activity before its colour greys out.
+const STALE_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// A project's colour, from its parent folder and name, so it stays put when
-/// projects move. FNV-1a, so it doesn't change between Rust releases.
+/// projects move. FNV-1a, so it doesn't change between Rust releases. Any hue
+/// on the wheel, with a little play in saturation and lightness, kept bright
+/// enough to read on the theme.
 fn project_hue(colors: Palette, path: &Path) -> u32 {
     let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let key = format!("{}/{}", path.parent().map(name).unwrap_or_default(), name(path));
@@ -66,22 +73,67 @@ fn project_hue(colors: Palette, path: &Path) -> u32 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    colors.lane(hash as usize)
+    let h = (hash % 360) as f32 / 360.;
+    let s = 0.55 + ((hash >> 16) % 30) as f32 / 100.;
+    let l = if colors.dark { 0.62 } else { 0.40 } + ((hash >> 32) % 10) as f32 / 100.;
+    let c = Rgba::from(hsla(h, s, l, 1.));
+    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
+    byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b)
 }
 
-/// A project's initials on its colour.
-fn face(name: &str, hue: u32, size: f32) -> Div {
+/// A project's initials on a folder of its colour: a tab over a body, the
+/// body squared off where the tab joins it so the two read as one shape.
+/// `fill` is the body's opacity; `hover` lifts it under the group "project".
+fn face(name: &str, hue: u32, size: f32, fill: f32, hover: Option<f32>) -> Div {
+    let paint = |d: Div| {
+        d.bg(Hsla::from(rgb(hue)).opacity(fill))
+            .when_some(hover, |d, h| d.group_hover("project", move |s| s.bg(Hsla::from(rgb(hue)).opacity(h))))
+    };
+    let tab = size * 0.1;
     div()
+        .relative()
         .size(px(size))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(Hsla::from(rgb(hue)).opacity(0.24))
-        .text_color(rgb(hue))
-        .text_size(px(crate::theme::scaled_ui(12.)))
-        .font_weight(FontWeight::SEMIBOLD)
-        .child(initials(name))
+        .child(paint(div().absolute().top(px(size * 0.16)).left_0().w(px(size * 0.4)).h(px(tab)).rounded_t(px(3.))))
+        .child(
+            paint(
+                div()
+                    .absolute()
+                    .top(px(size * 0.16 + tab))
+                    .left_0()
+                    .right_0()
+                    .bottom(px(size * 0.06))
+                    .rounded_tr(px(5.))
+                    .rounded_b(px(5.)),
+            )
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(hue))
+            .text_size(px(crate::theme::scaled_ui(11.)))
+            .font_weight(FontWeight::SEMIBOLD)
+            .child(initials(name)),
+        )
+}
+
+/// An amber dot that breathes while an agent works: a solid core with a halo
+/// swelling out of it and fading, once every 1.4s.
+fn pulse(id: impl Into<ElementId>, color: u32) -> Div {
+    const CORE: f32 = 8.;
+    const REACH: f32 = 16.;
+    let halo = div().absolute().rounded_full().bg(rgb(color)).with_animation(
+        id,
+        Animation::new(Duration::from_millis(1400)).repeat().with_easing(ease_out_quint()),
+        |halo, t| {
+            let size = CORE + (REACH - CORE) * t;
+            let at = (REACH - size) / 2.;
+            halo.size(px(size)).top(px(at)).left(px(at)).opacity(0.55 * (1. - t))
+        },
+    );
+    let at = (REACH - CORE) / 2.;
+    div()
+        .size(px(REACH))
+        .child(halo)
+        .child(div().absolute().top(px(at)).left(px(at)).size(px(CORE)).rounded_full().bg(rgb(color)))
 }
 
 /// A project being dragged along the rail, to a new place.
@@ -93,7 +145,7 @@ struct DraggedProject {
 }
 impl Render for DraggedProject {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().opacity(0.85).child(face(&self.name, self.hue, 34.))
+        div().opacity(0.85).child(face(&self.name, self.hue, 34., 0.24, None))
     }
 }
 
@@ -276,7 +328,14 @@ impl Workspace {
         let mut list = col().items_center().pt_2().gap(px(2.));
         for (i, p) in self.projects.iter().enumerate() {
             let active = self.project == i;
-            let hue = p.path.as_deref().map_or(colors.muted, |path| project_hue(colors, path));
+            // Projects untouched for a day fade to grey. One with no times at
+            // all, like one just added, keeps its colour.
+            let last = p.threads.iter().filter_map(|t| t.last_active()).max();
+            let stale = last.is_some_and(|at| crate::model::now_ms() - at > STALE_MS);
+            let hue = match p.path.as_deref() {
+                Some(path) if !stale => project_hue(colors, path),
+                _ => colors.muted,
+            };
             // Where a dragged project would land: a dash above this one (gap `i`),
             // or below the last (gap `len`). Gaps either side of the dragged
             // project would leave it where it is, so they show nothing.
@@ -291,10 +350,15 @@ impl Workspace {
             });
             let running = p.threads.iter().any(|t| t.state == ThreadState::Running);
             let review = p.threads.iter().any(|t| t.state == ThreadState::Waiting);
+            let unread = p.threads.iter().filter(|t| t.unread).count();
             let tip = match &p.path {
                 Some(path) if p.folders.is_empty() => format!("{} · {}", p.name, tilde(path)),
                 Some(path) => format!("{} · {} and {} more", p.name, tilde(path), p.folders.len()),
                 None => "Chats · not tied to a project".to_string(),
+            };
+            let tip = match unread {
+                0 => tip,
+                n => format!("{tip} · {n} unread"),
             };
             list = list.child(
                 row()
@@ -319,34 +383,58 @@ impl Workspace {
                     .child(
                         div()
                             .relative()
+                            .group("project")
                             .size(px(34.))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
-                            .border_2()
-                            .border_color(if active { Hsla::from(rgb(colors.blue)) } else { transparent_black() })
-                            .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
-                            .text_color(rgb(hue))
-                            .text_size(px(crate::theme::scaled_ui(12.)))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
                             .map(|s| match p.path {
-                                Some(_) => s.child(initials(&p.name)),
-                                None => s.child(icon(Glyph::Message).size(px(15.))),
+                                Some(_) => s.child(face(
+                                    &p.name,
+                                    hue,
+                                    34.,
+                                    if active { 0.24 } else { 0.14 },
+                                    (!active).then_some(0.24),
+                                )),
+                                None => s
+                                    .rounded_full()
+                                    .border_2()
+                                    .border_color(if active { Hsla::from(rgb(colors.blue)) } else { transparent_black() })
+                                    .bg(Hsla::from(rgb(hue)).opacity(if active { 0.24 } else { 0.14 }))
+                                    .text_color(rgb(hue))
+                                    .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
+                                    .child(icon(Glyph::Message).size(px(15.))),
                             })
-                            .when(running || review, |s| {
-                                s.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-3.))
-                                        .right(px(-3.))
-                                        .size(px(10.))
-                                        .rounded_full()
-                                        .border_2()
-                                        .border_color(rgb(colors.chrome))
-                                        .bg(rgb(if running { colors.amber } else { colors.blue })),
-                                )
+                            // Finished threads you haven't looked at, counted on a blue
+                            // pill; otherwise a dot for one at work or waiting on you.
+                            .map(|s| {
+                                let badge = div()
+                                    .absolute()
+                                    .top(px(if p.path.is_some() { 0. } else { -3. }))
+                                    .right(px(-4.))
+                                    .rounded_full();
+                                if unread > 0 {
+                                    s.child(
+                                        badge
+                                            .min_w(px(14.))
+                                            .h(px(14.))
+                                            .px(px(3.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .bg(rgb(colors.blue))
+                                            .text_color(rgb(colors.primary_text))
+                                            .text_size(px(crate::theme::scaled_ui(9.)))
+                                            .font_weight(FontWeight::BOLD)
+                                            .child(if unread > 9 { "9+".to_string() } else { unread.to_string() }),
+                                    )
+                                } else if running {
+                                    s.child(pulse(("project-pulse", i), colors.amber).absolute().top(px(1.)).right(px(-3.)))
+                                } else if review {
+                                    s.child(badge.size(px(10.)).border_2().border_color(rgb(colors.chrome)).bg(rgb(colors.blue)))
+                                } else {
+                                    s
+                                }
                             }),
                     )
                     .map(|s| match dash {
@@ -578,7 +666,9 @@ impl Workspace {
         let colors = palette(cx);
         // The chat stays put at the start; the other tabs scroll behind it.
         let mut fixed_tabs = Vec::new();
-        let mut tabs = row().id("tabs-scroll").h_full().overflow_x_scroll().track_scroll(&self.tabs_scroll);
+        // Fixed heights, not `h_full`: percentages through the scroll strip can
+        // resolve against an indefinite height and collapse the tabs to their content.
+        let mut tabs = row().id("tabs-scroll").h(px(BAR)).overflow_x_scroll().track_scroll(&self.tabs_scroll);
         // Bring the active tab into view when it changes. Children of the strip
         // are the unpinned tabs, so count those that come before it.
         if let Some(active) = self.tabs.get(self.active) {
@@ -618,10 +708,23 @@ impl Workspace {
                     (format!("{name} logs"), folder)
                 }
             };
+            // What the tab holds in full: the label is cut short, the tooltip isn't.
+            let tip = {
+                let full = |path: &Path| crate::model::tilde(path);
+                let what = match &t.kind {
+                    TabKind::Chat => self.current_thread().map_or_else(|| "Chat".to_string(), |thread| thread.title.to_string()),
+                    TabKind::File(path) => full(path),
+                    TabKind::Diff(path) => format!("This thread's changes · {}", full(path)),
+                    TabKind::GitDiff(path, staged) => format!("{} changes · {}", if *staged { "Staged" } else { "Unstaged" }, full(path)),
+                    TabKind::Terminal(cwd) => format!("Terminal · {}", full(cwd)),
+                    TabKind::ServerLog(name, root) => format!("{name} logs · {}", full(root)),
+                };
+                SharedString::from(if stale { format!("{what}\nOut of date — open it to see why") } else { what })
+            };
             let tab = row()
                     .id(("tab", t.id))
                     .group(group.clone())
-                    .h_full()
+                    .h(px(BAR))
                     .pl_3()
                     .pr_1()
                     .gap(px(6.))
@@ -655,7 +758,7 @@ impl Workspace {
                         // A stale tab's name is struck through (its text style reaches the label's runs).
                         line_with_detail(name, detail, 18.).w(width).flex_shrink_0().when(stale, |s| s.line_through())
                     })
-                    .when(stale, |s| s.tooltip(move |window, cx| Tooltip::new("Out of date — open it to see why").build(window, cx)))
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                     .child(if pinned {
                         // The chat (or a pinned tab) can't be closed: a pin sits where the close button would.
                         row()
@@ -696,7 +799,7 @@ impl Workspace {
             .flex_shrink_0()
             .bg(rgb(colors.chrome))
             .children(fixed_tabs)
-            .child(div().min_w_0().h_full().child(tabs))
+            .child(div().min_w_0().h(px(BAR)).child(tabs))
             .child(div().flex_1().h_full().border_b_1().border_color(rgb(colors.border)))
             .child(
                 row()

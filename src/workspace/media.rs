@@ -4,6 +4,7 @@
 use super::ui::*;
 use super::*;
 use crate::icons::Glyph;
+use std::sync::Arc;
 use gpui_component::{Sizable, button::{Button, ButtonVariants}};
 
 /// What kind of picture a file makes, judged by its extension.
@@ -57,6 +58,81 @@ fn still(path: &Path) -> Option<PathBuf> {
     out.exists().then_some(out)
 }
 
+/// A picture scaled down to fit the space it's given, never spilling out of it:
+/// sized from the box rather than the image, so a tall picture can't push past
+/// the bottom.
+fn fitted(picture: Img) -> Div {
+    div()
+        .relative()
+        .size_full()
+        .overflow_hidden()
+        .child(picture.absolute().top_0().left_0().size_full().object_fit(ObjectFit::ScaleDown))
+}
+
+/// The bordered box a side of an image's change sits in.
+fn frame(colors: Palette) -> Div {
+    div().size_full().rounded(px(6.)).border_1().border_color(rgb(colors.border)).bg(rgb(colors.background))
+}
+
+/// An image's change: what it was and what it is, side by side. A side that
+/// didn't exist says so.
+pub(super) fn image_diff(colors: Palette, old: Option<&Arc<Image>>, new: Option<&Arc<Image>>) -> AnyElement {
+    let side = |title: &'static str, tint: u32, image: Option<&Arc<Image>>, absent: &'static str| {
+        let picture = match image {
+            Some(image) => frame(colors).p_3().child(fitted(img(image.clone()))).into_any_element(),
+            None => frame(colors)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(colors.quiet))
+                .text_size(px(crate::theme::scaled_ui(12.)))
+                .child(absent)
+                .into_any_element(),
+        };
+        col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .gap_2()
+            .child(
+                row()
+                    .flex_shrink_0()
+                    .gap(px(6.))
+                    .child(div().size(px(7.)).rounded_full().bg(rgb(tint)))
+                    .child(label(colors, title))
+                    .when_some(image.and_then(|i| size_label(&i.bytes)), |s, size| {
+                        s.child(div().text_color(rgb(colors.quiet)).text_size(px(crate::theme::scaled_ui(11.5))).child(size))
+                    }),
+            )
+            .child(div().flex_1().min_h_0().child(picture))
+    };
+    row()
+        .size_full()
+        .min_h_0()
+        .gap_4()
+        .p_4()
+        .bg(rgb(colors.panel))
+        .map(|mut d| {
+            d.style().align_items = Some(AlignItems::Stretch);
+            d
+        })
+        .child(side("Before", colors.red, old, "Didn't exist"))
+        .child(side("After", colors.green, new, "Deleted"))
+        .into_any_element()
+}
+
+/// A file's size, briefly.
+fn size_label(bytes: &[u8]) -> Option<String> {
+    let n = bytes.len() as f64;
+    Some(if n < 1024. {
+        format!("{n} B")
+    } else if n < 1024. * 1024. {
+        format!("{:.0} KB", n / 1024.)
+    } else {
+        format!("{:.1} MB", n / 1024. / 1024.)
+    })
+}
+
 impl Workspace {
     /// Start showing `path` as a picture, making its still in the background.
     pub(super) fn open_media(&mut self, path: PathBuf, kind: Kind, cx: &mut Context<Self>) {
@@ -104,16 +180,11 @@ impl Workspace {
             .size_full()
             .min_h_0()
             .bg(rgb(colors.panel))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .p_4()
-                    .child(img(picture).size_full().object_fit(ObjectFit::ScaleDown)),
-            )
+            .child(div().flex_1().min_h_0().p_4().child(fitted(img(picture))))
             .child(
                 row()
                     .flex_shrink_0()
+                    .bg(rgb(colors.panel))
                     .justify_center()
                     .items_center()
                     .gap_2()

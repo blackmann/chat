@@ -37,6 +37,15 @@ pub fn key_bindings() -> Vec<KeyBinding> {
             gpui_component::input::Enter { secondary: false },
             Some("Composer > Input"),
         ),
+        // A waiting question card: choose, move between questions, send or skip.
+        KeyBinding::new("up", AskUp, Some("Ask")),
+        KeyBinding::new("down", AskDown, Some("Ask")),
+        KeyBinding::new("space", AskPick, Some("Ask")),
+        KeyBinding::new("enter", AskPick, Some("Ask")),
+        KeyBinding::new("tab", AskNext, Some("Ask")),
+        KeyBinding::new("shift-tab", AskPrevious, Some("Ask")),
+        KeyBinding::new("cmd-enter", AskSubmit, Some("Ask")),
+        KeyBinding::new("escape", AskSkip, Some("Ask")),
         KeyBinding::new("cmd-,", OpenPreferences, None),
         KeyBinding::new("cmd-l", AddToChat, None),
         KeyBinding::new("f12", GoToDefinition, None),
@@ -44,6 +53,19 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl--", GoBack, None),
         KeyBinding::new("ctrl-shift--", GoForward, None),
         KeyBinding::new("cmd-q", Quit, None),
+        // Find in the thread: over the composer too, where the input would take ⌘ F.
+        KeyBinding::new("cmd-f", FindInThread, None),
+        KeyBinding::new("cmd-f", FindInThread, Some("Composer > Input")),
+        KeyBinding::new("cmd-f", FindInThread, Some("ThreadFind > Input")),
+        KeyBinding::new("enter", FindNext, Some("ThreadFind > Input")),
+        KeyBinding::new("shift-enter", FindPrevious, Some("ThreadFind > Input")),
+        KeyBinding::new("cmd-g", FindNext, None),
+        KeyBinding::new("cmd-shift-g", FindPrevious, None),
+        KeyBinding::new("escape", CloseFind, Some("ThreadFind > Input")),
+        // Find in the project's files, on the Files page.
+        KeyBinding::new("cmd-shift-o", FindInFiles, None),
+        KeyBinding::new("enter", OpenFirstFound, Some("FileFind > Input")),
+        KeyBinding::new("escape", CloseFileFind, Some("FileFind > Input")),
     ]
 }
 

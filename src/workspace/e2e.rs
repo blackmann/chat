@@ -943,3 +943,148 @@ fn answers_the_agents_questions(cx: &mut TestAppContext) {
     d.wait("the agent to read the answers", 30, |d| d.read(said));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// The question card answers from the keyboard: it takes the keys when it
+/// shows, arrows and Space choose, Tab moves into the "Other" box (where Space
+/// types), and ⌘ Enter sends it all and hands the keys back to the composer.
+#[gpui::test]
+fn answers_the_agents_questions_from_the_keyboard(cx: &mut TestAppContext) {
+    use crate::model::{AskOutcome, Block};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let ws = d.ws.clone();
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| {
+            s.composer.update(cx, |c, cx| c.set_value("ask me a question", window, cx));
+            s.submit(&super::Submit, window, cx);
+        })
+    });
+    d.wait("the question", 30, |d| d.read(|s| s.waiting_ask().is_some()));
+    d.settle();
+    let card_focused = |d: &mut Driver| d.cx.update(|window, cx| ws.read(cx).ask_focus.is_focused(window));
+    assert!(card_focused(&mut d), "a question takes the keys when it shows");
+    assert_eq!(d.read(|s| s.ask_position().map(|(_, _, q, c)| (q, c))), Some((0, 0)));
+
+    d.keys("down");
+    assert_eq!(d.read(|s| s.ask_position().map(|(_, _, q, c)| (q, c))), Some((0, 1)));
+    d.keys("space");
+    let picks = d.read(|s| s.waiting_ask().unwrap().1.picks.get("question_0").cloned());
+    assert_eq!(picks, Some(vec!["Redis".to_string()]));
+
+    d.keys("tab");
+    d.keys("f o r space c a c h i n g");
+    let typed = d.read(|s| s.ask_inputs.iter().find(|((_, _, f), _)| f == "question_0_custom").map(|(_, i)| i.clone()));
+    let typed = d.cx.update(|_, cx| typed.unwrap().read(cx).value().to_string());
+    assert_eq!(typed, "for caching");
+
+    d.keys("cmd-enter");
+    let shown = d.read(|s| {
+        s.current_thread().unwrap().blocks.iter().find_map(|b| match b {
+            Block::Ask(a) => match &a.outcome {
+                Some(AskOutcome::Answered(answers)) => Some(answers.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+    });
+    assert_eq!(shown, Some(vec![("Database".into(), "Redis".into()), ("Other".into(), "for caching".into())]));
+    let composer_focused = d.cx.update(|window, cx| gpui::Focusable::focus_handle(ws.read(cx).composer.read(cx), cx).is_focused(window));
+    assert!(composer_focused, "the composer gets the keys back");
+
+    // Escape skips, without also stopping the agent.
+    d.wait("the first turn to end", 30, |d| d.read(|s| !s.current_thread().unwrap().state.busy()));
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| {
+            s.composer.update(cx, |c, cx| c.set_value("another question", window, cx));
+            s.submit(&super::Submit, window, cx);
+        })
+    });
+    d.wait("the second question", 30, |d| d.read(|s| s.waiting_ask().is_some()));
+    d.settle();
+    d.keys("escape");
+    let said = |s: &Workspace| s.current_thread().unwrap().blocks.iter().any(|b| matches!(b, Block::Text(t) if t.contains("decline")));
+    d.wait("the agent to hear it was skipped", 30, |d| d.read(said));
+    let stopped = d.read(|s| s.current_thread().unwrap().blocks.iter().any(|b| matches!(b, Block::Notice(n) if n == "Stopped")));
+    assert!(!stopped, "skipping isn't stopping");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// ⌘ F finds text in the thread showing, even from the composer: matches are
+/// counted, ↵ and ⇧ ↵ step through them (wrapping), and esc puts the bar away.
+#[gpui::test]
+fn finds_text_in_the_thread(cx: &mut TestAppContext) {
+    use crate::model::{Block, Message};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    d.act(|s, cx| {
+        s.start_thread(cx);
+        let thread = s.current_thread_mut().unwrap();
+        thread.blocks.push(Block::User(Message { text: "Where is the Needle?".into(), at: None }));
+        for n in 0..40 {
+            thread.blocks.push(Block::Text(format!("Paragraph {n} says nothing much.")));
+        }
+        thread.blocks.push(Block::Text("Found a needle, and **another needle**.".into()));
+    });
+    // A new thread shows its end; start from the top, where the first match is.
+    d.act(|s, _| {
+        s.follow = false;
+        s.transcript.set_offset(point(px(0.), px(0.)));
+    });
+    let composer = d.read(|s| s.composer.clone());
+    d.cx.update(|window, cx| composer.update(cx, |c, cx| c.focus(window, cx)));
+    d.keys("cmd-f");
+    assert!(d.read(|s| s.thread_find_open), "⌘ F opens the bar, over the composer too");
+    d.keys("n e e d l e");
+    let count = |d: &mut Driver| d.read(|s| s.thread_find_count());
+    assert_eq!(count(&mut d), Some((Some(0), 3)), "the first match in view is current");
+    d.keys("enter");
+    assert_eq!(count(&mut d), Some((Some(1), 3)));
+    // The match far down was scrolled to.
+    let shown = d.read(|s| {
+        let selection = s.selection.borrow();
+        let current = selection.find.as_ref().and_then(|f| f.current).unwrap();
+        let (at, _) = selection.position(current).unwrap();
+        let view = s.transcript.bounds();
+        at.y >= view.top() && at.y <= view.bottom()
+    });
+    assert!(shown, "the current match scrolls into view");
+    d.keys("enter enter");
+    assert_eq!(count(&mut d), Some((Some(0), 3)), "stepping wraps around");
+    d.keys("shift-enter");
+    assert_eq!(count(&mut d), Some((Some(2), 3)));
+    d.keys("escape");
+    assert!(d.read(|s| !s.thread_find_open && s.selection.borrow().find.is_none()));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// ⌘ ⇧ O searches the project's files from the Files page; ↵ opens the first
+/// line found, and esc goes back to the tree.
+#[gpui::test]
+fn finds_text_in_files(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    d.keys("cmd-shift-o");
+    assert!(d.read(|s| s.file_find_open && s.side_open && s.side == super::Side::Files));
+    d.keys("t w i c e");
+    // Past the pause that lets typing settle.
+    d.cx.executor().advance_clock(Duration::from_millis(500));
+    d.wait("the search", 10, |d| d.read(|s| s.file_hits.as_ref().is_some_and(|r| r.query == "twice")));
+    let found = d.read(|s| {
+        s.file_hits.as_ref().unwrap().files.iter().map(|f| (f.path.clone(), f.lines.iter().map(|l| l.number).collect::<Vec<_>>())).collect::<Vec<_>>()
+    });
+    assert_eq!(found, [(project.join("src/main.rs"), vec![4, 6]), (project.join("src/util.rs"), vec![2])]);
+    d.keys("enter");
+    assert_eq!(d.active(), TabKind::File(project.join("src/main.rs")));
+    // The box keeps the keys until esc.
+    let input = d.read(|s| s.file_find.clone());
+    d.cx.update(|window, cx| input.update(cx, |i, cx| i.focus(window, cx)));
+    d.keys("escape");
+    assert!(d.read(|s| !s.file_find_open));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

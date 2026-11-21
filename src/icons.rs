@@ -16,6 +16,7 @@ pub enum Glyph {
     FileText,
     Files,
     Stop,
+    Play,
     ShieldCheck,
     Sparkle,
     Gauge,
@@ -52,7 +53,7 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 38] = [
+    pub const ALL: [Glyph; 39] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -63,6 +64,7 @@ impl Glyph {
         Self::FileText,
         Self::Files,
         Self::Stop,
+        Self::Play,
         Self::ShieldCheck,
         Self::Sparkle,
         Self::Gauge,
@@ -104,6 +106,7 @@ impl Glyph {
             Self::FileText => "file-text.svg",
             Self::Files => "files.svg",
             Self::Stop => "stop.svg",
+            Self::Play => "play.svg",
             Self::ShieldCheck => "shield-check.svg",
             Self::Sparkle => "sparkle.svg",
             Self::Gauge => "gauge.svg",
@@ -168,6 +171,7 @@ fn svg(file: &str) -> Option<&'static str> {
             r#"<path d="M20 7h-3a2 2 0 0 1-2-2V2"/><path d="M9 18a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h7l4 4v10a2 2 0 0 1-2 2Z"/><path d="M3 7.6v12.8A1.6 1.6 0 0 0 4.6 22h9.8"/>"#
         }
         "stop.svg" => r#"<rect width="14" height="14" x="5" y="5" rx="2"/>"#,
+        "play.svg" => r#"<path d="M5 5a2 2 0 0 1 3.008-1.728l11.997 6.998a2 2 0 0 1 .003 3.458l-12 7A2 2 0 0 1 5 19z"/>"#,
         "shield-check.svg" => {
             r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>"#
         }

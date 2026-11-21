@@ -767,6 +767,7 @@ impl Workspace {
         let id = SharedString::from(format!("git-diff-{staged}-{}", path.display()));
         let body = match self.git_diffs.get(&(path.to_owned(), staged)) {
             Some(Ok(git::Diff::Text { old, new })) => self.diff_pane(id, super::panes::LineSource::GitDiff(path.to_owned(), staged), old, new, window, cx),
+            Some(Ok(git::Diff::Image { old, new })) => super::media::image_diff(colors, old.as_ref(), new.as_ref()),
             Some(Ok(git::Diff::Binary)) => empty(colors, Glyph::FileDiff, "Binary file", "Its change can't be shown as text.").into_any_element(),
             Some(Ok(git::Diff::Large)) => empty(colors, Glyph::FileDiff, "Large file", "This file is too large to diff here.").into_any_element(),
             Some(Err(error)) => empty(colors, Glyph::FileDiff, "No diff", error.clone()).into_any_element(),

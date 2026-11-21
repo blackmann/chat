@@ -4,6 +4,8 @@ mod chat;
 mod commands;
 mod effort;
 mod file_kind;
+mod find;
+mod grep;
 mod chrome;
 mod md;
 mod media;
@@ -65,6 +67,20 @@ actions!(
         FindReferences,
         GoBack,
         GoForward,
+        AskUp,
+        AskDown,
+        AskNext,
+        AskPrevious,
+        AskPick,
+        AskSubmit,
+        AskSkip,
+        FindInThread,
+        FindNext,
+        FindPrevious,
+        CloseFind,
+        FindInFiles,
+        CloseFileFind,
+        OpenFirstFound,
     ]
 );
 
@@ -206,6 +222,18 @@ pub struct Workspace {
     /// Projects not showing, by index, as they were left.
     views: HashMap<usize, ProjectView>,
     thread_search: Entity<InputState>,
+    /// The find bar over the transcript (⌘ F), and whether it's showing.
+    thread_find: Entity<InputState>,
+    thread_find_open: bool,
+    /// The search box atop the Files page (⌘ ⇧ O), and whether it's showing.
+    file_find: Entity<InputState>,
+    file_find_open: bool,
+    /// What the last search of the files found, once it's done.
+    file_hits: Option<grep::Results>,
+    /// The search of the files under way.
+    file_searching: Option<Task<()>>,
+    /// Bumped by each new search, so older ones stop and their results are dropped.
+    file_search_generation: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// What the last content search found, once it's done.
     thread_hits: Option<search::Results>,
     /// The search under way: for which project and query.
@@ -299,6 +327,12 @@ pub struct Workspace {
     ask_inputs: HashMap<(usize, u64, String), Entity<InputState>>,
     /// Why a set of questions couldn't be sent yet, by thread and question set.
     ask_errors: HashMap<(usize, u64), String>,
+    /// The waiting question card takes keys through this.
+    ask_focus: FocusHandle,
+    /// Where the keys are in that card: thread, question set, question, choice.
+    ask_cursor: Option<(usize, u64, usize, usize)>,
+    /// A question just arrived on the showing thread; the next frame moves the keys to it.
+    focus_ask: bool,
     rename_position: Point<Pixels>,
     /// The thread the composer's text belongs to, and what other threads had
     /// typed when they were left: text and the files mentioned in it.
@@ -359,6 +393,20 @@ impl Workspace {
         })
         .detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+        let thread_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find in thread"));
+        cx.subscribe(&thread_find, |s, _, e: &gpui_component::input::InputEvent, cx| {
+            if let gpui_component::input::InputEvent::Change = e {
+                s.sync_thread_find(true, cx);
+            }
+        })
+        .detach();
+        let file_find = cx.new(|cx| InputState::new(window, cx).placeholder("Find in files"));
+        cx.subscribe(&file_find, |s, _, e: &gpui_component::input::InputEvent, cx| {
+            if let gpui_component::input::InputEvent::Change = e {
+                s.search_files(cx);
+            }
+        })
+        .detach();
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         cx.subscribe_in(&rename_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
             if let gpui_component::input::InputEvent::PressEnter { .. } = e {
@@ -401,6 +449,13 @@ impl Workspace {
             terminals: HashMap::new(),
             views: HashMap::new(),
             thread_search,
+            thread_find,
+            thread_find_open: false,
+            file_find,
+            file_find_open: false,
+            file_hits: None,
+            file_searching: None,
+            file_search_generation: Default::default(),
             thread_hits: None,
             thread_searching: None,
             composer,
@@ -459,6 +514,9 @@ impl Workspace {
             rename_input,
             ask_inputs: HashMap::new(),
             ask_errors: HashMap::new(),
+            ask_focus: cx.focus_handle(),
+            ask_cursor: None,
+            focus_ask: false,
             rename_position: Point::default(),
             draft_owner: None,
             drafts: HashMap::new(),
@@ -956,10 +1014,16 @@ impl Workspace {
         };
         // A connection that fails before it opens usually means the agent isn't installed or signed in.
         let failed_to_open = matches!(&event, Event::Closed(Some(_))) && !thread.ready;
-        if let Event::RateLimit(limit) = &event {
-            self.limits.entry(thread.agent).or_default().insert(limit.window.clone(), limit.clone());
+        if let Event::RateLimit(limits) = &event {
+            let known = self.limits.entry(thread.agent).or_default();
+            for limit in limits {
+                known.insert(limit.window.clone(), limit.clone());
+            }
         }
         let was_busy = thread.state.busy();
+        if current && matches!(event, Event::Ask { .. }) {
+            self.focus_ask = true;
+        }
         thread.apply(event);
         // A turn that finishes out of sight waits to be read.
         if was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed) && !seen {
@@ -1077,6 +1141,113 @@ impl Workspace {
         self.save_soon(cx);
         cx.notify();
     }
+    /// The showing thread's first unanswered set of questions, which takes keys.
+    fn waiting_ask(&self) -> Option<(usize, &crate::model::Ask)> {
+        let thread = self.current_thread()?;
+        thread.blocks.iter().find_map(|b| match b {
+            Block::Ask(a) if a.outcome.is_none() => Some((thread.id, a)),
+            _ => None,
+        })
+    }
+    /// Where the keys are in the waiting card, made to fit it: question and choice.
+    fn ask_position(&self) -> Option<(usize, u64, usize, usize)> {
+        let (thread, ask) = self.waiting_ask()?;
+        let (question, choice) = match self.ask_cursor {
+            Some((t, a, q, c)) if t == thread && a == ask.id && q < ask.questions.len() => (q, c),
+            _ => (0, 0),
+        };
+        let choice = choice.min(choice_count(&ask.questions[question].kind).saturating_sub(1));
+        Some((thread, ask.id, question, choice))
+    }
+    /// Put the cursor on the question it's at: its picked choice, or its first,
+    /// or for a typed answer, its input.
+    fn ask_cursor_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, id, question, _)) = self.ask_position() else { return };
+        let Some((_, ask)) = self.waiting_ask() else { return };
+        let q = &ask.questions[question];
+        let picked = ask.picks.get(&q.field).and_then(|p| p.first()).cloned();
+        let values = choice_values(&q.kind);
+        let choice = picked.and_then(|p| values.iter().position(|v| *v == p)).unwrap_or(0);
+        let field = q.field.clone();
+        self.ask_cursor = Some((thread, id, question, choice));
+        self.focus_ask_cursor(&field, window, cx);
+    }
+    /// Give the keys to the cursor's question: its input when it's typed, else the card.
+    fn focus_ask_cursor(&mut self, field: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, id, _, _)) = self.ask_cursor else { return };
+        match self.ask_inputs.get(&(thread, id, field.to_string())) {
+            Some(input) => input.update(cx, |i, cx| i.focus(window, cx)),
+            None => self.ask_focus.focus(window),
+        }
+        cx.notify();
+    }
+    /// The question whose input has the keys, if one does.
+    fn ask_input_focused(&self, window: &Window, cx: &App) -> Option<usize> {
+        let (thread, ask) = self.waiting_ask()?;
+        ask.questions.iter().position(|q| {
+            self.ask_inputs.get(&(thread, ask.id, q.field.clone())).is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window))
+        })
+    }
+    /// Arrows: the next or previous choice, on into the questions around it.
+    fn ask_step(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Arrows inside a typed answer stay the input's.
+        if !self.ask_focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let Some((thread, id, question, choice)) = self.ask_position() else { return };
+        let Some((_, ask)) = self.waiting_ask() else { return };
+        // Every place the cursor can be, in order: each choice, and each input.
+        let places: Vec<(usize, usize)> = ask
+            .questions
+            .iter()
+            .enumerate()
+            .flat_map(|(q, question)| (0..choice_count(&question.kind).max(1)).map(move |c| (q, c)))
+            .collect();
+        let at = places.iter().position(|p| *p == (question, choice)).unwrap_or(0);
+        let to = if down { (at + 1).min(places.len() - 1) } else { at.saturating_sub(1) };
+        let (question, choice) = places[to];
+        let field = ask.questions[question].field.clone();
+        self.ask_cursor = Some((thread, id, question, choice));
+        self.focus_ask_cursor(&field, window, cx);
+    }
+    /// Tab: the next or previous question.
+    fn ask_jump(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((thread, id, question, _)) = self.ask_position() else { return };
+        let count = self.waiting_ask().map_or(0, |(_, a)| a.questions.len());
+        let question = self.ask_input_focused(window, cx).unwrap_or(question);
+        let next = if forward { (question + 1) % count } else { (question + count - 1) % count };
+        self.ask_cursor = Some((thread, id, next, 0));
+        self.ask_cursor_start(window, cx);
+    }
+    /// Space or Enter: pick the choice under the cursor.
+    fn ask_pick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ask_focus.is_focused(window) {
+            cx.propagate();
+            return;
+        }
+        let Some((_, id, question, choice)) = self.ask_position() else { return };
+        let Some((_, ask)) = self.waiting_ask() else { return };
+        let q = &ask.questions[question];
+        let Some(value) = choice_values(&q.kind).get(choice).cloned() else { return };
+        let field = q.field.clone();
+        self.pick(id, field, value, cx);
+    }
+    /// ⌘ Enter or Escape: send the answers, or skip; then back to the composer.
+    fn ask_finish(&mut self, skip: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, id, _, _)) = self.ask_position() else { return };
+        self.reply(id, skip, cx);
+        if self.waiting_ask().is_none_or(|(_, a)| a.id != id) {
+            self.ask_cursor = None;
+            match self.waiting_ask().map(|(t, a)| (t, a.id)) {
+                Some((thread, next)) => {
+                    self.ask_cursor = Some((thread, next, 0, 0));
+                    self.ask_cursor_start(window, cx);
+                }
+                None => self.composer.update(cx, |c, cx| c.focus(window, cx)),
+            }
+        }
+    }
     /// Give each text field of the showing thread's waiting questions an input,
     /// and let go of those whose questions are settled.
     fn prepare_ask_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1102,9 +1273,13 @@ impl Workspace {
             }
             let placeholder = prompt.unwrap_or_else(|| "Type an answer…".into());
             let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
-            cx.subscribe_in(&input, window, move |s, _, e: &gpui_component::input::InputEvent, _, cx| {
+            cx.subscribe_in(&input, window, move |s, _, e: &gpui_component::input::InputEvent, window, cx| {
                 if let gpui_component::input::InputEvent::PressEnter { .. } = e {
                     s.reply(ask, false, cx);
+                    if s.waiting_ask().is_none_or(|(_, a)| a.id != ask) {
+                        s.ask_cursor = None;
+                        s.composer.update(cx, |c, cx| c.focus(window, cx));
+                    }
                 }
             })
             .detach();
@@ -1130,6 +1305,12 @@ impl Workspace {
         let mode = self.settings.follow_up_mode;
         let Some(thread) = self.current_thread() else {
             return;
+        };
+        // Nothing typed on a cut-off thread: pick it back up.
+        let (shown, text) = if text.is_empty() && thread.interrupted() {
+            ("Continue".to_string(), "Continue where you left off.".to_string())
+        } else {
+            (shown, text)
         };
         if text.is_empty() {
             return;
@@ -1532,6 +1713,14 @@ impl Render for Workspace {
             self.focus.focus(window);
         }
         self.prepare_ask_inputs(window, cx);
+        if std::mem::take(&mut self.focus_ask) {
+            // Not while a message is being typed: the card can wait for a click or Tab.
+            let typing = self.composer.read(cx).focus_handle(cx).is_focused(window) && !self.composer.read(cx).value().trim().is_empty();
+            if !typing && let Some((thread, ask)) = self.waiting_ask().map(|(t, a)| (t, a.id)) {
+                self.ask_cursor = Some((thread, ask, 0, 0));
+                self.ask_cursor_start(window, cx);
+            }
+        }
         if std::mem::take(&mut self.clear_composer) {
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -1632,6 +1821,20 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &FindReferences, window, cx| s.find_references(window, cx)))
             .on_action(cx.listener(|s, _: &GoBack, _, cx| s.go_back(cx)))
             .on_action(cx.listener(|s, _: &GoForward, _, cx| s.go_forward(cx)))
+            .on_action(cx.listener(|s, _: &AskUp, window, cx| s.ask_step(false, window, cx)))
+            .on_action(cx.listener(|s, _: &AskDown, window, cx| s.ask_step(true, window, cx)))
+            .on_action(cx.listener(|s, _: &AskNext, window, cx| s.ask_jump(true, window, cx)))
+            .on_action(cx.listener(|s, _: &AskPrevious, window, cx| s.ask_jump(false, window, cx)))
+            .on_action(cx.listener(|s, _: &AskPick, window, cx| s.ask_pick(window, cx)))
+            .on_action(cx.listener(|s, _: &AskSubmit, window, cx| s.ask_finish(false, window, cx)))
+            .on_action(cx.listener(|s, _: &AskSkip, window, cx| s.ask_finish(true, window, cx)))
+            .on_action(cx.listener(|s, _: &FindInThread, window, cx| s.open_thread_find(window, cx)))
+            .on_action(cx.listener(|s, _: &FindNext, _, cx| s.thread_find_step(true, cx)))
+            .on_action(cx.listener(|s, _: &FindPrevious, _, cx| s.thread_find_step(false, cx)))
+            .on_action(cx.listener(|s, _: &CloseFind, window, cx| s.close_thread_find(window, cx)))
+            .on_action(cx.listener(|s, _: &FindInFiles, window, cx| s.open_file_find(window, cx)))
+            .on_action(cx.listener(|s, _: &CloseFileFind, window, cx| s.close_file_find(window, cx)))
+            .on_action(cx.listener(|s, _: &OpenFirstFound, _, cx| s.open_first_found(cx)))
             // Letting go of ⌘ takes the link away from the word under the pointer.
             .on_modifiers_changed(cx.listener(|s, e: &ModifiersChangedEvent, _, cx| s.lsp_modifiers(e.modifiers.platform, cx)))
             // Escape interrupts the agent, as the transcript says it will.
@@ -1794,5 +1997,19 @@ mod listing_tests {
         assert!(!ignored(&list(Path::new(&loose), false), "x.log"));
         std::fs::remove_dir_all(&dir).unwrap();
         std::fs::remove_dir_all(&loose).unwrap();
+    }
+}
+
+/// How many choices a question offers the cursor; none for a typed answer.
+fn choice_count(kind: &agent::QuestionKind) -> usize {
+    choice_values(kind).len()
+}
+
+/// The values of a question's choices, in the order they're drawn.
+fn choice_values(kind: &agent::QuestionKind) -> Vec<String> {
+    match kind {
+        agent::QuestionKind::Single(c) | agent::QuestionKind::Multi(c) => c.iter().map(|c| c.value.clone()).collect(),
+        agent::QuestionKind::Yes => vec!["true".into(), "false".into()],
+        _ => Vec::new(),
     }
 }

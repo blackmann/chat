@@ -818,8 +818,14 @@ impl Workspace {
 
     /// The agent's questions: one-of and many-of choices, yes or no, and
     /// typed answers, sent together. Once settled, the answers given.
-    fn ask_block(&self, colors: Palette, thread: usize, ask: &Ask, cx: &mut Context<Self>) -> Div {
+    fn ask_block(&self, window: &Window, colors: Palette, thread: usize, ask: &Ask, cx: &mut Context<Self>) -> Div {
         let id = ask.id;
+        // Only the first waiting card takes keys; the cursor shows while it has them.
+        let keyed = self.waiting_ask().is_some_and(|(t, a)| t == thread && a.id == id);
+        let cursor = self
+            .ask_position()
+            .filter(|_| keyed && self.ask_focus.is_focused(window))
+            .map(|(_, _, q, c)| (q, c));
         let small = px(crate::theme::scaled_ui(12.5));
         let header = row()
             .items_start()
@@ -857,7 +863,7 @@ impl Workspace {
             None => {}
         }
         let several = ask.questions.len() > 1;
-        for q in &ask.questions {
+        for (qi, q) in ask.questions.iter().enumerate() {
             let field = q.field.clone();
             let picked = ask.picks.get(&q.field).cloned().unwrap_or_default();
             let mut section = col().pl(px(22.)).gap(px(4.));
@@ -881,6 +887,7 @@ impl Workspace {
                     let multi = matches!(q.kind, QuestionKind::Multi(_));
                     for (n, choice) in choices.iter().enumerate() {
                         let on = picked.contains(&choice.value);
+                        let here = cursor == Some((qi, n));
                         let (field, value) = (field.clone(), choice.value.clone());
                         section = section.child(
                             row()
@@ -892,6 +899,7 @@ impl Workspace {
                                 .rounded(px(5.))
                                 .border_1()
                                 .border_color(rgb(if on { colors.blue } else { colors.border }))
+                                .when(here, |s| s.bg(rgb(colors.hover)))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(colors.hover)))
                                 .child(row().h(px(19.)).child(mark(colors, multi, on)))
@@ -905,14 +913,19 @@ impl Workspace {
                                             s.child(div().text_size(small).text_color(rgb(colors.muted)).child(d))
                                         }),
                                 )
-                                .on_click(cx.listener(move |s, _, _, cx| s.pick(id, field.clone(), value.clone(), cx))),
+                                .on_click(cx.listener(move |s, _, window, cx| {
+                                    s.ask_cursor = Some((thread, id, qi, n));
+                                    s.ask_focus.focus(window);
+                                    s.pick(id, field.clone(), value.clone(), cx)
+                                })),
                         );
                     }
                 }
                 QuestionKind::Yes => {
                     let mut buttons = row().gap_2();
-                    for (value, name) in [("true", "Yes"), ("false", "No")] {
+                    for (n, (value, name)) in [("true", "Yes"), ("false", "No")].into_iter().enumerate() {
                         let on = picked.iter().any(|p| p == value);
+                        let here = cursor == Some((qi, n));
                         let field = field.clone();
                         buttons = buttons.child(
                             row()
@@ -924,11 +937,16 @@ impl Workspace {
                                 .border_1()
                                 .border_color(rgb(if on { colors.blue } else { colors.border }))
                                 .text_size(small)
+                                .when(here, |s| s.bg(rgb(colors.hover)))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(rgb(colors.hover)))
                                 .child(mark(colors, false, on))
                                 .child(name)
-                                .on_click(cx.listener(move |s, _, _, cx| s.pick(id, field.clone(), value.into(), cx))),
+                                .on_click(cx.listener(move |s, _, window, cx| {
+                                    s.ask_cursor = Some((thread, id, qi, n));
+                                    s.ask_focus.focus(window);
+                                    s.pick(id, field.clone(), value.into(), cx)
+                                })),
                         );
                     }
                     section = section.child(buttons);
@@ -974,9 +992,16 @@ impl Workspace {
                 .pl(px(22.))
                 .gap_2()
                 .child(button("Submit", true).on_click(cx.listener(move |s, _, _, cx| s.reply(id, false, cx))))
-                .child(button("Skip", false).on_click(cx.listener(move |s, _, _, cx| s.reply(id, true, cx)))),
+                .child(button("Skip", false).on_click(cx.listener(move |s, _, _, cx| s.reply(id, true, cx))))
+                .when(keyed, |s| {
+                    s.child(div().flex_1()).child(label(colors, "↑↓ choose · Space pick · Tab next · ⌘↩ send · Esc skip").text_color(rgb(colors.quiet)))
+                }),
         );
-        card(colors).my_1().border_color(rgb(colors.blue)).child(body)
+        card(colors)
+            .my_1()
+            .border_color(rgb(colors.blue))
+            .when(keyed, |s| s.key_context("Ask").track_focus(&self.ask_focus))
+            .child(body)
     }
 
     /// What a finished turn left behind, with the way into reviewing it.
@@ -1090,6 +1115,8 @@ impl Workspace {
                 .tooltip(|w, cx| Tooltip::new("Stop · esc").build(w, cx))
                 .on_click(cx.listener(|s, _, _, cx| s.stop(cx)))
         });
+        // An interrupted thread with nothing typed offers to carry on instead.
+        let resume = empty && thread.interrupted();
         let send = row()
             .id("send")
             .size(px(26.))
@@ -1098,15 +1125,17 @@ impl Workspace {
             .justify_center()
             .rounded_full()
             .map(|s| {
-                if empty {
+                if empty && !resume {
                     s.bg(rgb(colors.hover)).text_color(rgb(colors.quiet))
                 } else {
                     s.bg(rgb(colors.blue)).text_color(rgb(colors.primary_text)).cursor_pointer()
                 }
             })
-            .child(icon(IconName::ArrowUp))
+            .map(|s| if resume { s.child(icon(Glyph::Play).size(px(12.))) } else { s.child(icon(IconName::ArrowUp)) })
             .tooltip(move |w, cx| {
-                let tip = if !busy {
+                let tip = if resume {
+                    "Continue · ↵"
+                } else if !busy {
                     "Send · ↵"
                 } else if follow_up == FollowUpMode::Queue || !supports_steering {
                     "Queue message · ↵"
@@ -1190,6 +1219,8 @@ impl Workspace {
             let selection = self.selection.borrow();
             (!selection.is_empty() && !selection.dragging).then(|| selection.ends())
         };
+        // Built before the segments are forgotten: it counts matches in them.
+        let find_bar = self.thread_find_open.then(|| self.thread_find_bar(colors, cx));
         self.selection.borrow_mut().forget_layout();
         let mut list = col().px_5().pt_3().pb_5().gap(px(6.)).map(|s| {
             if available > px(0.) { s.w(available.min(px(COLUMN))) } else { s.w_full().max_w(px(COLUMN)) }
@@ -1242,7 +1273,7 @@ impl Workspace {
                 Block::Thought(text) => self.thought_block(colors, thread.id, i, text, cx),
                 Block::Tool(tool) => self.tool_block(window, colors, thread.id, i, tool, cx),
                 Block::Permission(permission) => self.permission_block(colors, permission, cx),
-                Block::Ask(ask) => self.ask_block(colors, thread.id, ask, cx),
+                Block::Ask(ask) => self.ask_block(window, colors, thread.id, ask, cx),
                 Block::Notice(text) => row()
                     .items_start()
                     .py(px(4.))
@@ -1371,7 +1402,7 @@ impl Workspace {
         };
         col()
             .size_full()
-            .child(div().flex_1().min_h_0().child(transcript).when_some(selection_ends, |s, (start, end)| {
+            .child(div().relative().flex_1().min_h_0().child(transcript).children(find_bar).when_some(selection_ends, |s, (start, end)| {
                 // Below the selection's last line; above its first when the end is
                 // scrolled away; in the transcript's corner when both are.
                 let view = self.transcript.bounds();

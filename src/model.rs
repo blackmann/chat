@@ -181,6 +181,10 @@ impl Message {
     }
 }
 
+/// Notices that mark a turn cut off before the agent finished.
+const STOPPED: &str = "Stopped";
+const INTERRUPTED: &str = "Interrupted when Chat closed.";
+
 #[derive(Serialize, Deserialize)]
 pub enum Block {
     User(Message),
@@ -311,6 +315,19 @@ impl Thread {
 
     pub fn is_active(&self) -> bool {
         self.state.busy() || self.pending_steer.is_some()
+    }
+
+    /// The last turn was cut off, by quitting or by a stop, and nothing has
+    /// been said since: the thread can be picked up where it left off.
+    pub fn interrupted(&self) -> bool {
+        !self.is_active()
+            && self.queued.is_empty()
+            && self
+                .blocks
+                .iter()
+                .rev()
+                .find(|b| !matches!(b, Block::TurnEnded { .. }))
+                .is_some_and(|b| matches!(b, Block::Notice(n) if n == STOPPED || n == INTERRUPTED))
     }
 
     pub fn submit(&mut self, shown: impl Into<SharedString>, prompt: String, steer: bool) {
@@ -489,7 +506,7 @@ impl Thread {
                     Ok(Stop::Finished) => ThreadState::Done,
                     Ok(Stop::Cancelled) => {
                         self.settle_tools();
-                        self.notice("Stopped");
+                        self.notice(STOPPED);
                         ThreadState::Idle
                     }
                     Ok(Stop::Refused) => {
@@ -558,6 +575,23 @@ impl Thread {
         }
         self.settings.iter().map(|s| (s.id.clone(), s.current.clone())).collect()
     }
+    /// When anything last happened here, in ms since the epoch: now while a turn
+    /// runs, else the latest message sent or turn ended. `None` for a thread
+    /// with no times to go on.
+    pub fn last_active(&self) -> Option<i64> {
+        if self.state.busy() {
+            return Some(now_ms());
+        }
+        self.blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::User(m) => m.at,
+                Block::TurnEnded { at, .. } => Some(*at),
+                _ => None,
+            })
+            .max()
+    }
+
     /// Bring a thread read from disk to rest: nothing can still be running in a
     /// process that is gone. `saved_at` is when it was last written, about when
     /// the agent last did anything, so a cut-off turn's work ends there.
@@ -565,7 +599,7 @@ impl Thread {
         if self.state.busy() {
             self.dismiss_permissions();
             self.settle_tools();
-            self.notice("Interrupted when Chat closed.");
+            self.notice(INTERRUPTED);
             match saved_at {
                 Some(at) => self.stamp_turn_at(at),
                 None => self.turn_began = None,
@@ -711,6 +745,18 @@ mod tests {
     use super::*;
     use crate::agent::ToolPatch;
 
+    #[test]
+    fn last_active_is_the_latest_time_or_now_while_busy() {
+        let mut t = Thread::new(1, 0);
+        assert_eq!(t.last_active(), None);
+        t.blocks.push(Block::User(Message { text: "hi".into(), at: Some(1_000) }));
+        t.blocks.push(Block::TurnEnded { at: 5_000, worked_ms: 4_000 });
+        t.blocks.push(Block::User(Message { text: "old".into(), at: None }));
+        assert_eq!(t.last_active(), Some(5_000));
+        t.state = ThreadState::Running;
+        assert!(t.last_active().unwrap() > 5_000);
+    }
+
     fn edit(id: &str, status: Status, old: &str, new: &str) -> Event {
         Event::Tool {
             id: id.into(),
@@ -810,6 +856,22 @@ mod tests {
         t.apply(Event::TurnEnded(Ok(Stop::Cancelled)));
         assert!(!t.awaiting_user());
         assert!(matches!(&t.blocks[0], Block::Ask(a) if matches!(a.outcome, Some(AskOutcome::Dismissed))));
+    }
+
+    #[test]
+    fn a_cut_off_turn_can_be_continued() {
+        let mut t = Thread::new(1, 0);
+        t.state = ThreadState::Running;
+        t.settle(Some(now_ms()));
+        assert!(t.interrupted());
+        t.ready = true;
+        t.submit("Continue", "Continue".into(), false);
+        assert!(!t.interrupted());
+        t.apply(Event::TurnEnded(Ok(Stop::Cancelled)));
+        assert!(t.interrupted());
+        t.submit("next", "next".into(), false);
+        t.apply(Event::TurnEnded(Ok(Stop::Finished)));
+        assert!(!t.interrupted());
     }
 
     #[test]

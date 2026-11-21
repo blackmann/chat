@@ -23,6 +23,17 @@ pub struct Selection {
     anchor: Option<Point2>,
     head: Option<Point2>,
     pub dragging: bool,
+    /// What the find bar looks for, marked wherever it shows.
+    pub find: Option<Find>,
+}
+
+/// Text being found in the segments: the needle (lowercase), the match that's
+/// current (its segment and start), and the tints for the rest and for it.
+pub struct Find {
+    pub needle: String,
+    pub current: Option<Point2>,
+    pub tint: Hsla,
+    pub current_tint: Hsla,
 }
 
 pub type Shared = Rc<RefCell<Selection>>;
@@ -70,6 +81,20 @@ impl Selection {
             }
         }
         Some(parts.join("\n"))
+    }
+
+    /// Every match of the find bar's needle, in reading order, as of the last paint.
+    pub fn matches(&self) -> Vec<(Key, Range<usize>)> {
+        let Some(find) = &self.find else { return Vec::new() };
+        self.segments
+            .iter()
+            .flat_map(|(key, segment)| super::search::find(&segment.text, &find.needle).into_iter().map(move |r| (*key, r)))
+            .collect()
+    }
+    /// Where a match starts on screen as of the last paint, and its line's height.
+    pub fn position(&self, (key, offset): Point2) -> Option<(Point<Pixels>, Pixels)> {
+        let segment = self.segments.get(&key)?;
+        Some((segment.layout.position_for_index(offset.min(segment.text.len()))?, segment.layout.line_height()))
     }
 
     /// Where the selection starts and ends on screen, as of the last paint: the
@@ -213,20 +238,37 @@ impl Element for Selectable {
         window.insert_hitbox(bounds, HitboxBehavior::Normal)
     }
     fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, bounds: Bounds<Pixels>, _: &mut (), hitbox: &mut Hitbox, window: &mut Window, cx: &mut App) {
-        let range = {
+        let (range, found) = {
             let mut state = self.state.borrow_mut();
             state.segments.insert(self.key, Segment { layout: self.layout.clone(), bounds, text: self.text.clone() });
-            state.range(self.key, self.text.len())
+            let found: Vec<(Range<usize>, Hsla)> = match &state.find {
+                Some(find) => super::search::find(&self.text, &find.needle)
+                    .into_iter()
+                    .map(|r| {
+                        let tint = if find.current == Some((self.key, r.start)) { find.current_tint } else { find.tint };
+                        (r, tint)
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            (state.range(self.key, self.text.len()), found)
         };
         if self.cursor {
             window.set_cursor_style(CursorStyle::IBeam, hitbox);
         }
+        self.child.paint(window, cx);
+        for (range, tint) in found {
+            for rect in highlight(&self.layout, bounds, range) {
+                window.paint_quad(fill(rect, tint).corner_radii(px(2.)));
+            }
+        }
+        // Over the text, not under it: runs with their own background (inline
+        // code, symbol marks) paint with the glyphs and would hide it.
         if let Some(range) = range {
             for rect in highlight(&self.layout, bounds, range) {
                 window.paint_quad(fill(rect, self.color));
             }
         }
-        self.child.paint(window, cx);
     }
 }
 

@@ -128,6 +128,9 @@ impl Snapshot {
 pub enum Diff {
     /// Both sides in full, for the view to diff and colour: an absent side is empty.
     Text { old: String, new: String },
+    /// A picture GPUI can draw, each side as it was: `None` where the file
+    /// didn't exist.
+    Image { old: Option<std::sync::Arc<gpui::Image>>, new: Option<std::sync::Arc<gpui::Image>> },
     Binary,
     /// Too large to show.
     Large,
@@ -325,6 +328,25 @@ fn line_count(file: &Path) -> Option<u32> {
 /// Files past this size aren't diffed in the view.
 const MAX_DIFF: usize = 2 * 1024 * 1024;
 
+/// Images past this size aren't shown side by side.
+const MAX_IMAGE: usize = 32 * 1024 * 1024;
+
+/// The format of an image file GPUI can draw, by its extension. SVGs stay
+/// text, so their change reads as a diff of the markup.
+fn image_format(path: &Path) -> Option<gpui::ImageFormat> {
+    use gpui::ImageFormat::*;
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => Png,
+        "jpg" | "jpeg" => Jpeg,
+        "gif" => Gif,
+        "webp" => Webp,
+        "bmp" => Bmp,
+        "tif" | "tiff" => Tiff,
+        _ => return None,
+    })
+}
+
 /// A blob from the object store, as `git show` prints it: `HEAD:path` or `:path`.
 fn blob(root: &Path, spec: &Path, staged_side: &str) -> Option<Vec<u8>> {
     let mut arg = OsString::from(staged_side);
@@ -345,6 +367,14 @@ pub fn diff(root: &Path, entry: &Entry, staged: bool) -> Result<Diff, String> {
         let index = if matches!(entry.index, b'R' | b'C') { &entry.path } else { before_path };
         (blob(root, index, ":"), std::fs::read(root.join(&entry.path)).ok())
     };
+    if let Some(format) = image_format(&entry.path) {
+        let side = |bytes: Option<Vec<u8>>| bytes.filter(|b| !b.is_empty()).map(|b| std::sync::Arc::new(gpui::Image::from_bytes(format, b)));
+        let (old, new) = (side(old), side(new));
+        if old.iter().chain(&new).any(|i| i.bytes.len() > MAX_IMAGE) {
+            return Ok(Diff::Large);
+        }
+        return Ok(Diff::Image { old, new });
+    }
     let (old, new) = (old.unwrap_or_default(), new.unwrap_or_default());
     if old.len() > MAX_DIFF || new.len() > MAX_DIFF {
         return Ok(Diff::Large);
@@ -738,6 +768,26 @@ mod tests {
             "worktree\n"
         );
         assert!(!snapshot(&r.0).unwrap().entries[0].staged());
+    }
+    #[test]
+    fn image_changes_keep_both_pictures() {
+        let r = Repo::new();
+        // The bytes only need to be told apart: the view decodes them later.
+        std::fs::write(r.0.join("logo.png"), b"\x89PNG\0before").unwrap();
+        r.stage("logo.png");
+        r.commit();
+        std::fs::write(r.0.join("logo.png"), b"\x89PNG\0after").unwrap();
+        std::fs::write(r.0.join("new.webp"), b"RIFF\0new").unwrap();
+        let s = snapshot(&r.0).unwrap();
+        let sides = |name: &str| {
+            let e = s.entries.iter().find(|e| e.path == Path::new(name)).unwrap();
+            match diff(&r.0, e, false).unwrap() {
+                Diff::Image { old, new } => (old.map(|i| i.bytes.clone()), new.map(|i| (i.format, i.bytes.clone()))),
+                other => panic!("expected an image, got {other:?}"),
+            }
+        };
+        assert_eq!(sides("logo.png"), (Some(b"\x89PNG\0before".to_vec()), Some((gpui::ImageFormat::Png, b"\x89PNG\0after".to_vec()))));
+        assert_eq!(sides("new.webp"), (None, Some((gpui::ImageFormat::Webp, b"RIFF\0new".to_vec()))));
     }
     #[test]
     fn unborn_unstage_literal_paths_and_rename() {

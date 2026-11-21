@@ -386,6 +386,30 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// How long a code block's copy button says "Copied" after a click.
+const COPIED_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+thread_local! {
+    /// The copy button clicked last and when. Rendering here is stateless, so the
+    /// button finds its feedback by its element id, which is stable across frames.
+    static COPIED: std::cell::RefCell<Option<(ElementId, std::time::Instant)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn recently_copied(id: &ElementId) -> bool {
+    COPIED.with_borrow(|c| matches!(c, Some((at, when)) if at == id && when.elapsed() < COPIED_FOR))
+}
+
+/// Show the check on `id`'s button, then redraw once it should go back to "Copy".
+fn mark_copied(id: ElementId, cx: &mut App) {
+    COPIED.set(Some((id, std::time::Instant::now())));
+    cx.refresh_windows();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(COPIED_FOR).await;
+        let _ = cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
+}
+
 fn blocks(nodes: &[Node], cx: &Ctx) -> Vec<AnyElement> {
     nodes.iter().filter_map(|n| block(n, cx)).collect()
 }
@@ -443,6 +467,8 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
         }
         Node::Code(c) => {
             let code = c.value.clone();
+            let copy_id = cx.id("copy");
+            let copied = recently_copied(&copy_id);
             // Fenced blocks that name a language get its colours.
             let styles = c.lang.as_deref().and_then(|lang| super::syntax::cached(lang, &c.value));
             let lines = super::syntax::lines(&c.value);
@@ -479,23 +505,32 @@ fn block(node: &Node, cx: &Ctx) -> Option<AnyElement> {
                 )
                 .child(
                     div()
-                        .id(cx.id("copy"))
+                        .id(copy_id.clone())
                         .absolute()
                         .top(px(6.))
                         .right(px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
                         .px(px(6.))
                         .py(px(2.))
                         .rounded(px(4.))
                         .text_size(px(crate::theme::scaled_ui(11.)))
-                        .text_color(rgb(colors.muted))
+                        .text_color(rgb(if copied { colors.green } else { colors.muted }))
                         .bg(rgb(colors.background))
                         .border_1()
                         .border_color(rgb(colors.border))
                         .cursor_pointer()
-                        .opacity(0.)
-                        .group_hover("code", |d| d.opacity(1.))
-                        .child("Copy")
-                        .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(code.clone()))),
+                        // Stays visible while it says the copy worked, hovered or not.
+                        .when(!copied, |d| d.opacity(0.).group_hover("code", |d| d.opacity(1.)))
+                        .when(copied, |d| {
+                            d.child(super::ui::icon(gpui_component::IconName::Check).size(px(11.)).text_color(rgb(colors.green)))
+                        })
+                        .child(if copied { "Copied" } else { "Copy" })
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                            mark_copied(copy_id.clone(), cx);
+                        }),
                 )
                 .into_any_element()
         }

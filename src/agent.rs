@@ -316,19 +316,39 @@ pub enum LimitStatus {
 }
 
 impl RateLimit {
-    /// Read the Claude SDK's `SDKRateLimitInfo`.
-    fn parse(info: &serde_json::Value) -> Option<Self> {
-        let status = match info.get("status")?.as_str()? {
-            "allowed" => LimitStatus::Allowed,
-            "allowed_warning" => LimitStatus::Warning,
-            "rejected" => LimitStatus::Rejected,
-            _ => return None,
+    /// Read the Claude SDK's `SDKRateLimitInfo`: the limit it reports on,
+    /// plus every window in `unifiedWindows`. The top-level `utilization` only
+    /// comes once a warning threshold is passed; the windows carry it always.
+    fn parse(info: &serde_json::Value) -> Vec<Self> {
+        let status = |v: &serde_json::Value| match v.as_str()? {
+            "allowed" => Some(LimitStatus::Allowed),
+            "allowed_warning" => Some(LimitStatus::Warning),
+            "rejected" => Some(LimitStatus::Rejected),
+            _ => None,
         };
-        let window = info.get("rateLimitType")?.as_str()?.to_string();
-        // A fraction from the API headers; take a percentage too, in case it's ever sent as one.
-        let used = info.get("utilization").and_then(|u| u.as_f64()).map(|u| if u <= 1. { u * 100. } else { u }).map(|u| u.clamp(0., 100.));
-        let resets_at = info.get("resetsAt").and_then(|r| r.as_f64()).map(|r| if r > 1e11 { r / 1000. } else { r } as i64);
-        Some(Self { window, status, used, resets_at })
+        // A fraction of the window, which can run past 1 when usage goes over the cap.
+        let used = |v: &serde_json::Value| v.get("utilization").and_then(|u| u.as_f64()).map(|u| (u * 100.).max(0.));
+        let resets_at = |v: &serde_json::Value| v.get("resetsAt").and_then(|r| r.as_f64()).map(|r| if r > 1e11 { r / 1000. } else { r } as i64);
+        let top = info.get("status").and_then(status);
+        let mut limits: Vec<Self> = Vec::new();
+        if let (Some(status), Some(window)) = (top, info.get("rateLimitType").and_then(|w| w.as_str())) {
+            limits.push(Self { window: window.to_string(), status, used: used(info), resets_at: resets_at(info) });
+        }
+        for (window, w) in info.get("unifiedWindows").and_then(|w| w.as_object()).into_iter().flatten() {
+            match limits.iter_mut().find(|l| &l.window == window) {
+                Some(l) => {
+                    l.used = l.used.or(used(w));
+                    l.resets_at = l.resets_at.or(resets_at(w));
+                }
+                None => limits.push(Self {
+                    window: window.clone(),
+                    status: w.get("status").and_then(status).unwrap_or(LimitStatus::Allowed),
+                    used: used(w),
+                    resets_at: resets_at(w),
+                }),
+            }
+        }
+        limits
     }
 
     /// Shorter windows first: the five-hour one, then the weekly ones, then overage.
@@ -391,7 +411,7 @@ pub enum Event {
     /// (amount and currency) when the agent says.
     Usage { used: u64, size: u64, cost: Option<(f64, String)> },
     /// Where one of the account's usage limits stands (Claude subscriptions).
-    RateLimit(RateLimit),
+    RateLimit(Vec<RateLimit>),
     /// The slash commands the agent offers: name and description.
     Commands(Vec<(String, String)>),
     Title(String),
@@ -666,9 +686,9 @@ async fn run(
                             let result = response.block_task().await;
                             // A turn stopped by a usage limit says which, and when it lifts.
                             if let Err(e) = &result
-                                && let Some(limit) = e.data.as_ref().and_then(|d| d.get("rateLimit")).and_then(RateLimit::parse)
+                                && let Some(info) = e.data.as_ref().and_then(|d| d.get("rateLimit"))
                             {
-                                let _ = events.unbounded_send(Event::RateLimit(limit));
+                                let _ = events.unbounded_send(Event::RateLimit(RateLimit::parse(info)));
                             }
                             let _ = events.unbounded_send(Event::TurnEnded(match result {
                                 Ok(response) => Ok(match response.stop_reason {
@@ -943,9 +963,9 @@ fn translate(update: SessionUpdate) -> Option<Event> {
         SessionUpdate::UsageUpdate(usage) => {
             // Claude's adapter sends a rate limit event as a usage update that
             // repeats the last context figures, with the limit in `_meta`.
-            let limit = usage.meta.as_ref().and_then(|m| m.get("_claude/rateLimit")).and_then(RateLimit::parse);
-            match limit {
-                Some(limit) => Event::RateLimit(limit),
+            let limits = usage.meta.as_ref().and_then(|m| m.get("_claude/rateLimit")).map(RateLimit::parse);
+            match limits {
+                Some(limits) => Event::RateLimit(limits),
                 None => Event::Usage { used: usage.used, size: usage.size, cost: usage.cost.map(|c| (c.amount, c.currency)) },
             }
         }
@@ -984,21 +1004,39 @@ mod tests {
 
     #[test]
     fn rate_limit_reads_claude_info() {
-        let limit = RateLimit::parse(&serde_json::json!({
+        let limits = RateLimit::parse(&serde_json::json!({
             "status": "allowed_warning", "rateLimitType": "five_hour", "utilization": 0.82, "resetsAt": 1_800_000_000
-        }))
-        .unwrap();
+        }));
+        let [limit] = limits.as_slice() else { panic!("{limits:?}") };
         assert_eq!(limit.status, LimitStatus::Warning);
         assert_eq!(limit.short_name(), "5h");
         assert_eq!(limit.used.map(|u| u.round()), Some(82.));
         assert_eq!(limit.resets_at, Some(1_800_000_000));
 
-        let weekly = RateLimit::parse(&serde_json::json!({ "status": "rejected", "rateLimitType": "seven_day_opus", "resetsAt": 1_800_000_000_000u64 })).unwrap();
+        let weekly = RateLimit::parse(&serde_json::json!({ "status": "rejected", "rateLimitType": "seven_day_opus", "resetsAt": 1_800_000_000_000u64 }));
+        let [weekly] = weekly.as_slice() else { panic!("{weekly:?}") };
         assert_eq!((weekly.short_name().as_str(), weekly.long_name().as_str()), ("Opus week", "Opus weekly limit"));
         assert_eq!(weekly.resets_at, Some(1_800_000_000));
         assert!(limit.rank() < weekly.rank());
 
-        assert_eq!(RateLimit::parse(&serde_json::json!({ "status": "allowed" })), None);
+        assert_eq!(RateLimit::parse(&serde_json::json!({ "status": "allowed" })), vec![]);
+    }
+
+    #[test]
+    fn rate_limit_reads_every_window() {
+        // The usual event: no top-level utilization, the percentages in the windows.
+        let limits = RateLimit::parse(&serde_json::json!({
+            "status": "allowed", "rateLimitType": "five_hour", "resetsAt": 1_800_000_000,
+            "unifiedWindows": {
+                "five_hour": { "utilization": 0.42, "resetsAt": 1_800_000_000 },
+                "seven_day": { "utilization": 1.05, "resetsAt": 1_800_400_000, "status": "allowed_warning" }
+            }
+        }));
+        let five = limits.iter().find(|l| l.window == "five_hour").unwrap();
+        assert_eq!((five.status, five.used.map(|u| u.round())), (LimitStatus::Allowed, Some(42.)));
+        let week = limits.iter().find(|l| l.window == "seven_day").unwrap();
+        assert_eq!((week.status, week.used.map(|u| u.round()), week.resets_at), (LimitStatus::Warning, Some(105.), Some(1_800_400_000)));
+        assert_eq!(limits.len(), 2);
     }
 
     #[test]
@@ -1008,7 +1046,7 @@ mod tests {
             "_meta": { "_claude/rateLimit": { "status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1 } }
         }))
         .unwrap();
-        assert!(matches!(translate(update), Some(Event::RateLimit(RateLimit { status: LimitStatus::Allowed, .. }))));
+        assert!(matches!(translate(update), Some(Event::RateLimit(limits)) if limits[0].status == LimitStatus::Allowed));
     }
 
     #[test]
