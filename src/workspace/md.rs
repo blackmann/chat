@@ -80,19 +80,6 @@ struct Inline {
     images: Vec<(String, std::path::PathBuf)>,
 }
 
-/// Where an image link points on this machine: an absolute path, `~/…` or
-/// `file://…`. Only images GPUI can draw count; other files stay links.
-pub fn local_image(url: &str) -> Option<std::path::PathBuf> {
-    let url = url.strip_prefix('<').and_then(|u| u.strip_suffix('>')).unwrap_or(url);
-    let path = if let Some(rest) = url.strip_prefix("file://") {
-        std::path::PathBuf::from(rest.replace("%20", " "))
-    } else if let Some(rest) = url.strip_prefix("~/") {
-        std::env::home_dir()?.join(rest)
-    } else {
-        std::path::PathBuf::from(url)
-    };
-    (path.is_absolute() && super::media::kind(&path) == Some(super::media::Kind::Image)).then_some(path)
-}
 impl Inline {
     fn push(&mut self, s: &str, style: &Style) {
         if s.is_empty() {
@@ -167,7 +154,7 @@ impl Inline {
                     breaks,
                 ),
                 Node::LinkReference(l) => self.walk(&l.children, style, breaks),
-                Node::Image(i) if let Some(path) = local_image(&i.url) => self.images.push((i.url.clone(), path)),
+                Node::Image(i) if let Some(path) = crate::agent::local_image(&i.url) => self.images.push((i.url.clone(), path)),
                 Node::Image(i) => self.push(
                     &format!("[{}]", if i.alt.is_empty() { "image" } else { &i.alt }),
                     &Style {

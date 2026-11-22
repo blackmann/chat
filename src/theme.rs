@@ -34,6 +34,8 @@ pub struct Palette {
     pub blue: u32,
     pub green: u32,
     pub amber: u32,
+    /// Work in progress: a project whose agent is running.
+    pub orange: u32,
     pub red: u32,
     pub selected: u32,
     pub hover: u32,
@@ -47,6 +49,10 @@ pub struct Palette {
     pub scrim: u32,
     pub popover_hover: u32,
     pub popover_border: u32,
+    /// Large areas of state color (usage meters), lighter than the text colors in light mode.
+    pub fill_blue: u32,
+    pub fill_amber: u32,
+    pub fill_red: u32,
     /// Project colors for the rail, cycled per project.
     pub lanes: [u32; 8],
 }
@@ -69,6 +75,7 @@ impl Palette {
                 blue: 0x74ade8,
                 green: 0x98c379,
                 amber: 0xe5c07b,
+                orange: 0xf0883e,
                 red: 0xe06c75,
                 selected: 0x2f3d52,
                 hover: 0x33373f,
@@ -81,6 +88,9 @@ impl Palette {
                 scrim: 0x0000005c,
                 popover_hover: 0x3b3f48,
                 popover_border: 0x434852,
+                fill_blue: 0x74ade8,
+                fill_amber: 0xe5c07b,
+                fill_red: 0xe06c75,
                 lanes: [
                     0x74ade8, 0xc678dd, 0x98c379, 0xe5c07b, 0xe06c75, 0x56b6c2, 0xd19a66, 0xa0a8f0,
                 ],
@@ -100,6 +110,7 @@ impl Palette {
                 blue: 0x2f6fde,
                 green: 0x3b7d3e,
                 amber: 0xa86a00,
+                orange: 0xd9620f,
                 red: 0xc2414b,
                 selected: 0xe2e8f1,
                 hover: 0xebebed,
@@ -112,6 +123,9 @@ impl Palette {
                 scrim: 0x0000001f,
                 popover_hover: 0xe5e5e8,
                 popover_border: 0xd8d8dc,
+                fill_blue: 0x7fa9ef,
+                fill_amber: 0xf0c36a,
+                fill_red: 0xec8a91,
                 lanes: [
                     0x2f6fde, 0x8a3fc7, 0x3b8a3e, 0xb07800, 0xc2414b, 0x1f8a99, 0xc0601a, 0x5b62c9,
                 ],

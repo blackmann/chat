@@ -1,6 +1,6 @@
 //! Projects, threads and what a thread has gathered from its agent. A thread is
 //! a fold over the agent's events; every panel reads from it.
-use crate::agent::{Answer, Command, Question, QuestionKind, Reply, Event, Failure, FileDiff, History, Kind, Setting, Status, SteerOutcome, Step, Stop};
+use crate::agent::{Answer, Command, Question, QuestionKind, Reply, Event, Failure, FileDiff, History, Kind, Role, Setting, Status, SteerOutcome, Step, Stop, Tokens, TurnUsage};
 use serde::{Deserialize, Serialize};
 use futures::channel::mpsc::UnboundedSender;
 use gpui::{SharedString, Task};
@@ -42,6 +42,112 @@ pub struct Permission {
     pub answers: Vec<Answer>,
     /// The answer given, by name; `None` while the agent waits.
     pub chosen: Option<String>,
+    /// The tool call it's about, by id.
+    #[serde(default)]
+    pub tool: String,
+}
+
+impl Permission {
+    /// Whether the answer given let the call go ahead; `None` while waiting or dismissed.
+    pub fn allowed(&self) -> Option<bool> {
+        let chosen = self.chosen.as_ref()?;
+        self.answers.iter().find(|a| &a.name == chosen).map(|a| a.allow)
+    }
+}
+
+/// One finished turn, as the dashboard counts it. Kept on the thread until the
+/// next save writes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TurnRecord {
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub tokens: Tokens,
+    /// By model, when the agent says; else all under the thread's model.
+    pub models: Vec<(String, Tokens)>,
+    pub cost: f64,
+    pub currency: Option<String>,
+    /// Tool calls by kind: (kind, calls, denied).
+    pub tools: Vec<(String, u32, u32)>,
+    pub adds: u64,
+    pub dels: u64,
+    pub files: u64,
+    pub allowed: u32,
+    pub denied: u32,
+    /// How it ended: `finished`, `cancelled`, `refused`, `limit`, `failed`, `interrupted`.
+    pub stop: &'static str,
+    /// Rebuilt from a thread saved before turns were counted: no tokens, and
+    /// a share of the thread's cost rather than the turn's own.
+    pub rebuilt: bool,
+}
+
+/// Count what a turn's blocks did into `record`: tool calls by kind, the
+/// lines and files its finished edits changed, and permission answers.
+pub fn tally(turn: &[Block], record: &mut TurnRecord) {
+    let kind_of = |id: &str| {
+        turn.iter().find_map(|b| match b {
+            Block::Tool(t) if t.id == id => Some(t.kind),
+            _ => None,
+        })
+    };
+    let mut bump = |name: &str, calls: u32, denied: u32| match record.tools.iter_mut().find(|t| t.0 == name) {
+        Some(t) => {
+            t.1 += calls;
+            t.2 += denied;
+        }
+        None => record.tools.push((name.to_string(), calls, denied)),
+    };
+    let (mut adds, mut dels, mut allowed, mut denied) = (0, 0, 0, 0);
+    let mut files: Vec<&Path> = Vec::new();
+    for block in turn {
+        match block {
+            Block::Tool(t) => {
+                bump(kind_name(t.kind), 1, 0);
+                if t.status == Status::Done {
+                    for d in &t.diffs {
+                        let (a, r) = count(d.old.as_deref().unwrap_or(""), &d.new);
+                        adds += a as u64;
+                        dels += r as u64;
+                        if !files.contains(&d.path.as_path()) {
+                            files.push(&d.path);
+                        }
+                    }
+                }
+            }
+            Block::Permission(p) => match p.allowed() {
+                Some(true) => allowed += 1,
+                Some(false) => {
+                    denied += 1;
+                    // Permissions saved before they named their call can't say which tool.
+                    if let Some(kind) = kind_of(&p.tool) {
+                        bump(kind_name(kind), 0, 1);
+                    }
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    }
+    record.tools.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    record.adds += adds;
+    record.dels += dels;
+    record.files += files.len() as u64;
+    record.allowed += allowed;
+    record.denied += denied;
+}
+
+/// How a tool call's kind is named in stats.
+pub fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Read => "Read",
+        Kind::Edit => "Edit",
+        Kind::Delete => "Delete",
+        Kind::Move => "Move",
+        Kind::Search => "Search",
+        Kind::Execute => "Run",
+        Kind::Think => "Think",
+        Kind::Fetch => "Fetch",
+        Kind::Other => "Other",
+    }
 }
 
 /// Questions the agent asked, with what's been picked so far.
@@ -263,6 +369,11 @@ pub struct Thread {
     /// One steer awaits a reply before the next follow-up can be dispatched.
     pending_steer: Option<(usize, QueuedMessage)>,
     pub queued: VecDeque<QueuedMessage>,
+    /// What the running turn has spent so far, as the agent reports it.
+    turn_spent: Option<TurnUsage>,
+    turn_cost: f64,
+    /// Finished turns not yet saved to the stats.
+    pub finished: Vec<TurnRecord>,
 }
 
 pub struct QueuedMessage {
@@ -311,6 +422,9 @@ impl Thread {
             saved: Vec::new(),
             pending_steer: None,
             queued: VecDeque::new(),
+            turn_spent: None,
+            turn_cost: 0.,
+            finished: Vec::new(),
         }
     }
     pub fn send(&self, command: Command) {
@@ -411,6 +525,42 @@ impl Thread {
             self.mark_active(at);
         }
     }
+    /// Copy the local images this turn's replies show into the images folder,
+    /// so ones left in temporary places still show once those are cleared.
+    fn keep_images(&mut self) {
+        let start = self.turn_start.min(self.blocks.len());
+        for block in &mut self.blocks[start..] {
+            if let Block::Text(text) = block
+                && let Some(kept) = crate::agent::keep_images(text)
+            {
+                *text = kept;
+            }
+        }
+    }
+    /// Note the running turn among the finished ones, with what it spent and
+    /// did. Called before `stamp_turn`, while it still knows when it began.
+    fn record_turn(&mut self, stop: &'static str, at: i64) {
+        let Some(started_at) = self.turn_began else { return };
+        let spent = self.turn_spent.take().unwrap_or_default();
+        let start = self.turn_start.min(self.blocks.len());
+        let mut record = TurnRecord::default();
+        tally(&self.blocks[start..], &mut record);
+        let mut models = spent.models;
+        if models.is_empty() && spent.tokens.total() > 0 {
+            let model = self.settings.iter().find(|s| s.role == Role::Model).map(|s| s.current_name().to_string());
+            models.push((model.unwrap_or_else(|| "Unknown".into()), spent.tokens));
+        }
+        self.finished.push(TurnRecord {
+            started_at,
+            ended_at: at,
+            tokens: spent.tokens,
+            models,
+            cost: std::mem::take(&mut self.turn_cost),
+            currency: self.cost.as_ref().map(|c| c.1.clone()),
+            stop,
+            ..record
+        });
+    }
     /// A turn that ends leaves no tool call running.
     fn settle_tools(&mut self) {
         for block in &mut self.blocks {
@@ -504,10 +654,15 @@ impl Thread {
             Event::Settings(settings) => self.settings = settings,
             Event::Usage { used, size, cost } => {
                 self.usage = Some((used, size));
-                if cost.is_some() {
+                if let Some((amount, _)) = &cost {
+                    // The agent reports what the session has cost in all. A
+                    // reopened session may count again from nothing.
+                    let before = self.cost.as_ref().map_or(0., |c| c.0);
+                    self.turn_cost += if *amount >= before { amount - before } else { *amount };
                     self.cost = cost;
                 }
             }
+            Event::TurnUsage(spent) => self.turn_spent = Some(spent),
             // Limits are the account's, not the thread's: the workspace keeps them.
             Event::RateLimit(_) => {}
             Event::Commands(commands) => self.commands = commands,
@@ -516,8 +671,8 @@ impl Thread {
                     self.title = title.into();
                 }
             }
-            Event::Permission { id, title, answers, .. } => {
-                self.blocks.push(Block::Permission(Permission { id, title, answers, chosen: None }));
+            Event::Permission { id, tool, title, answers } => {
+                self.blocks.push(Block::Permission(Permission { id, title, answers, chosen: None, tool }));
                 self.state = ThreadState::Waiting;
             }
             Event::Ask { id, message, questions } => {
@@ -525,7 +680,15 @@ impl Thread {
                 self.state = ThreadState::Waiting;
             }
             Event::TurnEnded(result) => {
+                self.keep_images();
                 self.dismiss_permissions();
+                let stop = match &result {
+                    Ok(Stop::Finished) => "finished",
+                    Ok(Stop::Cancelled) => "cancelled",
+                    Ok(Stop::Refused) => "refused",
+                    Ok(Stop::Limit) => "limit",
+                    Err(_) => "failed",
+                };
                 self.state = match result {
                     Ok(Stop::Finished) => ThreadState::Done,
                     Ok(Stop::Cancelled) => {
@@ -550,6 +713,7 @@ impl Thread {
                         ThreadState::Failed
                     }
                 };
+                self.record_turn(stop, now_ms());
                 self.stamp_turn();
                 self.advance_follow_ups();
             }
@@ -578,6 +742,7 @@ impl Thread {
                 self.pending_steer = None;
                 self.dismiss_permissions();
                 self.settle_tools();
+                self.record_turn("interrupted", now_ms());
                 self.stamp_turn();
                 if reason.is_some() || interrupted {
                     match reason {

@@ -3,7 +3,7 @@
 use super::ui::*;
 use super::*;
 use crate::icons::Glyph;
-use gpui::{Animation, AnimationExt, ease_out_quint};
+use gpui::{Animation, AnimationExt};
 use std::time::Duration;
 use gpui_component::{
     Icon, IconName, Sizable, TitleBar,
@@ -168,25 +168,34 @@ fn face(name: &str, hue: u32, size: f32, fill: f32, hover: Option<f32>) -> Div {
         )
 }
 
-/// An amber dot that breathes while an agent works: a solid core with a halo
-/// swelling out of it and fading, once every 1.4s.
-fn pulse(id: impl Into<ElementId>, color: u32) -> Div {
-    const CORE: f32 = 8.;
-    const REACH: f32 = 16.;
-    let halo = div().absolute().rounded_full().bg(rgb(color)).with_animation(
+/// `core` breathing while an agent works: a halo swells out of it, fading as
+/// it goes, once every 2.4s. The halo is painted rather than laid out, so it
+/// grows by fractions of a pixel instead of stepping a whole one at a time, and
+/// it fades over the whole beat, so there's no still gap before the next one.
+fn pulse(id: impl Into<ElementId>, color: u32, core: Div) -> Div {
+    const REACH: f32 = 4.;
+    let halo = div().absolute().top(px(-REACH)).left(px(-REACH)).right(px(-REACH)).bottom(px(-REACH)).with_animation(
         id,
-        Animation::new(Duration::from_millis(1400)).repeat().with_easing(ease_out_quint()),
-        |halo, t| {
-            let size = CORE + (REACH - CORE) * t;
-            let at = (REACH - size) / 2.;
-            halo.size(px(size)).top(px(at)).left(px(at)).opacity(0.55 * (1. - t))
+        Animation::new(Duration::from_millis(2400)).repeat(),
+        move |halo, t| {
+            let inset = REACH * (1. - t).powi(3);
+            let alpha = 0.5 * (1. - t).powf(1.5);
+            halo.child(
+                canvas(
+                    |_, _, _| {},
+                    move |b, _, window, _| {
+                        let ring = Bounds::new(
+                            point(b.left() + px(inset), b.top() + px(inset)),
+                            size(b.size.width - px(2. * inset), b.size.height - px(2. * inset)),
+                        );
+                        window.paint_quad(fill(ring, Hsla::from(rgb(color)).opacity(alpha)).corner_radii(ring.size.height / 2.));
+                    },
+                )
+                .size_full(),
+            )
         },
     );
-    let at = (REACH - CORE) / 2.;
-    div()
-        .size(px(REACH))
-        .child(halo)
-        .child(div().absolute().top(px(at)).left(px(at)).size(px(CORE)).rounded_full().bg(rgb(color)))
+    div().relative().child(halo).child(core)
 }
 
 /// A project being dragged along the rail, to a new place.
@@ -344,6 +353,7 @@ impl Workspace {
     pub(super) fn title(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let project = self.current_project();
+        let dashboard = self.dashboard_open();
         TitleBar::new()
             .bg(rgb(colors.chrome))
             .border_b_1()
@@ -355,11 +365,27 @@ impl Workspace {
                     .pr_2()
                     .gap(px(6.))
                     .text_size(px(crate::theme::scaled_ui(13.)))
-                    .child(icon(Glyph::Sparkle).text_color(rgb(colors.blue)))
-                    .child(div().font_weight(FontWeight::MEDIUM).child("Chat"))
+                    .child(
+                        // "Chat" opens the dashboard, and closes it again.
+                        row()
+                            .id("open-dashboard")
+                            .debug_selector(|| "open-dashboard".into())
+                            .gap(px(6.))
+                            .px(px(5.))
+                            .ml(px(-5.))
+                            .py(px(1.))
+                            .rounded(px(5.))
+                            .when(dashboard, |s| s.bg(rgb(colors.hover)))
+                            .hover(|s| s.bg(rgb(colors.hover)))
+                            .on_click(cx.listener(|s, _, _, cx| s.toggle_dashboard(cx)))
+                            .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(if dashboard { "Back to threads" } else { "Usage dashboard" }).build(w, cx))
+                            .child(icon(Glyph::Sparkle).text_color(rgb(colors.blue)))
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Chat")),
+                    )
                     .child(div().text_color(rgb(colors.quiet)).child("/"))
-                    .child(div().text_color(rgb(colors.muted)).child(project.name.clone()))
-                    .when_some(self.current_thread(), |s, t| {
+                    .when(dashboard, |s| s.child(div().text_color(rgb(colors.muted)).child("Overview")))
+                    .when(!dashboard, |s| s.child(div().text_color(rgb(colors.muted)).child(project.name.clone())))
+                    .when_some(self.current_thread().filter(|_| !dashboard), |s, t| {
                         s.child(div().text_color(rgb(colors.quiet)).child("/"))
                             .child(div().min_w_0().truncate().child(t.title.clone()))
                     })
@@ -458,35 +484,35 @@ impl Workspace {
                                     .when(!active, |s| s.hover(|s| s.bg(Hsla::from(rgb(hue)).opacity(0.24))))
                                     .child(icon(Glyph::Message).size(px(15.))),
                             })
-                            // Finished threads you haven't looked at, counted on a blue
-                            // pill; otherwise a dot for one at work or waiting on you.
+                            // One mark: finished threads you haven't looked at, counted on
+                            // a pill, orange and breathing while an agent still works there;
+                            // otherwise an orange breathing dot for one at work, or a blue
+                            // one for one waiting on you.
                             .map(|s| {
-                                let badge = div()
-                                    .absolute()
-                                    .top(px(if p.path.is_some() { 0. } else { -3. }))
-                                    .right(px(-4.))
-                                    .rounded_full();
-                                if unread > 0 {
-                                    s.child(
-                                        badge
-                                            .min_w(px(14.))
-                                            .h(px(14.))
-                                            .px(px(3.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .bg(rgb(colors.blue))
-                                            .text_color(rgb(colors.primary_text))
-                                            .text_size(px(crate::theme::scaled_ui(9.)))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child(if unread > 9 { "9+".to_string() } else { unread.to_string() }),
-                                    )
-                                } else if running {
-                                    s.child(pulse(("project-pulse", i), colors.amber).absolute().top(px(1.)).right(px(-3.)))
-                                } else if review {
-                                    s.child(badge.size(px(10.)).border_2().border_color(rgb(colors.chrome)).bg(rgb(colors.blue)))
-                                } else {
-                                    s
+                                let at = |d: Div| d.absolute().top(px(if p.path.is_some() { 0. } else { -3. })).right(px(-4.));
+                                let count = |bg: u32| {
+                                    div()
+                                        .min_w(px(14.))
+                                        .h(px(14.))
+                                        .px(px(3.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(rgb(bg))
+                                        .text_color(rgb(colors.primary_text))
+                                        .text_size(px(crate::theme::scaled_ui(9.)))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(if unread > 9 { "9+".to_string() } else { unread.to_string() })
+                                };
+                                let dot = |bg: u32| div().size(px(10.)).rounded_full().border_2().border_color(rgb(colors.chrome)).bg(rgb(bg));
+                                match (unread > 0, running, review) {
+                                    (true, true, _) => s.child(at(pulse(("project-pulse", i), colors.orange, count(colors.orange)))),
+                                    (true, false, _) => s.child(at(count(colors.blue))),
+                                    // A plain dot: the halo needs no ring to stand apart.
+                                    (false, true, _) => s.child(at(pulse(("project-pulse", i), colors.orange, div().size(px(8.)).rounded_full().bg(rgb(colors.orange)))).mt(px(1.)).mr(px(1.))),
+                                    (false, false, true) => s.child(at(dot(colors.blue))),
+                                    _ => s,
                                 }
                             }),
                     )
@@ -1091,16 +1117,27 @@ impl Workspace {
             tip.push_str(&format!(" · resets {resets}"));
         }
         let tip: SharedString = tip.into();
+        let open = self.usage_open();
         Some(
-            row()
-                .id("rate-limit")
-                .debug_selector(|| "rate-limit".into())
-                .gap(px(4.))
-                .text_color(rgb(tint))
-                .when(limit.status != LimitStatus::Allowed, |s| s.child(icon(IconName::TriangleAlert).size(px(12.)).text_color(rgb(tint))))
-                .child(text)
-                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                .into_any_element(),
+            self.anchor(
+                "usage",
+                row()
+                    .id("rate-limit")
+                    .debug_selector(|| "rate-limit".into())
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .mx(px(-6.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .text_color(rgb(tint))
+                    .hover(|s| s.bg(rgb(colors.hover)))
+                    .when(open, |s| s.bg(rgb(colors.hover)))
+                    .when(limit.status != LimitStatus::Allowed, |s| s.child(icon(IconName::TriangleAlert).size(px(12.)).text_color(rgb(tint))))
+                    .child(text)
+                    .when(!open, |s| s.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx)))
+                    .on_click(cx.listener(|s, _, _, cx| s.toggle_usage(cx))),
+            )
+            .into_any_element(),
         )
     }
 }

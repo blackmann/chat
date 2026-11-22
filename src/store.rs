@@ -9,8 +9,8 @@
 //! thread. What was said each way is also kept in a full-text index, for
 //! searching threads by what's in them.
 use crate::{
-    agent::Step,
-    model::{Block, Project, Thread, ThreadState},
+    agent::{LimitStatus, RateLimit, Step},
+    model::{Block, Project, Thread, ThreadState, TurnRecord},
     settings::{self, AgentSpec},
 };
 use rusqlite::{Connection, params};
@@ -38,6 +38,23 @@ pub struct Store {
     writer: Arc<Mutex<Connection>>,
     /// The id the next saved thread gets.
     next_id: i64,
+    /// Usage limit readings since the last save, and the last of each written,
+    /// so only changes are kept.
+    limits: Vec<LimitRow>,
+    last_limits: std::collections::HashMap<(String, String), LimitRow>,
+}
+
+/// One reading of a usage limit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LimitRow {
+    /// Unix ms.
+    pub at: i64,
+    pub agent: String,
+    pub window: String,
+    pub status: String,
+    pub used: Option<f64>,
+    /// Unix seconds.
+    pub resets_at: Option<i64>,
 }
 
 fn connect(path: &Path) -> rusqlite::Result<Connection> {
@@ -92,14 +109,29 @@ impl Store {
             if name == migrations::MIGRATIONS[0].0 {
                 imported = import_json(tx, &dir.join("threads"))?;
             }
+            if name.ends_with("_backfill_turns") {
+                backfill_turns(tx)?;
+            }
             Ok(())
         })?;
         // Kept, renamed, in case anything went wrong; not read again.
         for file in imported {
             let _ = std::fs::rename(&file, file.with_extension("json.old"));
         }
-        let next_id = writer.query_row("SELECT coalesce(max(id), 0) + 1 FROM threads", [], |r| r.get(0))?;
-        Ok(Store { read: connect(&path)?, writer: Arc::new(Mutex::new(writer)), path, next_id })
+        // Past any thread a turn still names, so a new thread doesn't take a deleted one's turns.
+        let next_id = writer.query_row(
+            "SELECT max(coalesce((SELECT max(id) FROM threads), 0), coalesce((SELECT max(thread) FROM turns), 0)) + 1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(Store {
+            read: connect(&path)?,
+            writer: Arc::new(Mutex::new(writer)),
+            path,
+            next_id,
+            limits: Vec::new(),
+            last_limits: Default::default(),
+        })
     }
 
     /// The project's saved threads, numbered from `next_id`, without their
@@ -234,13 +266,40 @@ impl Store {
                             created_at: t.created_at,
                             active_at: t.active_at,
                             blocks,
+                            turns: std::mem::take(&mut t.finished),
                         }
                     })
                     .collect();
                 ProjectPlan { key, threads }
             })
             .collect();
-        Plan { saved_at: now, projects }
+        Plan { saved_at: now, projects, limits: std::mem::take(&mut self.limits) }
+    }
+
+    /// Keep an agent's usage limit readings for the next save, those that changed.
+    pub fn note_limits(&mut self, agent: &str, limits: &[RateLimit]) {
+        let at = crate::model::now_ms();
+        for limit in limits {
+            let row = LimitRow {
+                at,
+                agent: agent.to_string(),
+                window: limit.window.clone(),
+                status: match limit.status {
+                    LimitStatus::Allowed => "allowed",
+                    LimitStatus::Warning => "warning",
+                    LimitStatus::Rejected => "rejected",
+                }
+                .into(),
+                used: limit.used.map(|u| (u * 10.).round() / 10.),
+                resets_at: limit.resets_at,
+            };
+            let key = (row.agent.clone(), row.window.clone());
+            let same = self.last_limits.get(&key).is_some_and(|l| (&l.status, l.used, l.resets_at) == (&row.status, row.used, row.resets_at));
+            if !same {
+                self.last_limits.insert(key, row.clone());
+                self.limits.push(row);
+            }
+        }
     }
 
     /// The connection saves are written on, to hand to a background thread.
@@ -302,6 +361,7 @@ struct ThreadRow {
 pub struct Plan {
     saved_at: i64,
     projects: Vec<ProjectPlan>,
+    limits: Vec<LimitRow>,
 }
 impl Plan {
     /// The threads this save writes no blocks for: what they hold is already
@@ -337,6 +397,8 @@ struct ThreadPlan {
     active_at: Option<i64>,
     /// `None` for a thread whose blocks aren't read in: they stay as they are.
     blocks: Option<BlockChanges>,
+    /// Turns finished since the last save.
+    turns: Vec<TurnRecord>,
 }
 struct BlockChanges {
     /// How many blocks the thread has; saved ones past this go.
@@ -371,9 +433,176 @@ pub fn write(conn: &Mutex<Connection>, plan: &Plan) -> rusqlite::Result<()> {
         }
         for t in &project.threads {
             write_thread(&tx, project_id, t, plan.saved_at)?;
+            for turn in &t.turns {
+                write_turn(&tx, t.id, &project.key, &t.agent, turn)?;
+            }
         }
     }
+    for l in &plan.limits {
+        tx.prepare_cached("INSERT INTO limits (at, agent, window, status, used, resets_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?
+            .execute(params![l.at, l.agent, l.window, l.status, l.used, l.resets_at])?;
+    }
     tx.commit()
+}
+
+fn write_turn(tx: &rusqlite::Transaction, thread: i64, project: &str, agent: &str, t: &TurnRecord) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO turns (thread, project, agent, started_at, ended_at, input, output, cache_read, cache_write,
+                            cost, currency, adds, dels, files, allowed, denied, stop, rebuilt)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+    )?
+    .execute(params![
+        thread, project, agent, t.started_at, t.ended_at, t.tokens.input as i64, t.tokens.output as i64,
+        t.tokens.cache_read as i64, t.tokens.cache_write as i64, t.cost, t.currency, t.adds as i64, t.dels as i64,
+        t.files as i64, t.allowed, t.denied, t.stop, t.rebuilt
+    ])?;
+    let turn = tx.last_insert_rowid();
+    for (model, n) in &t.models {
+        tx.prepare_cached(
+            "INSERT INTO turn_models (turn, model, input, output, cache_read, cache_write) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT DO UPDATE SET input = input + excluded.input, output = output + excluded.output,
+                cache_read = cache_read + excluded.cache_read, cache_write = cache_write + excluded.cache_write",
+        )?
+        .execute(params![turn, model, n.input as i64, n.output as i64, n.cache_read as i64, n.cache_write as i64])?;
+    }
+    for (kind, calls, denied) in &t.tools {
+        tx.prepare_cached("INSERT OR REPLACE INTO turn_tools (turn, kind, calls, denied) VALUES (?1, ?2, ?3, ?4)")?
+            .execute(params![turn, kind, calls, denied])?;
+    }
+    Ok(())
+}
+
+/// Rebuild the turns of threads saved before turns were counted, from their
+/// blocks: a turn runs from a message sent to its `TurnEnded`, which says when
+/// it ended and how long the agent worked. Tokens weren't kept, so there are
+/// none; the thread's cost, less what turns already counted, is shared out by
+/// time worked. Turns from when a thread's live counting began are left be.
+fn backfill_turns(tx: &rusqlite::Transaction) -> rusqlite::Result<()> {
+    let live: std::collections::HashMap<i64, (i64, f64)> = {
+        let mut q = tx.prepare("SELECT thread, min(started_at), sum(cost) FROM turns WHERE thread IS NOT NULL GROUP BY thread")?;
+        let rows = q.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let threads: Vec<(i64, String, String, Option<String>)> = {
+        let mut q = tx.prepare("SELECT t.id, p.path, t.agent, t.cost FROM threads t JOIN projects p ON p.id = t.project")?;
+        let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, project, agent, cost) in threads {
+        let blocks: Vec<Block> = {
+            let mut q = tx.prepare_cached("SELECT body FROM blocks WHERE thread = ?1 ORDER BY seq")?;
+            let rows = q.query_map([id], |r| r.get::<_, String>(0))?;
+            rows.filter_map(|b| b.ok().and_then(|b| serde_json::from_str(&b).ok())).collect()
+        };
+        let (live_from, live_cost) = live.get(&id).copied().map_or((i64::MAX, 0.), |(from, cost)| (from, cost));
+        let mut turns = Vec::new();
+        let mut start = 0;
+        for (i, block) in blocks.iter().enumerate() {
+            let Block::TurnEnded { at, worked_ms } = block else { continue };
+            let turn = &blocks[start..i];
+            start = i + 1;
+            let sent = turn.iter().find_map(|b| match b {
+                Block::User(m) => Some(m.at),
+                _ => None,
+            });
+            // Only a turn something was sent for, and one not counted live.
+            let Some(sent) = sent else { continue };
+            if *at >= live_from {
+                continue;
+            }
+            let began = if *worked_ms > 0 { at - *worked_ms as i64 } else { sent.unwrap_or(*at) };
+            let mut record = TurnRecord { started_at: began, ended_at: *at, stop: "finished", rebuilt: true, ..Default::default() };
+            crate::model::tally(turn, &mut record);
+            turns.push(record);
+        }
+        if turns.is_empty() {
+            continue;
+        }
+        let (amount, currency) = parse::<(f64, String)>(cost).map_or((0., None), |(a, c)| (a, Some(c)));
+        let left = (amount - live_cost).max(0.);
+        let worked: i64 = turns.iter().map(|t| t.ended_at - t.started_at).sum();
+        let n = turns.len() as f64;
+        for t in &mut turns {
+            t.cost = if worked > 0 { left * (t.ended_at - t.started_at) as f64 / worked as f64 } else { left / n };
+            t.currency = currency.clone();
+            write_turn(tx, id, &project, &agent, t)?;
+        }
+    }
+    Ok(())
+}
+
+/// Every turn and limit reading kept, for the dashboard, with the titles of
+/// the threads they belong to. Opens its own connection, to run off the main thread.
+pub fn history(db: &Path) -> rusqlite::Result<crate::stats::History> {
+    use crate::{agent::Tokens, stats::{History, Turn}};
+    let conn = Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut turns: Vec<Turn> = Vec::new();
+    let mut ids: std::collections::HashMap<i64, usize> = Default::default();
+    {
+        let mut q = conn.prepare(
+            "SELECT id, thread, project, started_at, ended_at, input, output, cache_read, cache_write, cost, currency,
+                    adds, dels, files, allowed, denied, rebuilt
+             FROM turns ORDER BY started_at",
+        )?;
+        let mut rows = q.query([])?;
+        while let Some(r) = rows.next()? {
+            ids.insert(r.get(0)?, turns.len());
+            turns.push(Turn {
+                thread: r.get(1)?,
+                project: r.get(2)?,
+                started_at: r.get(3)?,
+                ended_at: r.get(4)?,
+                tokens: Tokens {
+                    input: r.get::<_, i64>(5)? as u64,
+                    output: r.get::<_, i64>(6)? as u64,
+                    cache_read: r.get::<_, i64>(7)? as u64,
+                    cache_write: r.get::<_, i64>(8)? as u64,
+                },
+                cost: r.get(9)?,
+                currency: r.get(10)?,
+                adds: r.get::<_, i64>(11)? as u64,
+                dels: r.get::<_, i64>(12)? as u64,
+                files: r.get::<_, i64>(13)? as u64,
+                allowed: r.get(14)?,
+                denied: r.get(15)?,
+                rebuilt: r.get(16)?,
+                models: Vec::new(),
+                tools: Vec::new(),
+            });
+        }
+    }
+    {
+        let mut q = conn.prepare("SELECT turn, model, input, output, cache_read, cache_write FROM turn_models")?;
+        let mut rows = q.query([])?;
+        while let Some(r) = rows.next()? {
+            if let Some(&i) = ids.get(&r.get::<_, i64>(0)?) {
+                let n = |k: usize| r.get::<_, i64>(k).map(|v| v as u64);
+                turns[i].models.push((r.get(1)?, Tokens { input: n(2)?, output: n(3)?, cache_read: n(4)?, cache_write: n(5)? }));
+            }
+        }
+    }
+    {
+        let mut q = conn.prepare("SELECT turn, kind, calls, denied FROM turn_tools")?;
+        let mut rows = q.query([])?;
+        while let Some(r) = rows.next()? {
+            if let Some(&i) = ids.get(&r.get::<_, i64>(0)?) {
+                turns[i].tools.push((r.get(1)?, r.get(2)?, r.get(3)?));
+            }
+        }
+    }
+    let limits = {
+        let mut q = conn.prepare("SELECT at, agent, window, status, used, resets_at FROM limits ORDER BY at")?;
+        let rows = q.query_map([], |r| {
+            Ok(LimitRow { at: r.get(0)?, agent: r.get(1)?, window: r.get(2)?, status: r.get(3)?, used: r.get(4)?, resets_at: r.get(5)? })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let titles = {
+        let mut q = conn.prepare("SELECT id, title FROM threads")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    Ok(History { turns, limits, titles })
 }
 
 fn write_thread(tx: &rusqlite::Transaction, project: i64, t: &ThreadPlan, saved_at: i64) -> rusqlite::Result<()> {
@@ -530,6 +759,7 @@ fn import_json(tx: &rusqlite::Transaction, dir: &Path) -> rusqlite::Result<Vec<P
                 created_at: s.created_at,
                 active_at: s.active_at,
                 blocks: Some(BlockChanges { len: s.blocks.len() as i64, writes }),
+                turns: Vec::new(),
             };
             write_thread(tx, project, &plan, saved_at)?;
         }
@@ -671,6 +901,129 @@ mod tests {
         projects[0].threads.remove(0);
         save(&mut store, &mut projects, &agents);
         assert!(found("lighthouse").is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn finished_turns_and_limit_changes_are_kept_for_the_dashboard() {
+        use crate::agent::{LimitStatus, RateLimit, Tokens};
+        let dir = temp("turns");
+        let agents = AgentSpec::defaults();
+        let mut store = Store::open_in(&dir).unwrap();
+        let mut thread = Thread::new(1, 0);
+        thread.title = "Count tokens".into();
+        thread.blocks.push(Block::User(Message::now("go")));
+        let tokens = Tokens { input: 10, output: 20, cache_read: 300, cache_write: 40 };
+        thread.finished.push(crate::model::TurnRecord {
+            started_at: 1_000,
+            ended_at: 61_000,
+            tokens,
+            models: vec![("claude-opus-5-5".into(), tokens)],
+            cost: 0.5,
+            currency: Some("USD".into()),
+            tools: vec![("Edit".into(), 3, 1)],
+            adds: 12,
+            dels: 4,
+            files: 2,
+            allowed: 2,
+            denied: 1,
+            stop: "finished",
+            rebuilt: false,
+        });
+        let mut project = Project::chats();
+        project.threads.push(thread);
+        let mut projects = [project];
+        let limit = |used| RateLimit { window: "seven_day".into(), status: LimitStatus::Allowed, used: Some(used), resets_at: Some(9) };
+        store.note_limits("Claude", &[limit(40.)]);
+        store.note_limits("Claude", &[limit(40.)]);
+        store.note_limits("Claude", &[limit(41.)]);
+        save(&mut store, &mut projects, &agents);
+        assert!(projects[0].threads[0].finished.is_empty(), "written once");
+        save(&mut store, &mut projects, &agents);
+
+        let h = history(store.path()).unwrap();
+        assert_eq!(h.turns.len(), 1);
+        let t = &h.turns[0];
+        assert_eq!((t.thread, t.project.as_str(), t.tokens, t.cost), (projects[0].threads[0].stored, "", tokens, 0.5));
+        assert_eq!(t.models, vec![("claude-opus-5-5".to_string(), tokens)]);
+        assert_eq!(t.tools, vec![("Edit".to_string(), 3, 1)]);
+        assert_eq!((t.adds, t.dels, t.files, t.allowed, t.denied), (12, 4, 2, 2, 1));
+        assert_eq!(h.limits.iter().map(|l| l.used).collect::<Vec<_>>(), [Some(40.), Some(41.)], "only changes");
+        assert_eq!(h.titles.get(&t.thread.unwrap()).map(String::as_str), Some("Count tokens"));
+
+        // A deleted thread's id isn't handed out again: its turns would follow.
+        projects[0].threads.clear();
+        save(&mut store, &mut projects, &agents);
+        let store = Store::open_in(&dir).unwrap();
+        assert!(store.next_id > t.thread.unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn turns_are_rebuilt_from_threads_saved_before_they_were_counted() {
+        use crate::agent::{Answer, FileDiff, Kind, Status};
+        use crate::model::{Permission, ToolCall};
+        let dir = temp("backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A database from before the backfill: every migration up to it.
+        let before: Vec<_> = migrations::MIGRATIONS.iter().copied().filter(|(n, _)| !n.ends_with("_backfill_turns")).collect();
+        let mut conn = connect(&dir.join("chat.db")).unwrap();
+        migrations::run(&mut conn, &before, |_, _| Ok(())).unwrap();
+        let tool = |id: &str, kind, diffs| {
+            Block::Tool(ToolCall { id: id.into(), title: String::new(), kind, status: Status::Done, diffs, output: String::new(), locations: Vec::new() })
+        };
+        let answers = vec![Answer { id: "y".into(), name: "Allow".into(), allow: true }, Answer { id: "n".into(), name: "Reject".into(), allow: false }];
+        let blocks = vec![
+            Block::User(Message { text: "one".into(), at: Some(1_000) }),
+            tool("r", Kind::Read, Vec::new()),
+            tool("e", Kind::Edit, vec![FileDiff { path: "a.rs".into(), old: Some("a\n".into()), new: "a\nb\nc\n".into() }]),
+            Block::Permission(Permission { id: 1, title: "Edit".into(), answers: answers.clone(), chosen: Some("Allow".into()), tool: String::new() }),
+            Block::TurnEnded { at: 31_000, worked_ms: 30_000 },
+            Block::User(Message { text: "two".into(), at: Some(100_000) }),
+            Block::Permission(Permission { id: 2, title: "Run".into(), answers, chosen: Some("Reject".into()), tool: String::new() }),
+            Block::TurnEnded { at: 190_000, worked_ms: 90_000 },
+            // Counted live already: left be.
+            Block::User(Message { text: "three".into(), at: Some(500_000) }),
+            Block::TurnEnded { at: 560_000, worked_ms: 60_000 },
+        ];
+        {
+            let tx = conn.transaction().unwrap();
+            tx.execute("INSERT INTO projects (path) VALUES ('/p')", []).unwrap();
+            tx.execute(
+                "INSERT INTO threads (id, project, position, title, agent, state, unread, picks, worktrees, plan, cost, saved_at)
+                 VALUES (7, 1, 0, 'Old', 'Claude', '\"Done\"', 0, '[]', '{}', '[]', '[3.0,\"USD\"]', 0)",
+                [],
+            )
+            .unwrap();
+            for (seq, b) in blocks.iter().enumerate() {
+                tx.execute("INSERT INTO blocks (thread, seq, body) VALUES (7, ?1, ?2)", params![seq as i64, json(b)]).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO turns (thread, project, agent, started_at, ended_at, input, output, cache_read, cache_write, cost, adds, dels, files, allowed, denied, stop)
+                 VALUES (7, '/p', 'Claude', 500000, 560000, 5, 5, 0, 0, 1.0, 0, 0, 0, 0, 0, 'finished')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(conn);
+
+        let store = Store::open_in(&dir).unwrap();
+        let h = history(store.path()).unwrap();
+        assert_eq!(h.turns.len(), 3, "two rebuilt, beside the one counted live");
+        let (a, b) = (&h.turns[0], &h.turns[1]);
+        assert!(a.rebuilt && b.rebuilt && !h.turns[2].rebuilt);
+        assert_eq!((a.started_at, a.ended_at, b.started_at), (1_000, 31_000, 100_000));
+        assert_eq!(a.tools, vec![("Edit".to_string(), 1, 0), ("Read".to_string(), 1, 0)]);
+        assert_eq!((a.adds, a.dels, a.files, a.allowed), (2, 0, 1, 1));
+        assert_eq!((b.denied, b.tools.len()), (1, 0), "a denial that can't say its tool counts only as a denial");
+        // The $2 not counted live, shared 30s to 90s.
+        assert!((a.cost - 0.5).abs() < 1e-9 && (b.cost - 1.5).abs() < 1e-9, "{} {}", a.cost, b.cost);
+        assert_eq!(a.currency.as_deref(), Some("USD"));
+        assert_eq!(a.tokens.total(), 0);
+        drop(store);
+        let again = Store::open_in(&dir).unwrap();
+        assert_eq!(history(again.path()).unwrap().turns.len(), 3, "rebuilt once");
         let _ = std::fs::remove_dir_all(dir);
     }
 

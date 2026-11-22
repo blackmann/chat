@@ -8,6 +8,7 @@ mod menu;
 mod model;
 mod pasteboard;
 mod settings;
+mod stats;
 mod store;
 mod theme;
 mod workspace;

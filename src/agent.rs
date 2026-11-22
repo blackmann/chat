@@ -308,6 +308,76 @@ pub struct RateLimit {
     pub resets_at: Option<i64>,
 }
 
+/// Tokens spent, split the way the API bills them. `input` leaves out the
+/// cache's reads and writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tokens {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl Tokens {
+    pub fn total(&self) -> u64 {
+        self.input + self.output + self.cache_read + self.cache_write
+    }
+    pub fn add(&mut self, other: &Tokens) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+}
+
+/// What one turn spent: in all, and by model when the agent says.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TurnUsage {
+    pub tokens: Tokens,
+    pub models: Vec<(String, Tokens)>,
+}
+
+impl TurnUsage {
+    /// Read a prompt response's `usage` and its `_meta.quota`, which Claude's
+    /// and Codex's adapters fill with a `token_count` per model. The per-model
+    /// counts include subagents, which `usage` leaves out, so they win when there.
+    pub fn parse(usage: Option<&serde_json::Value>, meta: Option<&serde_json::Value>) -> Option<TurnUsage> {
+        let n = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        let models: Vec<(String, Tokens)> = meta
+            .and_then(|m| m.pointer("/quota/model_usage"))
+            .and_then(|m| m.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                let model = m.get("model")?.as_str()?.to_string();
+                let c = m.get("token_count")?;
+                let tokens = Tokens {
+                    input: n(c, "inputTokens"),
+                    output: n(c, "outputTokens") + n(c, "reasoningOutputTokens"),
+                    cache_read: n(c, "cachedInputTokens"),
+                    cache_write: n(c, "cachedWriteTokens"),
+                };
+                (tokens.total() > 0).then_some((model, tokens))
+            })
+            .collect();
+        let tokens = if models.is_empty() {
+            let u = usage?;
+            Tokens {
+                input: n(u, "inputTokens"),
+                output: n(u, "outputTokens") + n(u, "thoughtTokens"),
+                cache_read: n(u, "cachedReadTokens"),
+                cache_write: n(u, "cachedWriteTokens"),
+            }
+        } else {
+            models.iter().fold(Tokens::default(), |mut t, (_, m)| {
+                t.add(m);
+                t
+            })
+        };
+        (tokens.total() > 0).then_some(TurnUsage { tokens, models })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitStatus {
     Allowed,
@@ -412,6 +482,8 @@ pub enum Event {
     Usage { used: u64, size: u64, cost: Option<(f64, String)> },
     /// Where one of the account's usage limits stands (Claude subscriptions).
     RateLimit(Vec<RateLimit>),
+    /// The tokens the turn that's ending spent; sent just before `TurnEnded`.
+    TurnUsage(TurnUsage),
     /// The slash commands the agent offers: name and description.
     Commands(Vec<(String, String)>),
     Title(String),
@@ -691,6 +763,13 @@ async fn run(
                             {
                                 let _ = events.unbounded_send(Event::RateLimit(RateLimit::parse(info)));
                             }
+                            if let Ok(response) = &result {
+                                let usage = response.usage.as_ref().and_then(|u| serde_json::to_value(u).ok());
+                                let meta = response.meta.as_ref().map(|m| serde_json::Value::Object(m.clone()));
+                                if let Some(spent) = TurnUsage::parse(usage.as_ref(), meta.as_ref()) {
+                                    let _ = events.unbounded_send(Event::TurnUsage(spent));
+                                }
+                            }
                             let _ = events.unbounded_send(Event::TurnEnded(match result {
                                 Ok(response) => Ok(match response.stop_reason {
                                     StopReason::EndTurn => Stop::Finished,
@@ -891,16 +970,81 @@ fn images_dir() -> PathBuf {
 
 /// Keep an image in the images folder, named by its contents.
 pub fn store_image(bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    store_image_in(&images_dir(), bytes, ext)
+}
+
+fn store_image_in(dir: &Path, bytes: &[u8], ext: &str) -> Option<PathBuf> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hash);
-    let dir = images_dir();
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir_all(dir).ok()?;
     let path = dir.join(format!("{:016x}.{ext}", hash.finish()));
     if !path.exists() {
         std::fs::write(&path, bytes).ok()?;
     }
     Some(path)
+}
+
+/// Where an image link points on this machine: an absolute path, `~/…` or
+/// `file://…`. Only images GPUI can draw count; other files stay links.
+pub fn local_image(url: &str) -> Option<PathBuf> {
+    let url = url.strip_prefix('<').and_then(|u| u.strip_suffix('>')).unwrap_or(url);
+    let path = if let Some(rest) = url.strip_prefix("file://") {
+        PathBuf::from(rest.replace("%20", " "))
+    } else if let Some(rest) = url.strip_prefix("~/") {
+        std::env::home_dir()?.join(rest)
+    } else {
+        PathBuf::from(url)
+    };
+    (path.is_absolute() && is_image(&path.to_string_lossy())).then_some(path)
+}
+
+/// Images past this size are left where they are rather than copied.
+const MAX_KEPT_IMAGE: u64 = 32 * 1024 * 1024;
+
+/// `text` with the local images it shows copied into the images folder and
+/// pointed at there, so a screenshot an agent left in `/tmp` still shows
+/// after a restart clears it. `None` when nothing needed copying.
+pub fn keep_images(text: &str) -> Option<String> {
+    keep_images_in(text, &images_dir())
+}
+
+fn keep_images_in(text: &str, dir: &Path) -> Option<String> {
+    if !text.contains("![") {
+        return None;
+    }
+    let markdown::mdast::Node::Root(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()).ok()? else {
+        return None;
+    };
+    fn walk(node: &markdown::mdast::Node, dir: &Path, kept: &mut Vec<(usize, usize, String)>) {
+        if let markdown::mdast::Node::Image(i) = node
+            && let Some(pos) = &i.position
+            && let Some(path) = local_image(&i.url)
+            && !path.starts_with(dir)
+            && std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_KEPT_IMAGE)
+            && let Ok(bytes) = std::fs::read(&path)
+            && let Some(copy) = store_image_in(dir, &bytes, &path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase())
+        {
+            let alt = i.alt.replace(['[', ']'], "");
+            kept.push((pos.start.offset, pos.end.offset, format!("![{alt}](<{}>)", copy.display())));
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, dir, kept);
+        }
+    }
+    let mut kept = Vec::new();
+    for child in &root.children {
+        walk(child, dir, &mut kept);
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    let mut out = text.to_string();
+    kept.sort_by_key(|(start, ..)| std::cmp::Reverse(*start));
+    for (start, end, link) in kept {
+        out.replace_range(start..end, &link);
+    }
+    Some(out)
 }
 
 /// A message as the agent gets it: the text, then each pasted image it
@@ -1051,6 +1195,27 @@ pub fn shell_path() -> Option<String> {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+
+    #[test]
+    fn local_images_are_kept_in_the_images_folder() {
+        let root = std::env::temp_dir().join(format!("chat-keep-{}", std::process::id()));
+        let (tmp, kept) = (root.join("tmp"), root.join("images"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("shot.png"), b"\x89PNGshot").unwrap();
+        let text = format!(
+            "Before:\n\n![before](<{}>)\n\n![gone](/nowhere/x.png) ![remote](https://x.dev/a.png)",
+            tmp.join("shot.png").display()
+        );
+        let out = keep_images_in(&text, &kept).unwrap();
+        let copy = std::fs::read_dir(&kept).unwrap().next().unwrap().unwrap().path();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"\x89PNGshot");
+        assert_eq!(
+            out,
+            format!("Before:\n\n![before](<{}>)\n\n![gone](/nowhere/x.png) ![remote](https://x.dev/a.png)", copy.display())
+        );
+        assert_eq!(keep_images_in(&out, &kept), None, "a kept image stays put");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn rate_limit_reads_claude_info() {

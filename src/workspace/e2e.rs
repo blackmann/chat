@@ -1206,3 +1206,85 @@ fn searches_and_closes_settings(cx: &mut TestAppContext) {
     assert!(d.read(|s| !s.prefs_open));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// The limit in the status bar opens the usage widget, with the week's bar and
+/// the five-hour clock; a second click, Escape or a click away closes it.
+#[gpui::test]
+fn opens_the_usage_widget(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let ws = d.ws.clone();
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| {
+            s.composer.update(cx, |c, cx| c.set_value("explain it", window, cx));
+            s.submit(&super::Submit, window, cx);
+        })
+    });
+    // The mock agent reports its limits when a turn ends.
+    d.wait("the agent's limits", 60, |d| d.cx.debug_bounds("rate-limit").is_some());
+    let click = |d: &mut Driver| {
+        // A click just after a click away closed it counts as that close.
+        std::thread::sleep(Duration::from_millis(450));
+        let item = d.cx.debug_bounds("rate-limit").unwrap();
+        d.cx.simulate_click(item.center(), Modifiers::none());
+        d.settle();
+    };
+    click(&mut d);
+    assert!(d.read(|s| s.usage_open()), "a click opens the widget");
+    let pop = d.cx.debug_bounds("usage-popover").expect("the widget is drawn");
+    let item = d.cx.debug_bounds("rate-limit").unwrap();
+    assert!(pop.bottom() <= item.top(), "it opens above the status bar");
+    click(&mut d);
+    assert!(!d.read(|s| s.usage_open()), "a second click closes it");
+    click(&mut d);
+    d.keys("escape");
+    assert!(!d.read(|s| s.usage_open()), "Escape closes it");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A finished turn is counted: "Chat" in the title bar opens the dashboard
+/// with its tokens, spend and tools, a range can be picked, and Escape closes it.
+#[gpui::test]
+fn counts_turns_on_the_dashboard(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let ws = d.ws.clone();
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| {
+            s.composer.update(cx, |c, cx| c.set_value("greet the user", window, cx));
+            s.submit(&super::Submit, window, cx);
+        })
+    });
+    // Allow the edit it asks about.
+    d.wait("the permission request", 60, |d| d.read(|s| s.current_thread().is_some_and(|t| t.awaiting_user())));
+    let id = d.read(|s| {
+        s.current_thread().unwrap().blocks.iter().find_map(|b| match b {
+            crate::model::Block::Permission(p) if p.chosen.is_none() => Some(p.id),
+            _ => None,
+        })
+    });
+    d.act(|s, cx| s.answer(id.unwrap(), Some(("yes".into(), "Allow".into())), cx));
+    d.wait("the turn to finish", 60, |d| d.read(|s| s.current_thread().is_some_and(|t| t.turn_began.is_none() && !t.blocks.is_empty())));
+    let chat = d.cx.debug_bounds("open-dashboard").expect("Chat is in the title bar");
+    d.cx.simulate_click(chat.center(), Modifiers::none());
+    d.wait("the dashboard's numbers", 30, |d| d.read(|s| s.dashboard.as_ref().is_some_and(|d| d.stats.is_some())));
+    assert!(d.cx.debug_bounds("dashboard").is_some(), "it's drawn in place of the threads");
+    let stats = d.read(|s| s.dashboard.as_ref().and_then(|d| d.stats.clone()).unwrap());
+    assert_eq!(stats.turns, 1);
+    assert_eq!(stats.tokens, 42_500, "the mock agent's turn, cache included");
+    assert_eq!(stats.models, vec![("mock-large".to_string(), 900)]);
+    assert!(stats.cost > 0., "the session's cost went up during the turn");
+    assert!(stats.tools.iter().any(|(k, n, _)| k == "Run" && *n >= 1), "tools counted: {:?}", stats.tools);
+    assert!(stats.weeks.last().is_some_and(|w| w.adds > 0), "lines changed counted");
+    assert_eq!((stats.allowed, stats.denied), (1, 0));
+
+    d.act(|s, cx| s.set_range(crate::stats::Range::Year, cx));
+    assert_eq!(d.read(|s| s.dashboard.as_ref().map(|d| d.range)), Some(crate::stats::Range::Year));
+    d.keys("escape");
+    assert!(d.read(|s| !s.dashboard_open()), "Escape closes it");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

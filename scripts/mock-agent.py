@@ -211,9 +211,23 @@ def turn(rid, session, prompt, cwd):
 def finish(rid, session):
     update(session, {"sessionUpdate": "usage_update", "used": 42000 + turns[0] * 3100, "size": 200000,
                       "cost": {"amount": 0.21 * turns[0], "currency": "USD"}})
+    # Usage limits, as Claude's adapter reports them: a usage update carrying the windows in `_meta`.
+    now = time.time()
+    update(session, {"sessionUpdate": "usage_update", "used": 42000 + turns[0] * 3100, "size": 200000,
+                      "_meta": {"_claude/rateLimit": {"status": "allowed", "rateLimitType": "five_hour",
+                                                     "unifiedWindows": {
+                                                         "five_hour": {"status": "allowed", "utilization": min(0.42 + 0.1 * turns[0], 1.0), "resetsAt": now + 2.6 * 3600},
+                                                         "seven_day": {"status": "allowed", "utilization": min(0.23 + 0.05 * turns[0], 1.0), "resetsAt": now + 4.2 * 86400},
+                                                     }}}})
     with turn_lock:
         del active_turns[rid]
-        send({"id": rid, "result": {"stopReason": "cancelled" if cancelled.is_set() else "end_turn"}})
+        # What the turn spent, as Claude's adapter reports it: `usage`, and `_meta.quota` by model.
+        count = {"inputTokens": 1200, "cachedInputTokens": 38000, "cachedWriteTokens": 2400, "outputTokens": 900}
+        send({"id": rid, "result": {"stopReason": "cancelled" if cancelled.is_set() else "end_turn",
+                                    "usage": {"inputTokens": 1200, "outputTokens": 900, "cachedReadTokens": 38000,
+                                              "cachedWriteTokens": 2400, "totalTokens": 42500},
+                                    "_meta": {"quota": {"token_count": count,
+                                                        "model_usage": [{"model": "mock-large", "token_count": count}]}}}})
 
 
 def main():

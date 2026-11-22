@@ -2,6 +2,7 @@
 //! the panels around them. Views live in the submodules.
 mod chat;
 mod commands;
+mod dashboard;
 mod effort;
 mod file_kind;
 mod find;
@@ -20,6 +21,7 @@ mod servers;
 mod git_panel;
 mod syntax;
 mod terminal;
+mod usage;
 pub use terminal::init_terminal_keys;
 mod ui;
 #[cfg(test)]
@@ -322,6 +324,10 @@ pub struct Workspace {
     servers: lsp::Servers,
     /// The reasoning effort slider is showing.
     effort_open: bool,
+    /// The usage widget is open while this redraws it.
+    usage_tick: Option<Task<()>>,
+    /// The dashboard, while it shows in place of the threads and tabs.
+    dashboard: Option<dashboard::Dashboard>,
     /// Where the effort slider's track was last painted, to map the pointer to a step.
     effort_track: Rc<std::cell::Cell<Bounds<Pixels>>>,
     effort_dragging: bool,
@@ -521,6 +527,8 @@ impl Workspace {
             symbol: None,
             servers: lsp::Servers::default(),
             effort_open: false,
+            usage_tick: None,
+            dashboard: None,
             effort_track: Rc::default(),
             effort_dragging: false,
             renaming: None,
@@ -620,6 +628,7 @@ impl Workspace {
     // ── Projects and threads ────────────────────────────────────────────────
 
     fn select_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.close_dashboard(cx);
         if self.project == index {
             return;
         }
@@ -745,6 +754,7 @@ impl Workspace {
     }
 
     fn select_thread(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.close_dashboard(cx);
         let id = self.current_project().threads.get(index).map(|t| t.id);
         if id != self.draft_owner {
             self.stash_draft(cx);
@@ -1083,6 +1093,9 @@ impl Workspace {
         // A connection that fails before it opens usually means the agent isn't installed or signed in.
         let failed_to_open = matches!(&event, Event::Closed(Some(_))) && !thread.ready;
         if let Event::RateLimit(limits) = &event {
+            if let Some(store) = &mut self.store {
+                store.note_limits(self.settings.agents.get(thread.agent).map_or("", |a| a.name.as_str()), limits);
+            }
             let known = self.limits.entry(thread.agent).or_default();
             for limit in limits {
                 known.insert(limit.window.clone(), limit.clone());
@@ -1843,7 +1856,9 @@ impl Render for Workspace {
         } else {
             center.into_any_element()
         };
-        let main = if self.threads_open {
+        let main = if self.dashboard_open() {
+            self.dashboard_view(cx)
+        } else if self.threads_open {
             h_resizable("thread-panels")
                 .with_state(&self.thread_panels)
                 .child(
@@ -1948,6 +1963,10 @@ impl Render for Workspace {
                     s.close_card(cx);
                 } else if s.effort_open {
                     s.close_effort(cx);
+                } else if s.usage_open() {
+                    s.close_usage(cx);
+                } else if s.dashboard_open() {
+                    s.close_dashboard(cx);
                 } else if s.line_selection.is_some() {
                     s.line_selection = None;
                     cx.notify();
@@ -1977,6 +1996,19 @@ impl Render for Workspace {
             .when(self.prefs_open, |root| root.child(self.preferences_view(cx)))
             .when_some(self.effort_open.then(|| self.effort_view(cx)).flatten(), |root, view| {
                 let at = self.anchors.borrow().get("effort").map(|b| b.top_right() - point(px(0.), px(6.)));
+                root.child(
+                    deferred(
+                        anchored()
+                            .anchor(Corner::BottomRight)
+                            .position(at.unwrap_or_default())
+                            .snap_to_window_with_margin(px(8.))
+                            .child(view),
+                    )
+                    .with_priority(2),
+                )
+            })
+            .when_some(self.usage_open().then(|| self.usage_view(cx)).flatten(), |root, view| {
+                let at = self.anchors.borrow().get("usage").map(|b| b.top_right() - point(px(0.), px(6.)));
                 root.child(
                     deferred(
                         anchored()
