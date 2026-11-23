@@ -10,6 +10,7 @@
 //! searching threads by what's in them.
 use crate::{
     agent::{LimitStatus, RateLimit, Step},
+    missions::{Kind as MissionKind, Mission, Phase as MissionPhase},
     model::{Block, Project, Thread, ThreadState, TurnRecord},
     settings::{self, AgentSpec},
 };
@@ -311,6 +312,47 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// The newest missions, newest first: any under way, then those done.
+    pub fn load_missions(&self) -> Vec<Mission> {
+        read_missions(&self.read).unwrap_or_else(|e| {
+            eprintln!("chat: couldn't read missions: {e}");
+            Vec::new()
+        })
+    }
+}
+
+fn read_missions(conn: &Connection) -> rusqlite::Result<Vec<Mission>> {
+    let mut query = conn.prepare(
+        "SELECT id, kind, seed, level, started_at, phase, answer FROM missions ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = query.query_map([crate::missions::HISTORY as i64 + 1], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, String>(5)?, r.get::<_, Option<String>>(6)?))
+    })?;
+    let mut missions = Vec::new();
+    for row in rows {
+        let (id, kind, seed, level, started_at, phase, answer) = row?;
+        // Kinds and phases this build doesn't know are left out.
+        let (Some(kind), Ok(phase)) = (MissionKind::from_key(&kind), serde_json::from_str(&phase)) else { continue };
+        missions.push(Mission { id, kind, seed: seed as u64, level: level.clamp(0, u8::MAX as i64) as u8, started_at, phase, answer });
+    }
+    Ok(missions)
+}
+
+/// Write `mission` as it stands, over what was there.
+pub fn write_mission(conn: &Mutex<Connection>, mission: &Mission) -> rusqlite::Result<()> {
+    let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+    let (score, ended_at) = match mission.phase {
+        MissionPhase::Done { at, score, .. } => (Some(score), Some(at)),
+        _ => (None, None),
+    };
+    let phase = serde_json::to_string(&mission.phase).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO missions (id, kind, seed, level, started_at, phase, answer, score, ended_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![mission.id, mission.kind.key(), mission.seed as i64, mission.level, mission.started_at, phase, mission.answer, score, ended_at],
+    )?;
+    Ok(())
 }
 
 /// The blocks of `thread` that differ from what was last saved, and how many
@@ -783,6 +825,22 @@ mod tests {
     fn save(store: &mut Store, projects: &mut [Project], agents: &[AgentSpec]) {
         let plan = store.plan(projects, agents);
         write(&store.writer(), &plan).unwrap();
+    }
+
+    #[test]
+    fn missions_survive_a_round_trip() {
+        let dir = temp("missions");
+        let store = Store::open_in(&dir).unwrap();
+        let mut done = Mission::new(1, MissionKind::Pin, u64::MAX - 3, 2, 10);
+        done.phase = MissionPhase::Recall;
+        done.submit("123456", 20);
+        let open = Mission::new(2, MissionKind::Pin, 9, 0, 30);
+        write_mission(&store.writer(), &done).unwrap();
+        write_mission(&store.writer(), &open).unwrap();
+        // Writing again replaces it.
+        write_mission(&store.writer(), &done).unwrap();
+        let again = Store::open_in(&dir).unwrap();
+        assert_eq!(again.load_missions(), vec![open, done]);
     }
 
     #[test]

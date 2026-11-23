@@ -7,7 +7,7 @@ use crate::{
     git::{self, Operation},
     icons::Glyph,
 };
-use gpui_component::{
+use gpui_component::{Selectable, 
     Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
@@ -34,7 +34,7 @@ impl Render for CommitEdge {
 }
 
 /// A raised, bordered button with an optional icon, as in a native toolbar.
-fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
+pub(super) fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
     row()
         .id(id)
         .h(px(24.))
@@ -244,6 +244,8 @@ impl Workspace {
                     s.git_diffs.insert(key, diff);
                 }
                 s.sync_git_watch();
+                // The same events add and remove files in the Files page.
+                s.refresh_listings(cx);
                 // Commits and edits move open files' marks and blame.
                 s.diff_blame.borrow_mut().clear();
                 for path in s.files.keys().cloned().collect::<Vec<_>>() {
@@ -767,11 +769,22 @@ impl Workspace {
         let id = SharedString::from(format!("git-diff-{staged}-{}", path.display()));
         let body = match self.git_diffs.get(&(path.to_owned(), staged)) {
             Some(Ok(git::Diff::Text { old, new })) => self.diff_pane(id, super::panes::LineSource::GitDiff(path.to_owned(), staged), old, new, window, cx),
-            Some(Ok(git::Diff::Image { old, new })) => super::media::image_diff(colors, old.as_ref(), new.as_ref()),
+            Some(Ok(git::Diff::Image { old, new })) => super::media::image_diff(colors, old.as_ref(), new.as_ref(), self.settings.image_diff_stacked),
             Some(Ok(git::Diff::Binary)) => empty(colors, Glyph::FileDiff, "Binary file", "Its change can't be shown as text.").into_any_element(),
             Some(Ok(git::Diff::Large)) => empty(colors, Glyph::FileDiff, "Large file", "This file is too large to diff here.").into_any_element(),
             Some(Err(error)) => empty(colors, Glyph::FileDiff, "No diff", error.clone()).into_any_element(),
             None => label(colors, "Loading diff…").p_3().into_any_element(),
+        };
+        let image = matches!(self.git_diffs.get(&(path.to_owned(), staged)), Some(Ok(git::Diff::Image { .. })));
+        let stacked = self.settings.image_diff_stacked;
+        let layout = |id: &'static str, glyph: Glyph, tip: &'static str, value: bool| {
+            Button::new(id).icon(glyph).ghost().xsmall().selected(stacked == value).tooltip(tip).on_click(cx.listener(move |s, _, _, cx| {
+                if s.settings.image_diff_stacked != value {
+                    s.settings.image_diff_stacked = value;
+                    let _ = s.settings.save();
+                    cx.notify();
+                }
+            }))
         };
         let entry = self.git_snapshots.values().filter_map(|s| s.as_ref().ok()).find_map(|s| s.entries.iter().find(|e| s.root.join(&e.path) == path));
         col()
@@ -787,6 +800,14 @@ impl Workspace {
                     .child(label(colors, if staged { "Staged · HEAD → Index" } else { "Unstaged · Index → Working tree" }))
                     .when_some(entry.and_then(|e| e.stat(staged)), |s, (adds, dels)| s.child(stat(colors, adds, dels)))
                     .child(div().flex_1())
+                    .when(image, |s| {
+                        s.child(
+                            row()
+                                .gap(px(2.))
+                                .child(layout("image-diff-beside", Glyph::Columns, "Side by side", false))
+                                .child(layout("image-diff-stacked", Glyph::Rows, "Stacked", true)),
+                        )
+                    })
                     .child(
                         Button::new("git-view-file").ghost().xsmall().label("Open file").on_click(cx.listener({
                             let path = path.to_owned();

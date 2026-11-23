@@ -633,8 +633,15 @@ impl Workspace {
             return lines;
         }
         // Command output and the like: its last line says how the call went.
-        let output = tool.output.trim_end();
-        let detail = output.lines().last().unwrap_or_default().trim().to_string();
+        // Images it returned are drawn, not shown as their markdown.
+        let (output, pictures) = output_images(&tool.output);
+        let output = output.trim_end();
+        let detail = match output.lines().last().map(str::trim).filter(|l| !l.is_empty()) {
+            Some(last) => last.to_string(),
+            None if pictures.len() == 1 => "1 image".to_string(),
+            None if !pictures.is_empty() => format!("{} images", pictures.len()),
+            None => String::new(),
+        };
         let key = (thread, index);
         let open = self.open_tools.contains(&key);
         // Thoughts are prose; everything else names a command, file or query.
@@ -723,6 +730,38 @@ impl Workspace {
                                 s.child(div().text_color(rgb(colors.quiet)).child(format!("… {hidden} earlier lines")))
                             })
                             .children(lines.into_iter().map(|l| div().whitespace_nowrap().min_h(px(4.)).child(l))),
+                    )
+                })
+                .when(!pictures.is_empty(), |s| {
+                    s.child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .border_t_1()
+                            .border_color(rgb(colors.row_border))
+                            .children(pictures.into_iter().enumerate().map(|(n, path)| {
+                                let open = path.clone();
+                                div()
+                                    .id(("tool-image", index * 100 + n))
+                                    .w(px(TOOL_IMAGE.0))
+                                    .h(px(TOOL_IMAGE.1))
+                                    .rounded(px(5.))
+                                    .overflow_hidden()
+                                    .border_1()
+                                    .border_color(rgb(colors.border))
+                                    .bg(rgb(colors.background))
+                                    .cursor_pointer()
+                                    .hover(|s| s.border_color(rgb(colors.quiet)))
+                                    .tooltip({
+                                        let tip = super::tilde(&path);
+                                        move |w, cx| Tooltip::new(tip.clone()).build(w, cx)
+                                    })
+                                    .child(img(path).size_full().object_fit(ObjectFit::Contain))
+                                    .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::File(open.clone()), cx)))
+                            })),
                     )
                 }),
         )
@@ -1348,17 +1387,14 @@ impl Workspace {
             }
         }
         let transcript = if thread.blocks.is_empty() && thread.problem.is_none() {
-            let project = self.current_project();
-            empty(
-                colors,
-                Glyph::Sparkle,
-                match project.path {
-                    Some(_) => format!("What should we build in {}?", project.name),
-                    None => "What's on your mind?".to_string(),
-                },
-                "Describe a change, paste an error, or ask how something works.",
-            )
-            .into_any_element()
+            col()
+                .flex_1()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .p_6()
+                .child(super::retro_mac::RetroMac::new(colors, self.composer.read(cx).value()))
+                .into_any_element()
         } else {
             let transcript = div()
                 .id("transcript")
@@ -1459,6 +1495,25 @@ impl Workspace {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_output_images_are_drawn_not_listed() {
+        let dir = std::env::temp_dir().join(format!("chat-tool-images-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a b")).unwrap();
+        let (one, two) = (dir.join("a b/one.jpg"), dir.join("two.png"));
+        std::fs::write(&one, b"x").unwrap();
+        std::fs::write(&two, b"x").unwrap();
+        let output = format!(
+            "Read /tmp/b.jpg\n\n\n![image](<{}>)\n\n![shot]({})\n![gone](/nowhere/x.png)",
+            one.display(),
+            two.display()
+        );
+        let (text, pictures) = super::output_images(&output);
+        assert_eq!(pictures, [one, two]);
+        assert_eq!(text, "Read /tmp/b.jpg\n\n![gone](/nowhere/x.png)", "one that isn't there stays as text");
+        assert_eq!(super::output_images("plain").0, "plain");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     use super::{Mentions, activity_runs, activity_summary, replace_file_mentions, thought_lines};
     use crate::{agent::{Kind, Status}, model::{Block, ToolCall}};
 
@@ -1548,4 +1603,40 @@ mod tests {
         let lines = thought_lines("Planning\n\n  Designing  \n\r\nRefining\n");
         assert_eq!(lines, ["Planning", "Designing", "Refining"]);
     }
+}
+
+/// How big an image a tool returned is drawn when its call is opened.
+const TOOL_IMAGE: (f32, f32) = (180., 120.);
+
+/// A tool's output without the lines that are just an image, `![alt](<path>)`
+/// or `![alt](path)` to a file here, and those images' paths in order.
+fn output_images(output: &str) -> (String, Vec<std::path::PathBuf>) {
+    let mut pictures = Vec::new();
+    let mut rest = Vec::new();
+    for line in output.lines() {
+        match image_line(line.trim()) {
+            Some(path) => pictures.push(path),
+            None => rest.push(line),
+        }
+    }
+    if pictures.is_empty() {
+        return (output.to_string(), pictures);
+    }
+    // Drop the blank lines left around where the images were.
+    let text = rest.join("\n");
+    let mut text = text.trim().to_string();
+    while text.contains("\n\n\n") {
+        text = text.replace("\n\n\n", "\n\n");
+    }
+    (text, pictures)
+}
+
+fn image_line(line: &str) -> Option<std::path::PathBuf> {
+    let rest = line.strip_prefix("![")?;
+    let (_, target) = rest.split_once("](")?;
+    let target = target.strip_suffix(')')?;
+    let target = target.strip_prefix('<').and_then(|t| t.strip_suffix('>')).unwrap_or(target);
+    let target = target.strip_prefix("file://").unwrap_or(target);
+    let path = std::path::PathBuf::from(target);
+    (path.is_absolute() && path.is_file()).then_some(path)
 }

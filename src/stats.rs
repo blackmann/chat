@@ -105,7 +105,7 @@ impl Unit {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Day {
     pub date: NaiveDate,
     pub tokens: u64,
@@ -115,6 +115,8 @@ pub struct Day {
     pub threads: u32,
     /// Past today: drawn as a placeholder.
     pub future: bool,
+    /// Projects worked on, as (folder, tokens, turns), the busiest first.
+    pub projects: Vec<(String, u64, u32)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -336,17 +338,24 @@ impl Stats {
 
         // By day, over everything: the year's grid, streaks and the biggest day.
         // By day: tokens, turns, whether any turn was counted live, threads.
-        let mut by_day: HashMap<NaiveDate, (u64, u32, bool, HashSet<i64>)> = HashMap::new();
+        let mut by_day: HashMap<NaiveDate, (u64, u32, bool, HashSet<i64>, HashMap<&str, (u64, u32)>)> = HashMap::new();
         for t in &history.turns {
             let day = by_day.entry(local(t.started_at).date_naive()).or_default();
             day.0 += t.tokens.total();
             day.1 += 1;
             day.2 |= !t.rebuilt;
             day.3.extend(t.thread);
+            let p = day.4.entry(t.project.as_str()).or_default();
+            p.0 += t.tokens.total();
+            p.1 += 1;
         }
         let day = |date: NaiveDate| {
-            let (tokens, turns, counted, threads) = by_day.get(&date).map_or((0, 0, false, 0), |(n, k, c, t)| (*n, *k, *c, t.len() as u32));
-            Day { date, tokens, turns, counted, threads, future: date > today }
+            let Some((tokens, turns, counted, threads, projects)) = by_day.get(&date) else {
+                return Day { date, tokens: 0, turns: 0, counted: false, threads: 0, future: date > today, projects: Vec::new() };
+            };
+            let mut projects: Vec<(String, u64, u32)> = projects.iter().map(|(p, (n, k))| (p.to_string(), *n, *k)).collect();
+            projects.sort_by(|a, b| (b.1, b.2).cmp(&(a.1, a.2)).then_with(|| a.0.cmp(&b.0)));
+            Day { date, tokens: *tokens, turns: *turns, counted: *counted, threads: threads.len() as u32, future: date > today, projects }
         };
         let end = today + Duration::days(6 - today.weekday().num_days_from_sunday() as i64);
         let grid_start = end - Duration::days(53 * 7 - 1);
@@ -687,7 +696,10 @@ mod tests {
         assert_eq!((week.peak, week.hits), (Some(55.), 1), "one five-hour window ran out, read twice");
         let longest = s.bests.longest.unwrap();
         assert_eq!((longest.thread, longest.title.as_deref()), (1, Some("Build the dashboard")));
-        assert_eq!(s.bests.biggest_day.unwrap().tokens, 4_000);
+        let biggest = s.bests.biggest_day.unwrap();
+        assert_eq!(biggest.tokens, 4_000);
+        assert!(biggest.projects.windows(2).all(|p| p[0].1 >= p[1].1), "busiest project first");
+        assert_eq!(biggest.projects.iter().map(|p| p.1).sum::<u64>(), 4_000);
     }
 
     #[test]

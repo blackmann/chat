@@ -492,7 +492,7 @@ impl Workspace {
             record(colors, k, value(b.value), b.title.clone().unwrap_or_else(|| "A deleted thread".into()), format!("{} · {}", b.project, date(b.at)), link)
         };
         let currency = s.currency.clone();
-        let big = s.bests.biggest_day.map(|d| {
+        let big = s.bests.biggest_day.as_ref().map(|d| {
             record(
                 colors,
                 "Biggest day",
@@ -675,20 +675,16 @@ fn heat_section(colors: Palette, s: &Stats) -> Div {
     let columns = (0..weeks).map(|w| {
         col().flex_1().min_w(px(4.)).gap(px(3.)).children((0..7).map(|d| {
             let i = w * 7 + d;
-            let day = s.heat[i];
+            let day = &s.heat[i];
             let cell = div().id(("heat", i)).h(px(CELL)).w_full().rounded(px(2.));
             if day.future {
                 return cell.border_1().border_dashed().border_color(rgb(colors.row_border));
             }
-            let when = day.date.format("%a, %b %-d");
-            let tip = if day.turns == 0 {
-                format!("Nothing · {when}")
-            } else if day.counted {
-                format!("{} tokens · {} · {when}", fmt_tokens(day.tokens), plural(day.threads as usize, "thread"))
-            } else {
-                format!("{} · {} · {when}, before tokens were counted", plural(day.turns as usize, "turn"), plural(day.threads as usize, "thread"))
-            };
-            cell.bg(level_color(s.level(&day))).hover(|s| s.border_1().border_color(rgb(colors.text))).tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+            let tip = day.clone();
+            cell.bg(level_color(s.level(day))).hover(|s| s.border_1().border_color(rgb(colors.text))).tooltip(move |w, cx| {
+                let tip = tip.clone();
+                Tooltip::element(move |_, _| heat_tip(colors, &tip)).build(w, cx)
+            })
         }))
     });
     let days = col().w(px(26.)).flex_shrink_0().gap(px(3.)).children(["", "Mon", "", "Wed", "", "Fri", ""].map(|t| div().h(px(CELL)).text_size(small(9.)).line_height(px(CELL)).text_color(rgb(colors.quiet)).child(t)));
@@ -715,7 +711,7 @@ fn heat_section(colors: Palette, s: &Stats) -> Div {
         .gap(px(14.))
         .child(stat("Current streak", s.streak.to_string(), days_word(s.streak)).child(streak_bar(s.streak as f32 / s.longest_streak.max(1) as f32)))
         .child(stat("Longest streak", s.longest_streak.to_string(), days_word(s.longest_streak)).child(streak_bar(1.)))
-        .when_some(s.bests.biggest_day, |c, d| c.child(stat("Biggest day", fmt_tokens(d.tokens), d.date.format("%b %-d, %Y").to_string())));
+        .when_some(s.bests.biggest_day.as_ref(), |c, d| c.child(stat("Biggest day", fmt_tokens(d.tokens), d.date.format("%b %-d, %Y").to_string())));
     let active = s.heat.iter().filter(|d| d.turns > 0).count();
     let counted = s.heat.iter().filter(|d| d.counted).count();
     let per_day = if counted > 0 { s.heat.iter().filter(|d| d.counted).map(|d| d.tokens).sum::<u64>() / counted as u64 } else { 0 };
@@ -740,6 +736,49 @@ fn heat_section(colors: Palette, s: &Stats) -> Div {
                 )
                 .child(side),
         )
+}
+
+/// A day on the grid, up close: the same width every time, so it doesn't
+/// jump about as the pointer crosses the grid.
+fn heat_tip(colors: Palette, day: &crate::stats::Day) -> Div {
+    const SHOWN: usize = 4;
+    let total = if day.turns == 0 {
+        "Nothing".to_string()
+    } else if day.counted {
+        format!("{} tokens", fmt_tokens(day.tokens))
+    } else {
+        plural(day.turns as usize, "turn")
+    };
+    let detail = match (day.turns, day.counted) {
+        (0, _) => None,
+        (_, true) => Some(format!("{} · {}", plural(day.turns as usize, "turn"), plural(day.threads as usize, "thread"))),
+        (_, false) => Some(format!("{} · before tokens were counted", plural(day.threads as usize, "thread"))),
+    };
+    let projects = day.projects.iter().take(SHOWN).map(|(path, tokens, turns)| {
+        let amount = if *tokens > 0 { fmt_tokens(*tokens) } else { plural(*turns as usize, "turn") };
+        row()
+            .gap(px(8.))
+            .child(div().flex_1().min_w_0().truncate().text_color(rgb(colors.text)).child(crate::stats::project_name(path)))
+            .child(div().flex_shrink_0().text_color(rgb(colors.muted)).child(amount))
+    });
+    let more = day.projects.len().saturating_sub(SHOWN);
+    col()
+        .w(px(216.))
+        .py(px(4.))
+        .gap(px(2.))
+        .text_size(small(12.))
+        .child(
+            row()
+                .gap(px(8.))
+                .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).text_color(rgb(colors.text)).child(day.date.format("%a, %b %-d").to_string()))
+                .child(div().flex_shrink_0().text_color(rgb(colors.text)).child(total)),
+        )
+        .when_some(detail, |c, d| c.child(div().text_size(small(11.)).text_color(rgb(colors.quiet)).child(d)))
+        .when(!day.projects.is_empty(), |c| {
+            c.child(div().my(px(4.)).h(px(1.)).bg(rgb(colors.row_border)))
+                .children(projects)
+                .when(more > 0, |c| c.child(div().text_size(small(11.)).text_color(rgb(colors.quiet)).child(format!("+ {more} more"))))
+        })
 }
 
 fn projects_section(colors: Palette, s: &Stats) -> Div {

@@ -69,18 +69,15 @@ fn fitted(picture: Img) -> Div {
         .child(picture.absolute().top_0().left_0().size_full().object_fit(ObjectFit::ScaleDown))
 }
 
-/// The bordered box a side of an image's change sits in.
-fn frame(colors: Palette) -> Div {
-    div().size_full().rounded(px(6.)).border_1().border_color(rgb(colors.border)).bg(rgb(colors.background))
-}
-
-/// An image's change: what it was and what it is, side by side. A side that
-/// didn't exist says so.
-pub(super) fn image_diff(colors: Palette, old: Option<&Arc<Image>>, new: Option<&Arc<Image>>) -> AnyElement {
+/// An image's change: what it was and what it is, beside each other or, when
+/// `stacked`, one above the other, split by a rule. A side that didn't exist
+/// says so.
+pub(super) fn image_diff(colors: Palette, old: Option<&Arc<Image>>, new: Option<&Arc<Image>>, stacked: bool) -> AnyElement {
     let side = |title: &'static str, tint: u32, image: Option<&Arc<Image>>, absent: &'static str| {
         let picture = match image {
-            Some(image) => frame(colors).p_3().child(fitted(img(image.clone()))).into_any_element(),
-            None => frame(colors)
+            Some(image) => fitted(img(image.clone())).into_any_element(),
+            None => div()
+                .size_full()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -94,6 +91,7 @@ pub(super) fn image_diff(colors: Palette, old: Option<&Arc<Image>>, new: Option<
             .min_w_0()
             .min_h_0()
             .gap_2()
+            .p_3()
             .child(
                 row()
                     .flex_shrink_0()
@@ -106,17 +104,20 @@ pub(super) fn image_diff(colors: Palette, old: Option<&Arc<Image>>, new: Option<
             )
             .child(div().flex_1().min_h_0().child(picture))
     };
-    row()
+    let rule = div().flex_shrink_0().bg(rgb(colors.border));
+    let rule = if stacked { rule.h(px(1.)).w_full() } else { rule.w(px(1.)).h_full() };
+    div()
+        .flex()
+        .when(stacked, |d| d.flex_col())
         .size_full()
         .min_h_0()
-        .gap_4()
-        .p_4()
         .bg(rgb(colors.panel))
         .map(|mut d| {
             d.style().align_items = Some(AlignItems::Stretch);
             d
         })
         .child(side("Before", colors.red, old, "Didn't exist"))
+        .child(rule)
         .child(side("After", colors.green, new, "Deleted"))
         .into_any_element()
 }

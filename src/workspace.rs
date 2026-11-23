@@ -10,7 +10,9 @@ mod chrome;
 mod md;
 mod media;
 mod mentions;
+mod missions;
 mod panes;
+mod retro_mac;
 mod preferences;
 mod search;
 mod select;
@@ -61,6 +63,7 @@ actions!(
         ShowContext,
         ShowChanges,
         ShowFiles,
+        ShowMissions,
         OpenTerminal,
         OpenPreferences,
         AddToChat,
@@ -119,14 +122,17 @@ pub enum Side {
     Context,
     Changes,
     Files,
+    /// Challenges for the whole app, not the project showing.
+    Missions,
 }
 impl Side {
-    pub const ALL: [Side; 3] = [Side::Context, Side::Changes, Side::Files];
+    pub const ALL: [Side; 4] = [Side::Context, Side::Changes, Side::Files, Side::Missions];
     pub fn title(self) -> &'static str {
         match self {
             Side::Context => "Context",
             Side::Changes => "Changes",
             Side::Files => "Files",
+            Side::Missions => "Missions",
         }
     }
 }
@@ -148,7 +154,7 @@ struct ProjectView {
 type Terminals = HashMap<PathBuf, Result<Entity<terminal::TerminalView>, SharedString>>;
 
 /// A file or folder in the Files page.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Entry {
     pub name: SharedString,
     pub path: PathBuf,
@@ -202,8 +208,11 @@ pub struct Workspace {
     side_open: bool,
     /// Folders open in the Files page.
     expanded: HashSet<PathBuf>,
-    /// Folder listings, read once when a folder is first opened.
+    /// Folder listings, read when a folder is opened and again whenever git
+    /// looks (the watcher, the window coming forward), for those showing.
     listings: HashMap<PathBuf, Vec<Entry>>,
+    /// Bumped per re-read of the listings, so a slow one can't undo a newer one.
+    listings_revision: u64,
     /// The lines of each file open in a tab, or why it couldn't be shown.
     files: HashMap<PathBuf, Result<Rc<FileView>, SharedString>>,
     /// Open images and videos, shown as pictures rather than lines.
@@ -372,6 +381,12 @@ pub struct Workspace {
     limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
     /// Other apps a file can be opened in, found once at startup.
     editors: Rc<crate::editors::Editors>,
+    /// The mission under way and those done; for the app, not a project.
+    missions: crate::missions::Missions,
+    /// Where a mission's answer is typed.
+    mission_input: Entity<InputState>,
+    /// Moves the mission on when its time is up, and redraws its countdown.
+    mission_tick: Option<Task<()>>,
     _quit: Option<Subscription>,
 }
 
@@ -427,6 +442,7 @@ impl Workspace {
             }
         })
         .detach();
+        let mission_input = missions::answer_input(window, cx);
         let settings = Settings::load();
         let commit_message = git_panel::commit_input(settings.commit_box_height.is_some(), window, cx);
         let mut projects = vec![Project::chats()];
@@ -454,6 +470,7 @@ impl Workspace {
             side_open: true,
             expanded: HashSet::new(),
             listings: HashMap::new(),
+            listings_revision: 0,
             files: HashMap::new(),
             media: HashMap::new(),
             file_scroll: HashMap::new(),
@@ -505,7 +522,6 @@ impl Workspace {
             thought_selection: HashMap::new(),
             live: Vec::new(),
             saving: false,
-            store,
             git_snapshots: HashMap::new(),
             git_diffs: HashMap::new(),
             git_refreshing: false,
@@ -555,6 +571,10 @@ impl Workspace {
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
             editors: Rc::default(),
+            missions: crate::missions::Missions::from_saved(store.as_ref().map(|s| s.load_missions()).unwrap_or_default()),
+            mission_input,
+            mission_tick: None,
+            store,
             _quit: None,
         };
         cx.spawn(async move |this, cx| {
@@ -592,13 +612,18 @@ impl Workspace {
             workspace.select_thread(first, cx);
         }
         workspace.start_git_watch(window, cx);
+        workspace.listen_for_notification_clicks(window, cx);
+        workspace.advance_mission(cx);
         cx.observe_window_activation(window, |s, window, cx| {
             s.window_active = window.is_window_active();
             // Coming back to the window is seeing the thread on show.
-            if s.window_active && let Some(t) = s.current_thread_mut() && t.unread {
-                t.unread = false;
-                s.save_soon(cx);
-                cx.notify();
+            if s.window_active && let Some(t) = s.current_thread_mut() {
+                crate::notify::withdraw(t.id);
+                if t.unread {
+                    t.unread = false;
+                    s.save_soon(cx);
+                    cx.notify();
+                }
             }
         })
         .detach();
@@ -773,6 +798,7 @@ impl Workspace {
         self.transcript.scroll_to_bottom();
         if let Some(t) = self.current_thread_mut() {
             t.unread = false;
+            crate::notify::withdraw(t.id);
         }
         if let Some(t) = self.current_thread() {
             let id = t.id;
@@ -988,6 +1014,28 @@ impl Workspace {
         })
         .detach();
     }
+    /// Bring up the thread whose notification was clicked.
+    fn listen_for_notification_clicks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut clicks) = crate::notify::init() else { return };
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(id) = clicks.next().await {
+                if this.update_in(cx, |s, window, cx| s.reveal_thread(id, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+    fn reveal_thread(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let found = self.projects.iter().enumerate().find_map(|(p, project)| {
+            project.threads.iter().position(|t| t.id == id).map(|t| (p, t))
+        });
+        let Some((project, thread)) = found else { return };
+        cx.activate(true);
+        window.activate_window();
+        self.select_project(project, cx);
+        self.select_thread(thread, cx);
+    }
     /// A thread's agent says which worktree it works in for a project folder.
     fn on_worktree(&mut self, report: crate::worktree_tool::Report, cx: &mut Context<Self>) {
         let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == report.thread) else {
@@ -1105,11 +1153,34 @@ impl Workspace {
         if current && matches!(event, Event::Ask { .. }) {
             self.focus_ask = true;
         }
+        let asking = match &event {
+            Event::Permission { title, .. } => Some(format!("Needs permission: {title}")),
+            Event::Ask { message, questions, .. } => Some(
+                Some(message.as_str())
+                    .filter(|m| !m.trim().is_empty())
+                    .or_else(|| questions.first().and_then(|q| q.prompt.as_deref().or(q.title.as_deref())))
+                    .map_or("Has a question for you".into(), |m| format!("Asks: {m}")),
+            ),
+            _ => None,
+        };
         thread.apply(event);
         // A turn that finishes out of sight waits to be read.
-        if was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed) && !seen {
+        let ended = was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed);
+        if ended && !seen {
             thread.unread = true;
         }
+        // Out of sight, a finished turn or a question for the user is worth a notification.
+        let note = (!seen && self.settings.notifications != Some(false))
+            .then(|| asking.or_else(|| ended.then(|| thread.ending_summary())))
+            .flatten()
+            .map(|body| (thread.title.to_string(), body));
+        if let Some((title, body)) = note {
+            let project = self.projects.iter().find(|p| p.threads.iter().any(|t| t.id == id));
+            crate::notify::post(id, &title, project.map_or("", |p| p.name.as_str()), &body);
+        }
+        let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == id) else {
+            return;
+        };
         if failed_to_open && let Some(problem) = &mut thread.problem {
             let name = self.settings.agents.get(thread.agent).map_or("the agent", |a| a.name.as_str());
             problem.push_str(&format!("\nCheck that {name} is installed and signed in, then send your message again."));
@@ -1118,6 +1189,10 @@ impl Workspace {
         // undone by the next chunk, nor by a drag on the scrollbar.
         if current && self.follow && self.holding_transcript.is_none() {
             self.transcript.scroll_to_bottom();
+        }
+        // A mission waiting on turns counts this one.
+        if ended {
+            self.mission_turn_ended(cx);
         }
         self.save_soon(cx);
         cx.notify();
@@ -1587,6 +1662,8 @@ impl Workspace {
         // Picking the page that's already showing folds the panel away.
         self.side_open = !(self.side_open && self.side == side);
         self.side = side;
+        // A mission's countdown ticks faster while its page shows.
+        self.advance_mission(cx);
         cx.notify();
     }
     fn toggle_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -1602,6 +1679,55 @@ impl Workspace {
             self.listings.insert(path.to_path_buf(), list(path, ignored));
         }
         cx.notify();
+    }
+
+    /// Read the Files page's showing folders again: the project's roots and the
+    /// folders open beneath them, so files made, deleted or checked out show.
+    pub(super) fn refresh_listings(&mut self, cx: &mut Context<Self>) {
+        let roots = self.current_project().roots();
+        let showing: Vec<(PathBuf, bool)> = self
+            .listings
+            .keys()
+            .filter(|dir| roots.contains(dir) || (self.expanded.contains(*dir) && roots.iter().any(|r| dir.starts_with(r))))
+            .map(|dir| {
+                // A folder git ignores passes that on to what's inside.
+                let ignored = dir
+                    .parent()
+                    .and_then(|parent| self.listings.get(parent))
+                    .and_then(|entries| entries.iter().find(|e| &e.path == dir))
+                    .is_some_and(|e| e.ignored);
+                (dir.clone(), ignored)
+            })
+            .collect();
+        if showing.is_empty() {
+            return;
+        }
+        self.listings_revision += 1;
+        let revision = self.listings_revision;
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { showing.into_iter().map(|(dir, ignored)| { let entries = list(&dir, ignored); (dir, entries) }).collect::<Vec<_>>() })
+                .await;
+            let _ = this.update(cx, |s, cx| {
+                // A later read has started: it knows better.
+                if s.listings_revision != revision {
+                    return;
+                }
+                let mut changed = false;
+                for (dir, entries) in read {
+                    // A folder gone since lists as empty; its parent drops it.
+                    if s.listings.get(&dir) != Some(&entries) {
+                        s.listings.insert(dir, entries);
+                        changed = true;
+                    }
+                }
+                if changed {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     // ── Popovers (as in Gitflow) ────────────────────────────────────────────
@@ -1898,6 +2024,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &ShowContext, _, cx| s.show_side(Side::Context, cx)))
             .on_action(cx.listener(|s, _: &ShowChanges, _, cx| s.show_side(Side::Changes, cx)))
             .on_action(cx.listener(|s, _: &ShowFiles, _, cx| s.show_side(Side::Files, cx)))
+            .on_action(cx.listener(|s, _: &ShowMissions, _, cx| s.show_side(Side::Missions, cx)))
             .on_action(cx.listener(|s, _: &OpenTerminal, window, cx| s.open_terminal(window, cx)))
             .on_action(cx.listener(Self::open_prefs))
             .on_action(cx.listener(|s, _: &GoToDefinition, window, cx| s.go_to_definition(window, cx)))

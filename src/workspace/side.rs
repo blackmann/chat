@@ -9,6 +9,7 @@ fn side_glyph(side: Side) -> Icon {
         Side::Context => IconName::Asterisk.into(),
         Side::Changes => Glyph::Branch.into(),
         Side::Files => Glyph::Files.into(),
+        Side::Missions => Glyph::Target.into(),
     }
 }
 
@@ -423,9 +424,16 @@ impl Workspace {
                         // The repository has staged or unstaged changes.
                         s.child(div().absolute().top(px(8.)).right(px(9.)).size(px(5.)).rounded_full().bg(rgb(colors.amber)))
                     })
+                    .when(side == Side::Missions && self.missions.ready() && !active, |s| {
+                        // A mission is ready to be recalled.
+                        s.child(div().absolute().top(px(8.)).right(px(9.)).size(px(5.)).rounded_full().bg(rgb(colors.blue)))
+                    })
                     .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                    .on_click(cx.listener(move |s, _, _, cx| {
+                    .on_click(cx.listener(move |s, _, window, cx| {
                         s.side = side;
+                        if side == Side::Missions {
+                            s.focus_mission_answer(window, cx);
+                        }
                         cx.notify();
                     })),
             );
@@ -465,6 +473,7 @@ impl Workspace {
                 Side::Context => self.context_page(cx),
                 Side::Changes => self.changes_page(cx),
                 Side::Files => self.files_page(cx),
+                Side::Missions => self.missions_page(cx),
             };
             div().id("side-page").flex_1().min_h_0().overflow_y_scroll().child(page).into_any_element()
         };

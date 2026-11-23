@@ -515,6 +515,24 @@ impl Thread {
             _ => false,
         })
     }
+    /// What a notification says of the turn that just ended: why it stopped
+    /// when it didn't finish, else the start of the agent's last reply.
+    pub fn ending_summary(&self) -> String {
+        let turn = self.blocks.get(self.turn_start..).unwrap_or_default();
+        let last = turn.iter().rev().find_map(|b| match b {
+            Block::Text(text) if !text.trim().is_empty() => Some(Ok(text.as_str())),
+            Block::Notice(notice) => Some(Err(notice.as_str())),
+            Block::SignIn { .. } => Some(Err("The agent needs signing in.")),
+            _ => None,
+        });
+        let failed = self.state == ThreadState::Failed;
+        match (last, failed) {
+            (Some(Ok(text)), false) => crate::notify::excerpt(text),
+            (Some(Err(notice)), _) => crate::notify::excerpt(notice),
+            _ if failed => self.problem.as_deref().map_or("Failed".into(), |p| crate::notify::excerpt(p)),
+            _ => "Finished".into(),
+        }
+    }
     /// Close the running turn with when it ended and how long it took.
     fn stamp_turn(&mut self) {
         self.stamp_turn_at(now_ms());
@@ -1052,6 +1070,18 @@ mod tests {
         t.apply(Event::TurnEnded(Ok(Stop::Cancelled)));
         assert!(!t.awaiting_user());
         assert!(matches!(&t.blocks[0], Block::Ask(a) if matches!(a.outcome, Some(AskOutcome::Dismissed))));
+    }
+
+    #[test]
+    fn an_ending_is_summed_up_by_its_last_reply_or_failure() {
+        let mut t = Thread::new(1, 0);
+        t.state = ThreadState::Running;
+        t.apply(Event::Text("## All done\n\nThe **tests** pass.".into()));
+        t.apply(Event::TurnEnded(Ok(Stop::Finished)));
+        assert_eq!(t.ending_summary(), "All done The tests pass.");
+        t.state = ThreadState::Running;
+        t.apply(Event::TurnEnded(Err(Failure::Other("Network gone".into()))));
+        assert_eq!(t.ending_summary(), "Network gone");
     }
 
     #[test]

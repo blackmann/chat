@@ -324,6 +324,21 @@ impl Workspace {
         }))
     }
 
+    fn set_notifications(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.notifications = (!on).then_some(false);
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    fn notifications_switch(&self, cx: &mut Context<Self>) -> Div {
+        let this = cx.weak_entity();
+        let on = self.settings.notifications != Some(false);
+        row().child(Switch::new("notifications").checked(on).on_click(move |on, _, cx| {
+            let on = *on;
+            let _ = this.update(cx, |s, cx| s.set_notifications(on, cx));
+        }))
+    }
+
     fn set_follow_up_mode(&mut self, mode: FollowUpMode, cx: &mut Context<Self>) {
         self.settings.follow_up_mode = mode;
         let _ = self.settings.save();
@@ -509,6 +524,13 @@ impl Workspace {
                 "Thinking and tool calls",
                 "Summary shows them while the agent works, then folds them into one line at the end of the turn. Edits stay listed either way.",
                 self.activity_picker(cx).into_any_element(),
+            ),
+            row(
+                Chat,
+                "Notifications",
+                "Notify when a thread needs you",
+                "A system notification when a turn finishes or the agent asks a question while its thread isn't on screen or Chat isn't in front. Click one to open the thread.",
+                self.notifications_switch(cx).into_any_element(),
             ),
         ]
     }

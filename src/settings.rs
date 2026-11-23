@@ -94,12 +94,17 @@ pub struct Settings {
     pub activity: ActivityMode,
     /// What orders the thread list.
     pub thread_sort: ThreadSort,
+    /// Whether threads that finish or need an answer out of sight post a
+    /// system notification; unset means they do.
+    pub notifications: Option<bool>,
     /// Columns per tab stop in code views; unset means the default (4).
     pub tab_width: Option<usize>,
     /// Whether code views draw indent guides; unset means they do.
     pub indent_guides: Option<bool>,
     /// The commit box's height, once dragged; unset means it grows with its text.
     pub commit_box_height: Option<f32>,
+    /// Whether an image's change shows before above after rather than beside it.
+    pub image_diff_stacked: bool,
     /// Language servers beside or instead of the defaults, matched by name.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub language_servers: Vec<crate::lsp::ServerSpec>,

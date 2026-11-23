@@ -5,7 +5,9 @@ mod git;
 mod git_watch;
 mod lsp;
 mod menu;
+mod missions;
 mod model;
+mod notify;
 mod pasteboard;
 mod settings;
 mod stats;
@@ -32,6 +34,7 @@ pub fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-1", ShowContext, None),
         KeyBinding::new("cmd-2", ShowChanges, None),
         KeyBinding::new("cmd-3", ShowFiles, None),
+        KeyBinding::new("cmd-4", ShowMissions, None),
         KeyBinding::new("ctrl-`", OpenTerminal, None),
         KeyBinding::new("enter", Submit, Some("Composer > Input")),
         KeyBinding::new(
@@ -111,6 +114,7 @@ fn main() {
                     MenuItem::action("Context", ShowContext),
                     MenuItem::action("Changes", ShowChanges),
                     MenuItem::action("Files", ShowFiles),
+                    MenuItem::action("Missions", ShowMissions),
                     MenuItem::separator(),
                     MenuItem::action("Toggle Threads", ToggleThreads),
                     MenuItem::action("Toggle Side Panel", ToggleSide),
