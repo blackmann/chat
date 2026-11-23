@@ -10,7 +10,6 @@ mod chrome;
 mod md;
 mod media;
 mod mentions;
-mod missions;
 mod panes;
 mod retro_mac;
 mod preferences;
@@ -63,7 +62,6 @@ actions!(
         ShowContext,
         ShowChanges,
         ShowFiles,
-        ShowMissions,
         OpenTerminal,
         OpenPreferences,
         AddToChat,
@@ -122,17 +120,14 @@ pub enum Side {
     Context,
     Changes,
     Files,
-    /// Challenges for the whole app, not the project showing.
-    Missions,
 }
 impl Side {
-    pub const ALL: [Side; 4] = [Side::Context, Side::Changes, Side::Files, Side::Missions];
+    pub const ALL: [Side; 3] = [Side::Context, Side::Changes, Side::Files];
     pub fn title(self) -> &'static str {
         match self {
             Side::Context => "Context",
             Side::Changes => "Changes",
             Side::Files => "Files",
-            Side::Missions => "Missions",
         }
     }
 }
@@ -381,12 +376,6 @@ pub struct Workspace {
     limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
     /// Other apps a file can be opened in, found once at startup.
     editors: Rc<crate::editors::Editors>,
-    /// The mission under way and those done; for the app, not a project.
-    missions: crate::missions::Missions,
-    /// Where a mission's answer is typed.
-    mission_input: Entity<InputState>,
-    /// Moves the mission on when its time is up, and redraws its countdown.
-    mission_tick: Option<Task<()>>,
     _quit: Option<Subscription>,
 }
 
@@ -442,7 +431,6 @@ impl Workspace {
             }
         })
         .detach();
-        let mission_input = missions::answer_input(window, cx);
         let settings = Settings::load();
         let commit_message = git_panel::commit_input(settings.commit_box_height.is_some(), window, cx);
         let mut projects = vec![Project::chats()];
@@ -571,9 +559,6 @@ impl Workspace {
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
             editors: Rc::default(),
-            missions: crate::missions::Missions::from_saved(store.as_ref().map(|s| s.load_missions()).unwrap_or_default()),
-            mission_input,
-            mission_tick: None,
             store,
             _quit: None,
         };
@@ -613,7 +598,6 @@ impl Workspace {
         }
         workspace.start_git_watch(window, cx);
         workspace.listen_for_notification_clicks(window, cx);
-        workspace.advance_mission(cx);
         cx.observe_window_activation(window, |s, window, cx| {
             s.window_active = window.is_window_active();
             // Coming back to the window is seeing the thread on show.
@@ -1190,10 +1174,6 @@ impl Workspace {
         if current && self.follow && self.holding_transcript.is_none() {
             self.transcript.scroll_to_bottom();
         }
-        // A mission waiting on turns counts this one.
-        if ended {
-            self.mission_turn_ended(cx);
-        }
         self.save_soon(cx);
         cx.notify();
     }
@@ -1662,8 +1642,6 @@ impl Workspace {
         // Picking the page that's already showing folds the panel away.
         self.side_open = !(self.side_open && self.side == side);
         self.side = side;
-        // A mission's countdown ticks faster while its page shows.
-        self.advance_mission(cx);
         cx.notify();
     }
     fn toggle_folder(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -2024,7 +2002,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|s, _: &ShowContext, _, cx| s.show_side(Side::Context, cx)))
             .on_action(cx.listener(|s, _: &ShowChanges, _, cx| s.show_side(Side::Changes, cx)))
             .on_action(cx.listener(|s, _: &ShowFiles, _, cx| s.show_side(Side::Files, cx)))
-            .on_action(cx.listener(|s, _: &ShowMissions, _, cx| s.show_side(Side::Missions, cx)))
             .on_action(cx.listener(|s, _: &OpenTerminal, window, cx| s.open_terminal(window, cx)))
             .on_action(cx.listener(Self::open_prefs))
             .on_action(cx.listener(|s, _: &GoToDefinition, window, cx| s.go_to_definition(window, cx)))

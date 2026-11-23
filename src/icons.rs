@@ -45,8 +45,6 @@ pub enum Glyph {
     Package,
     /// Language servers.
     Zap,
-    /// Missions.
-    Target,
     Columns,
     Rows,
     Claude,
@@ -57,7 +55,7 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 42] = [
+    pub const ALL: [Glyph; 41] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -95,7 +93,6 @@ impl Glyph {
         Self::Database,
         Self::Package,
         Self::Zap,
-        Self::Target,
         Self::Columns,
         Self::Rows,
         Self::Claude,
@@ -140,7 +137,6 @@ impl Glyph {
             Self::Database => "database.svg",
             Self::Package => "package.svg",
             Self::Zap => "zap.svg",
-            Self::Target => "target.svg",
             Self::Columns => "columns-2.svg",
             Self::Rows => "rows-2.svg",
             Self::Claude => "claude.svg",
@@ -228,7 +224,6 @@ fn svg(file: &str) -> Option<&'static str> {
         "file-type.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 13v-1h6v1"/><path d="M12 12v6"/><path d="M11 18h2"/>"#,
         "file-key.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="16" r="2"/><path d="m16 10-4.5 4.5"/><path d="m15 11 1 1"/>"#,
         "database.svg" => r#"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>"#,
-        "target.svg" => r#"<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>"#,
         "columns-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>"#,
         "rows-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>"#,
         "zap.svg" => {

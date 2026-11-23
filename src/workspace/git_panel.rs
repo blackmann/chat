@@ -34,7 +34,7 @@ impl Render for CommitEdge {
 }
 
 /// A raised, bordered button with an optional icon, as in a native toolbar.
-pub(super) fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
+fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
     row()
         .id(id)
         .h(px(24.))
