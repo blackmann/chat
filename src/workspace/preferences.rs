@@ -339,6 +339,23 @@ impl Workspace {
         }))
     }
 
+    pub(super) fn set_missions(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.missions = (!on).then_some(false);
+        let _ = self.settings.save();
+        if !on {
+            self.close_mission(cx);
+        }
+        cx.notify();
+    }
+
+    fn missions_switch(&self, cx: &mut Context<Self>) -> Div {
+        let this = cx.weak_entity();
+        row().child(Switch::new("missions").checked(self.missions_on()).on_click(move |on, _, cx| {
+            let on = *on;
+            let _ = this.update(cx, |s, cx| s.set_missions(on, cx));
+        }))
+    }
+
     fn set_follow_up_mode(&mut self, mode: FollowUpMode, cx: &mut Context<Self>) {
         self.settings.follow_up_mode = mode;
         let _ = self.settings.save();
@@ -531,6 +548,13 @@ impl Workspace {
                 "Notify when a thread needs you",
                 "A system notification when a turn finishes or the agent asks a question while its thread isn't on screen or Chat isn't in front. Click one to open the thread.",
                 self.notifications_switch(cx).into_any_element(),
+            ),
+            row(
+                Chat,
+                "Missions",
+                "Missions",
+                "Tiny memory games that arrive in the status bar's mail icon now and then while agents work, such as remembering a PIN until a few turns later.",
+                self.missions_switch(cx).into_any_element(),
             ),
         ]
     }

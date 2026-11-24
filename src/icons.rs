@@ -36,6 +36,7 @@ pub enum Glyph {
     FileSliders,
     FileLock,
     FileArchive,
+    Archive,
     FileAudio,
     FileVideo,
     FileSpreadsheet,
@@ -45,6 +46,10 @@ pub enum Glyph {
     Package,
     /// Language servers.
     Zap,
+    /// Missions, in the status bar.
+    Mail,
+    /// A mission streak.
+    Flame,
     Columns,
     Rows,
     Claude,
@@ -55,7 +60,7 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 41] = [
+    pub const ALL: [Glyph; 44] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -85,6 +90,7 @@ impl Glyph {
         Self::FileSliders,
         Self::FileLock,
         Self::FileArchive,
+        Self::Archive,
         Self::FileAudio,
         Self::FileVideo,
         Self::FileSpreadsheet,
@@ -93,6 +99,8 @@ impl Glyph {
         Self::Database,
         Self::Package,
         Self::Zap,
+        Self::Mail,
+        Self::Flame,
         Self::Columns,
         Self::Rows,
         Self::Claude,
@@ -129,6 +137,7 @@ impl Glyph {
             Self::FileSliders => "file-sliders.svg",
             Self::FileLock => "file-lock.svg",
             Self::FileArchive => "file-archive.svg",
+            Self::Archive => "archive.svg",
             Self::FileAudio => "file-audio.svg",
             Self::FileVideo => "file-video.svg",
             Self::FileSpreadsheet => "file-spreadsheet.svg",
@@ -137,6 +146,8 @@ impl Glyph {
             Self::Database => "database.svg",
             Self::Package => "package.svg",
             Self::Zap => "zap.svg",
+            Self::Mail => "mail.svg",
+            Self::Flame => "flame.svg",
             Self::Columns => "columns-2.svg",
             Self::Rows => "rows-2.svg",
             Self::Claude => "claude.svg",
@@ -217,6 +228,7 @@ fn svg(file: &str) -> Option<&'static str> {
         "file-terminal.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="m8 16 2-2-2-2"/><path d="M12 18h4"/>"#,
         "file-sliders.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M8 12h8"/><path d="M10 11v2"/><path d="M8 17h8"/><path d="M14 16v2"/>"#,
         "file-lock.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><rect width="8" height="5" x="8" y="13" rx="1"/><path d="M10 13v-1.5a2 2 0 0 1 4 0V13"/>"#,
+        "archive.svg" => r#"<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>"#,
         "file-archive.svg" => r#"<path d="M10 12v-1"/><path d="M10 18v-2"/><path d="M10 7V6"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M15.5 22H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v16a2 2 0 0 0 .274 1.01"/><circle cx="10" cy="20" r="2"/>"#,
         "file-audio.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="17" r="2"/><path d="M12 17v-6l3 1"/>"#,
         "file-video.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="m10 11 5 3-5 3z"/>"#,
@@ -224,6 +236,8 @@ fn svg(file: &str) -> Option<&'static str> {
         "file-type.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M9 13v-1h6v1"/><path d="M12 12v6"/><path d="M11 18h2"/>"#,
         "file-key.svg" => r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><circle cx="10" cy="16" r="2"/><path d="m16 10-4.5 4.5"/><path d="m15 11 1 1"/>"#,
         "database.svg" => r#"<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>"#,
+        "mail.svg" => r#"<rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>"#,
+        "flame.svg" => r#"<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>"#,
         "columns-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>"#,
         "rows-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>"#,
         "zap.svg" => {

@@ -5,6 +5,7 @@ mod git;
 mod git_watch;
 mod lsp;
 mod menu;
+mod missions;
 mod model;
 mod notify;
 mod pasteboard;

@@ -1,7 +1,9 @@
-//! A tool the agent can call to say which Git worktree it is working in, for a
-//! project folder. The agent starts this binary again as a stdio MCP server
-//! (`chat --worktree-tool …`); a call is checked against Git and passed to the
-//! running app over a Unix socket, so the Changes page can follow the thread.
+//! Tools the agent can call to tell the app about its thread: which Git
+//! worktree it is working in for a project folder (`set_worktree`), and what
+//! the thread is called (`set_title`). The agent starts this binary again as a
+//! stdio MCP server (`chat --worktree-tool …`); a call is checked and passed to
+//! the running app over a Unix socket, so the Changes page and the thread list
+//! can follow the thread.
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
@@ -14,6 +16,9 @@ use std::{
 /// The flag that starts the binary as the tool server instead of the app.
 pub const FLAG: &str = "--worktree-tool";
 const TOOL: &str = "set_worktree";
+const TITLE_TOOL: &str = "set_title";
+/// Longer titles are cut here; the thread list shows far less anyway.
+const TITLE_LIMIT: usize = 120;
 
 /// A report from a thread's agent: `folder` is the project folder, `worktree`
 /// the checkout it now works in, or `None` for the folder itself.
@@ -22,6 +27,13 @@ pub struct Report {
     pub thread: usize,
     pub folder: PathBuf,
     pub worktree: Option<PathBuf>,
+}
+
+/// What an agent's tool call tells the app.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Message {
+    Worktree(Report),
+    Title { thread: usize, title: String },
 }
 
 static SOCKET: OnceLock<PathBuf> = OnceLock::new();
@@ -33,7 +45,7 @@ pub fn socket() -> Option<&'static Path> {
 
 /// Listen for reports; each arrives on `send`. Failing to listen leaves the
 /// tool out of new sessions and nothing else.
-pub fn listen(send: impl Fn(Report) + Send + 'static) -> std::io::Result<()> {
+pub fn listen(send: impl Fn(Message) + Send + 'static) -> std::io::Result<()> {
     let path = std::env::temp_dir().join(format!("chat-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -45,9 +57,9 @@ pub fn listen(send: impl Fn(Report) + Send + 'static) -> std::io::Result<()> {
             if reader.read_line(&mut line).is_err() {
                 continue;
             }
-            let reply = match serde_json::from_str::<Report>(&line) {
-                Ok(report) => {
-                    send(report);
+            let reply = match serde_json::from_str::<Message>(&line) {
+                Ok(message) => {
+                    send(message);
                     "ok\n"
                 }
                 Err(_) => "bad report\n",
@@ -110,14 +122,42 @@ fn resolve(folders: &[PathBuf], folder: Option<&str>, worktree: &str) -> Result<
     Ok(Report { thread: 0, folder, worktree: (top != own).then_some(top) })
 }
 
-fn send(socket: &Path, report: &Report) -> Result<(), String> {
+fn send(socket: &Path, message: &Message) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| format!("The app isn't listening: {e}"))?;
-    let mut line = serde_json::to_string(report).map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_string(message).map_err(|e| e.to_string())?;
     line.push('\n');
     stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     let mut reply = String::new();
     BufReader::new(&stream).read_line(&mut reply).map_err(|e| e.to_string())?;
     if reply.trim() == "ok" { Ok(()) } else { Err(reply.trim().to_owned()) }
+}
+
+/// A title as the agent gave it, on one line and not too long.
+fn clean_title(title: &str) -> Result<String, String> {
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err("`title` must not be empty.".into());
+    }
+    Ok(match title.char_indices().nth(TITLE_LIMIT) {
+        Some((at, _)) => format!("{}…", title[..at].trim_end()),
+        None => title,
+    })
+}
+
+fn describe_title() -> Value {
+    json!({
+        "name": TITLE_TOOL,
+        "description": "Rename this chat thread in the user's app. The title is what the user sees in their thread \
+            list, so keep it short and specific. Call this when the user asks you to name or rename the thread, or \
+            once the thread's subject is clear (for example an issue key and summary).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "The new title, on one line."}
+            },
+            "required": ["title"]
+        }
+    })
 }
 
 fn describe() -> Value {
@@ -149,29 +189,49 @@ fn handle(message: &Value, socket: &Path, thread: usize, folders: &[PathBuf]) ->
             "serverInfo": {"name": "chat", "version": env!("CARGO_PKG_VERSION")},
         }),
         "ping" => json!({}),
-        "tools/list" => json!({"tools": [describe()]}),
+        "tools/list" => {
+            let mut tools = vec![describe_title()];
+            if !folders.is_empty() {
+                tools.push(describe());
+            }
+            json!({"tools": tools})
+        }
+        "tools/call" if message["params"]["name"] == TITLE_TOOL => {
+            let outcome = match message["params"]["arguments"]["title"].as_str() {
+                None => Err("`title` is required.".to_owned()),
+                Some(title) => clean_title(title).and_then(|title| {
+                    send(socket, &Message::Title { thread, title: title.clone() })?;
+                    Ok(format!("Renamed this thread to {title:?}."))
+                }),
+            };
+            tool_result(outcome)
+        }
         "tools/call" if message["params"]["name"] == TOOL => {
             let args = &message["params"]["arguments"];
             let outcome = match args["worktree"].as_str() {
                 None => Err("`worktree` is required.".to_owned()),
                 Some(worktree) => resolve(folders, args["folder"].as_str(), worktree).and_then(|mut report| {
                     report.thread = thread;
-                    send(socket, &report)?;
+                    send(socket, &Message::Worktree(report.clone()))?;
                     Ok(match &report.worktree {
                         Some(w) => format!("Recorded: {} is being worked on in {}.", report.folder.display(), w.display()),
                         None => format!("Recorded: back to working in {} itself.", report.folder.display()),
                     })
                 }),
             };
-            let (text, error) = match outcome {
-                Ok(text) => (text, false),
-                Err(text) => (text, true),
-            };
-            json!({"content": [{"type": "text", "text": text}], "isError": error})
+            tool_result(outcome)
         }
         _ => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("Unknown method {method}")}})),
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+fn tool_result(outcome: Result<String, String>) -> Value {
+    let (text, error) = match outcome {
+        Ok(text) => (text, false),
+        Err(text) => (text, true),
+    };
+    json!({"content": [{"type": "text", "text": text}], "isError": error})
 }
 
 /// Run as the tool server: `FLAG socket thread folder…`, MCP over stdio.
@@ -233,13 +293,26 @@ mod tests {
 
     #[test]
     fn speaks_enough_mcp() {
-        let folders = vec![];
+        let folders = vec![PathBuf::from("/nope")];
         let init = handle(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}), Path::new("/nope"), 1, &folders).unwrap();
         assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
         assert!(handle(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}), Path::new("/nope"), 1, &folders).is_none());
         let list = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), Path::new("/nope"), 1, &folders).unwrap();
-        assert_eq!(list["result"]["tools"][0]["name"], TOOL);
+        let names: Vec<_> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].clone()).collect();
+        assert_eq!(names, [TITLE_TOOL, TOOL]);
+        let bare = handle(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}), Path::new("/nope"), 1, &[]).unwrap();
+        assert_eq!(bare["result"]["tools"].as_array().unwrap().len(), 1);
         let call = handle(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": TOOL, "arguments": {}}}), Path::new("/nope"), 1, &folders).unwrap();
         assert_eq!(call["result"]["isError"], true);
+        let call = handle(&json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": TITLE_TOOL, "arguments": {"title": "  "}}}), Path::new("/nope"), 1, &folders).unwrap();
+        assert_eq!(call["result"]["isError"], true);
+    }
+
+    #[test]
+    fn cleans_titles() {
+        assert_eq!(clean_title("  ENG-1166:\n Highlight  memo ").unwrap(), "ENG-1166: Highlight memo");
+        assert!(clean_title(" \n ").is_err());
+        let long = clean_title(&"a".repeat(200)).unwrap();
+        assert_eq!(long.chars().count(), TITLE_LIMIT + 1);
     }
 }

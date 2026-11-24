@@ -26,7 +26,12 @@ fn link_path(url: &str, root: Option<&Path>) -> Option<(PathBuf, Option<(usize, 
         None => (raw, None),
     };
     let raw = raw.split('?').next().unwrap_or(raw);
-    let raw = percent_decode(raw);
+    let mut raw = percent_decode(raw);
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        raw = format!("{home}/{rest}");
+    }
     if raw.is_empty() || raw.contains("://") {
         return None;
     }
@@ -1250,15 +1255,17 @@ impl Workspace {
 
     /// Clicking a link in the transcript: web links go to the browser, paths to
     /// the project's files (agents link them as `src/x.rs`, `src/x.rs:12` or
-    /// `file:///…`), opened in a tab beside the chat.
+    /// `file:///…`, or just write them), opened in a tab beside the chat.
+    /// ⌘-click shows the path in Finder instead.
     fn link_opener(&self, cx: &mut Context<Self>) -> md::OnLink {
         let root = self.current_project().path.clone();
         let this = cx.entity().downgrade();
-        std::rc::Rc::new(move |url: &str, _window: &mut Window, cx: &mut App| {
+        std::rc::Rc::new(move |url: &str, window: &mut Window, cx: &mut App| {
             if md::is_web(url) {
                 return cx.open_url(url);
             }
             match link_path(url, root.as_deref()) {
+                Some((path, _)) if window.modifiers().platform && path.exists() => cx.reveal_path(&path),
                 Some((path, lines)) if path.is_file() => {
                     this.update(cx, |s, cx| s.open_at(path, lines, cx)).ok();
                 }

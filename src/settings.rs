@@ -103,6 +103,8 @@ pub struct Settings {
     pub indent_guides: Option<bool>,
     /// The commit box's height, once dragged; unset means it grows with its text.
     pub commit_box_height: Option<f32>,
+    /// Whether missions (tiny games from the status bar) are offered; unset means they are.
+    pub missions: Option<bool>,
     /// Whether an image's change shows before above after rather than beside it.
     pub image_diff_stacked: bool,
     /// Language servers beside or instead of the defaults, matched by name.

@@ -10,6 +10,7 @@ mod chrome;
 mod md;
 mod media;
 mod mentions;
+mod missions;
 mod panes;
 mod retro_mac;
 mod preferences;
@@ -249,6 +250,9 @@ pub struct Workspace {
     command_index: usize,
     command_scroll: ScrollHandle,
     thread_scroll: ScrollHandle,
+    /// The right panel's page (context or files) and the Git changes list.
+    side_scroll: ScrollHandle,
+    git_changes_scroll: ScrollHandle,
     commands_dismissed: bool,
     /// Empty the composer on the next render, outside the action that sent it.
     clear_composer: bool,
@@ -313,6 +317,8 @@ pub struct Workspace {
     restore_commit_message: Option<String>,
     /// Which Git operation is running, so its button can say so.
     git_running: Option<GitRunning>,
+    /// The stash a first click on Drop armed; a second click drops it.
+    stash_drop_armed: Option<usize>,
     /// The repository the Changes page shows, when a project spans several folders.
     git_repo: Option<PathBuf>,
     /// Text selected in the transcript.
@@ -376,6 +382,10 @@ pub struct Workspace {
     limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
     /// Other apps a file can be opened in, found once at startup.
     editors: Rc<crate::editors::Editors>,
+    /// The mission in the mailbox and the streak; for the app, not a project.
+    missions: crate::missions::Missions,
+    /// What the mission card shows beyond the mission itself.
+    mission_ui: missions::MissionUi,
     _quit: Option<Subscription>,
 }
 
@@ -385,6 +395,7 @@ enum GitRunning {
     Commit,
     Push,
     Undo,
+    Stash,
     Other,
 }
 
@@ -485,6 +496,8 @@ impl Workspace {
             tab_in_view: std::cell::Cell::new(None),
             command_scroll: ScrollHandle::new(),
             thread_scroll: ScrollHandle::new(),
+            side_scroll: ScrollHandle::new(),
+            git_changes_scroll: ScrollHandle::new(),
             commands_dismissed: false,
             clear_composer: false,
             transcript: ScrollHandle::new(),
@@ -523,6 +536,7 @@ impl Workspace {
             clear_commit_message: None,
             restore_commit_message: None,
             git_running: None,
+            stash_drop_armed: None,
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
@@ -559,6 +573,8 @@ impl Workspace {
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
             editors: Rc::default(),
+            missions: crate::missions::Missions::from_saved(store.as_ref().map(|s| s.load_missions()).unwrap_or_default()),
+            mission_ui: missions::MissionUi::new(cx),
             store,
             _quit: None,
         };
@@ -957,7 +973,7 @@ impl Workspace {
         let id = t.id;
         // Capture the latest choices before clearing the controls for reconnect.
         t.picks = t.current_picks();
-        let tool = crate::worktree_tool::socket().filter(|_| !roots.is_empty()).map(|s| crate::worktree_tool::args(s, t.id, &roots));
+        let tool = crate::worktree_tool::socket().map(|s| crate::worktree_tool::args(s, t.id, &roots));
         let (commands, mut events, run) = agent::connect(spec, cwd, extra, t.session_id.clone(), t.picks.clone(), tool);
         let driver = cx.background_executor().spawn(run);
         let listener = cx.spawn(async move |this, cx| {
@@ -979,7 +995,7 @@ impl Workspace {
         self.live.push(id);
         self.stop_idle_agents();
     }
-    /// Take reports from agents' worktree tool as they come.
+    /// Take reports from agents' tools as they come.
     fn listen_for_worktrees(&mut self, cx: &mut Context<Self>) {
         let (tx, mut reports) = futures::channel::mpsc::unbounded();
         if crate::worktree_tool::listen(move |report| {
@@ -991,7 +1007,11 @@ impl Workspace {
         }
         cx.spawn(async move |this, cx| {
             while let Some(report) = reports.next().await {
-                if this.update(cx, |s, cx| s.on_worktree(report, cx)).is_err() {
+                let handled = this.update(cx, |s, cx| match report {
+                    crate::worktree_tool::Message::Worktree(report) => s.on_worktree(report, cx),
+                    crate::worktree_tool::Message::Title { thread, title } => s.on_title(thread, title, cx),
+                });
+                if handled.is_err() {
                     break;
                 }
             }
@@ -1033,6 +1053,15 @@ impl Workspace {
         self.git_picks.remove(&(Some(report.thread), report.folder));
         self.save_soon(cx);
         self.refresh_git(cx);
+        cx.notify();
+    }
+    /// A thread's agent renamed it.
+    fn on_title(&mut self, id: usize, title: String, cx: &mut Context<Self>) {
+        let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == id) else {
+            return;
+        };
+        thread.title = title.into();
+        self.save_soon(cx);
         cx.notify();
     }
     /// Keep at most `LIVE_SESSIONS` agents running, stopping the ones shown
@@ -1161,6 +1190,10 @@ impl Workspace {
         if let Some((title, body)) = note {
             let project = self.projects.iter().find(|p| p.threads.iter().any(|t| t.id == id));
             crate::notify::post(id, &title, project.map_or("", |p| p.name.as_str()), &body);
+        }
+        // A mission waiting on turns counts this one; an empty mailbox may get one.
+        if ended {
+            self.mission_turn_ended(cx);
         }
         let Some(thread) = self.projects.iter_mut().flat_map(|p| &mut p.threads).find(|t| t.id == id) else {
             return;
@@ -2137,6 +2170,7 @@ impl Render for Workspace {
                 )
             })
             .when_some(self.lsp_overlay(cx), |root, overlay| root.child(overlay))
+            .when_some(self.mission_overlay(cx), |root, card| root.child(card))
             .when_some(self.popup.clone(), |root, menu| {
                 root.child(
                     deferred(

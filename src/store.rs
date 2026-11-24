@@ -10,6 +10,7 @@
 //! searching threads by what's in them.
 use crate::{
     agent::{LimitStatus, RateLimit, Step},
+    missions::{self, Mission},
     model::{Block, Project, Thread, ThreadState, TurnRecord},
     settings::{self, AgentSpec},
 };
@@ -311,6 +312,56 @@ impl Store {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Recent missions, newest first: enough for the one under way and the streak.
+    pub fn load_missions(&self) -> Vec<Mission> {
+        read_missions(&self.read).unwrap_or_else(|e| {
+            eprintln!("chat: couldn't read missions: {e}");
+            Vec::new()
+        })
+    }
+}
+
+/// Missions read back, at most; a streak longer than this is counted as this.
+const MISSIONS_READ: i64 = 500;
+
+fn read_missions(conn: &Connection) -> rusqlite::Result<Vec<Mission>> {
+    let mut query = conn.prepare(
+        "SELECT id, pin, phase, wait_turns, turns_left, tries, guess, solved, created_at, ended_at
+         FROM missions WHERE kind = 'pin' ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = query.query_map([MISSIONS_READ], |r| {
+        Ok(missions::Saved {
+            id: r.get(0)?,
+            pin: r.get(1)?,
+            phase: r.get(2)?,
+            wait_turns: r.get(3)?,
+            turns_left: r.get(4)?,
+            tries: r.get(5)?,
+            guess: r.get(6)?,
+            solved: r.get(7)?,
+            created_at: r.get(8)?,
+            ended_at: r.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        // Rows this build can't make sense of are left out.
+        out.extend(Mission::from_saved(row?));
+    }
+    Ok(out)
+}
+
+/// Write `mission` as it stands, over what was there.
+pub fn write_mission(conn: &Mutex<Connection>, mission: &Mission) -> rusqlite::Result<()> {
+    let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
+    let m = mission.row();
+    conn.execute(
+        "INSERT OR REPLACE INTO missions (id, kind, pin, phase, wait_turns, turns_left, tries, guess, solved, created_at, ended_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![m.id, m.kind, m.pin, m.phase, m.wait_turns, m.turns_left, m.tries, m.guess, m.solved, m.created_at, m.ended_at],
+    )?;
+    Ok(())
 }
 
 /// The blocks of `thread` that differ from what was last saved, and how many
@@ -783,6 +834,24 @@ mod tests {
     fn save(store: &mut Store, projects: &mut [Project], agents: &[AgentSpec]) {
         let plan = store.plan(projects, agents);
         write(&store.writer(), &plan).unwrap();
+    }
+
+    #[test]
+    fn missions_survive_a_round_trip() {
+        let dir = temp("missions");
+        let store = Store::open_in(&dir).unwrap();
+        let mut done = Mission::new(1, 9, 10);
+        done.phase = missions::Phase::Recall { tries: 0 };
+        let pin = done.pin.clone();
+        done.submit(&pin, 20);
+        let mut open = Mission::new(2, 3, 30);
+        open.phase = missions::Phase::Recall { tries: 1 };
+        write_mission(&store.writer(), &done).unwrap();
+        write_mission(&store.writer(), &open).unwrap();
+        // Writing again replaces it.
+        write_mission(&store.writer(), &open).unwrap();
+        let again = Store::open_in(&dir).unwrap();
+        assert_eq!(again.load_missions(), vec![open, done]);
     }
 
     #[test]

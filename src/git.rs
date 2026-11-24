@@ -77,6 +77,40 @@ pub struct Snapshot {
     pub last_commit: Option<LastCommit>,
     /// Every checkout of the repository, the main one first.
     pub worktrees: Vec<Worktree>,
+    /// Changes put aside with `git stash`, newest first.
+    pub stashes: Vec<Stash>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stash {
+    /// Its place in the stash list: `stash@{index}`.
+    pub index: usize,
+    /// What it was saved as: the message given, or the commit it was made on.
+    pub message: String,
+    /// The branch it was made on, when Git recorded one.
+    pub branch: Option<String>,
+    /// How long ago, as Git says it: "2 hours ago".
+    pub when: String,
+}
+/// `stash list` records: ref, reflog subject and age, separated by unit separators.
+fn parse_stashes(bytes: &[u8]) -> Vec<Stash> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let (spec, subject, when) = (parts.next()?, parts.next()?, parts.next().unwrap_or(""));
+            let index = spec.strip_prefix("stash@{")?.strip_suffix('}')?.parse().ok()?;
+            // "WIP on main: 1a2b3c4 subject" for a plain stash, "On main: message" for a named one.
+            let (head, rest) = subject.split_once(": ").unwrap_or(("", subject));
+            let branch = head.strip_prefix("WIP on ").or_else(|| head.strip_prefix("On ")).map(str::to_owned);
+            let message = if head.starts_with("WIP on ") {
+                // Drop the abbreviated hash in front of the commit's subject.
+                rest.split_once(' ').map_or(rest, |(_, s)| s).to_owned()
+            } else {
+                rest.to_owned()
+            };
+            Some(Stash { index, message, branch, when: when.to_owned() })
+        })
+        .collect()
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worktree {
@@ -144,12 +178,26 @@ pub enum Operation {
     Push,
     /// Undo the last commit, keeping its changes staged.
     UndoCommit,
+    /// Put changes aside: everything, untracked files included, or only what is staged.
+    Stash { staged_only: bool },
+    /// Bring a stash's changes back and remove it from the list.
+    StashPop(usize),
+    /// Bring a stash's changes back and keep it.
+    StashApply(usize),
+    /// Throw a stash away.
+    StashDrop(usize),
 }
 
 fn command(root: &Path) -> Command {
+    let mut cmd = stash_command(root);
+    cmd.arg("--literal-pathspecs");
+    cmd
+}
+/// `git stash` takes no paths here, and with `--literal-pathspecs` it leaves
+/// untracked files behind, so it runs without.
+fn stash_command(root: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("--literal-pathspecs")
-        .arg("-C")
+    cmd.arg("-C")
         .arg(root)
         .env("GIT_OPTIONAL_LOCKS", "0");
     // Hooks (husky's pre-commit, pre-push) run tools like pnpm that live on the
@@ -283,7 +331,8 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
         Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty() })
     });
     let worktrees = run(&root, &["worktree", "list", "--porcelain"]).map(|out| parse_worktrees(&out)).unwrap_or_default();
-    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit, worktrees })
+    let stashes = run(&root, &["stash", "list", "--format=%gd%x1f%gs%x1f%cr"]).map(|out| parse_stashes(&out)).unwrap_or_default();
+    Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit, worktrees, stashes })
 }
 /// `--numstat -z` records: counts and a path, or counts, nothing, and two paths for a rename.
 fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
@@ -572,6 +621,20 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
                 let remote = if remotes.lines().any(|r| r == "origin") { "origin" } else { remotes.lines().next().ok_or("No remote to push to.")? };
                 checked(push().args(["-u", remote, "HEAD"]).output())?;
             }
+        }
+        Operation::Stash { staged_only } => {
+            let mode = if staged_only { "--staged" } else { "--include-untracked" };
+            checked(stash_command(root).args(["stash", "push", "-q", mode]).output())?;
+        }
+        // `--index` puts back what was staged as staged, as it was when stashed.
+        Operation::StashPop(index) => {
+            checked(stash_command(root).args(["stash", "pop", "-q", "--index"]).arg(format!("stash@{{{index}}}")).output())?;
+        }
+        Operation::StashApply(index) => {
+            checked(stash_command(root).args(["stash", "apply", "-q", "--index"]).arg(format!("stash@{{{index}}}")).output())?;
+        }
+        Operation::StashDrop(index) => {
+            checked(stash_command(root).args(["stash", "drop", "-q"]).arg(format!("stash@{{{index}}}")).output())?;
         }
         Operation::UndoCommit => {
             if run(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
@@ -956,5 +1019,58 @@ mod tests {
     fn status_reads_upstream_and_ahead() {
         let status = parse_status(b"# branch.oid abc\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +2 -0\0");
         assert_eq!((status.upstream.as_deref(), status.ahead), (Some("origin/main"), 2));
+    }
+    #[test]
+    fn parses_stash_list() {
+        let out = b"stash@{0}\x1fOn main: half done\x1f2 minutes ago\nstash@{1}\x1fWIP on feature/x: 1a2b3c4 Fix it\x1f3 days ago\n";
+        let stashes = parse_stashes(out);
+        assert_eq!(stashes.len(), 2);
+        assert_eq!((stashes[0].index, stashes[0].message.as_str(), stashes[0].branch.as_deref()), (0, "half done", Some("main")));
+        assert_eq!((stashes[1].index, stashes[1].message.as_str(), stashes[1].branch.as_deref()), (1, "Fix it", Some("feature/x")));
+        assert_eq!(stashes[1].when, "3 days ago");
+    }
+    #[test]
+    fn stash_pop_apply_and_drop() {
+        let r = Repo::new();
+        r.write("a", "base\n");
+        r.stage("a");
+        r.commit();
+        r.write("a", "staged\n");
+        r.stage("a");
+        r.write("new", "untracked\n");
+        operate(&r.0, Operation::Stash { staged_only: false }).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.entries.is_empty(), "everything, untracked files too, is put aside");
+        assert_eq!(s.stashes.len(), 1);
+        operate(&r.0, Operation::StashApply(0)).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.stashes.len(), 1, "apply keeps the stash");
+        assert!(s.entries.iter().any(|e| e.path == Path::new("a") && e.staged()), "staged changes come back staged");
+        assert!(s.entries.iter().any(|e| e.untracked()));
+        // A different change, or Git, within the same second, makes the same stash commit and adds no entry.
+        r.write("a", "second\n");
+        operate(&r.0, Operation::Stash { staged_only: false }).unwrap();
+        assert_eq!(snapshot(&r.0).unwrap().stashes.len(), 2);
+        operate(&r.0, Operation::StashDrop(1)).unwrap();
+        operate(&r.0, Operation::StashPop(0)).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.stashes.is_empty() && !s.entries.is_empty());
+    }
+    #[test]
+    fn stash_staged_only_leaves_the_rest() {
+        let r = Repo::new();
+        r.write("a", "base\n");
+        r.write("b", "base\n");
+        r.stage("a");
+        r.stage("b");
+        r.commit();
+        r.write("a", "staged\n");
+        r.stage("a");
+        r.write("b", "unstaged\n");
+        operate(&r.0, Operation::Stash { staged_only: true }).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].path, Path::new("b"));
+        assert_eq!(std::fs::read_to_string(r.0.join("a")).unwrap(), "base\n");
     }
 }

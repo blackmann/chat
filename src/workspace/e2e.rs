@@ -1289,3 +1289,87 @@ fn counts_turns_on_the_dashboard(cx: &mut TestAppContext) {
     assert!(d.read(|s| !s.dashboard_open()), "Escape closes it");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// A PIN mission from the status bar: offered, accepted, hidden, asked for
+/// after turns end, missed twice, and put away by clicking elsewhere.
+#[gpui::test]
+fn plays_a_pin_mission_from_the_status_bar(cx: &mut TestAppContext) {
+    use crate::missions::Phase;
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let mail = d.cx.debug_bounds("mission-button").expect("the mail icon is in the status bar");
+    d.cx.simulate_click(mail.center(), Modifiers::none());
+    d.settle();
+    assert!(d.read(|s| !s.mission_ui.open), "with no mission it does nothing");
+
+    d.act(|s, cx| {
+        s.missions.offer(crate::model::now_ms());
+        cx.notify();
+    });
+    d.settle();
+    d.cx.simulate_click(mail.center(), Modifiers::none());
+    d.settle();
+    assert!(d.cx.debug_bounds("mission-card").is_some(), "the card opens above the icon");
+    let accept = d.cx.debug_bounds("mission-accept").expect("an offer to accept");
+    d.cx.simulate_click(accept.center(), Modifiers::none());
+    d.settle();
+    let (pin, waits) = d.read(|s| {
+        let m = s.missions.active.as_ref().unwrap();
+        assert!(matches!(m.phase, Phase::Showing { .. }));
+        (m.pin.clone(), m.wait_turns)
+    });
+
+    // The test's clock moves timers only when told to; the mission reads the real one.
+    d.wait("the PIN to hide", 30, |d| {
+        d.cx.executor().advance_clock(Duration::from_millis(250));
+        d.read(|s| s.missions.active.as_ref().is_some_and(|m| matches!(m.phase, Phase::Waiting { .. })))
+    });
+    assert!(d.read(|s| !s.mission_ui.open), "the card goes with the digits");
+    for _ in 0..waits {
+        d.act(|s, cx| s.mission_turn_ended(cx));
+    }
+    assert!(d.read(|s| matches!(s.missions.active.as_ref().unwrap().phase, Phase::Recall { tries: 0 })));
+
+    // Two wrong answers, typed.
+    d.cx.simulate_click(mail.center(), Modifiers::none());
+    d.settle();
+    let wrong: String = pin.chars().map(|c| if c == '0' { '1' } else { '0' }).collect();
+    let typed = wrong.chars().map(String::from).collect::<Vec<_>>().join(" ");
+    d.keys(&typed);
+    assert!(d.read(|s| matches!(s.missions.active.as_ref().unwrap().phase, Phase::Recall { tries: 1 })));
+    d.wait("the shake", 10, |d| {
+        d.cx.executor().advance_clock(Duration::from_millis(100));
+        d.read(|s| s.mission_ui.entry.is_empty())
+    });
+    d.keys(&typed);
+    assert!(d.read(|s| matches!(s.missions.active.as_ref().unwrap().phase, Phase::Done { solved: false })));
+    assert_eq!(d.read(|s| s.missions.streak), 0);
+    assert!(d.cx.debug_bounds("mission-card").is_some(), "the PIN is shown, not put away");
+
+    // A click elsewhere puts it away and empties the mailbox.
+    let card = d.cx.debug_bounds("mission-card").unwrap();
+    d.cx.simulate_click(card.origin - point(px(0.), px(40.)) + point(px(300.), px(0.)), Modifiers::none());
+    d.settle();
+    assert!(d.read(|s| !s.mission_ui.open && s.missions.active.is_none()));
+
+    // Saved off the main thread: give it a moment, then read it back.
+    let db = d.read(|s| s.store.as_ref().unwrap().path().to_path_buf());
+    let start = Instant::now();
+    let saved = loop {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let row: Option<(String, Option<bool>)> = conn.query_row("SELECT phase, solved FROM missions", [], |r| Ok((r.get(0)?, r.get(1)?))).ok();
+        if row.as_ref().is_some_and(|r| r.0 == "done") || start.elapsed() > Duration::from_secs(5) {
+            break row;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(saved, Some(("done".into(), Some(false))));
+
+    // Turned off, the icon goes.
+    d.act(|s, cx| s.set_missions(false, cx));
+    let ws = d.ws.clone();
+    assert!(d.cx.update(|_, cx| ws.update(cx, |s, cx| s.mission_button(cx).is_none())));
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

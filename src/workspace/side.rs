@@ -2,7 +2,7 @@
 use super::ui::*;
 use super::*;
 use crate::{agent::Step, icons::Glyph, model::Touch};
-use gpui_component::{Icon, IconName, Sizable, tooltip::Tooltip};
+use gpui_component::{Icon, IconName, Sizable, scroll::ScrollableElement, tooltip::Tooltip};
 
 fn side_glyph(side: Side) -> Icon {
     match side {
@@ -466,7 +466,13 @@ impl Workspace {
                 Side::Changes => self.changes_page(cx),
                 Side::Files => self.files_page(cx),
             };
-            div().id("side-page").flex_1().min_h_0().overflow_y_scroll().child(page).into_any_element()
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(div().id("side-page").size_full().overflow_y_scroll().track_scroll(&self.side_scroll).child(page))
+                .vertical_scrollbar(&self.side_scroll)
+                .into_any_element()
         };
         col()
             .size_full()

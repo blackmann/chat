@@ -1057,6 +1057,7 @@ impl Workspace {
                         cx.notify();
                     })),
             )
+            .when_some(self.mission_button(cx), |s, button| s.child(button))
             .when_some(self.servers_button(cx), |s, button| s.child(button))
             .child(div().flex_1())
             .when(working > 0, |s| {

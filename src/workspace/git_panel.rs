@@ -10,6 +10,7 @@ use crate::{
 use gpui_component::{Selectable, 
     Disableable, IconName, Sizable,
     button::{Button, ButtonVariants},
+    scroll::ScrollableElement,
     input::{Input, InputState},
 };
 
@@ -274,8 +275,10 @@ impl Workspace {
             Operation::Commit(_) => GitRunning::Commit,
             Operation::Push => GitRunning::Push,
             Operation::UndoCommit => GitRunning::Undo,
+            Operation::Stash { .. } | Operation::StashPop(_) | Operation::StashApply(_) | Operation::StashDrop(_) => GitRunning::Stash,
             _ => GitRunning::Other,
         });
+        self.stash_drop_armed = None;
         self.git_revision += 1;
         self.git_errors.remove(&folder);
         cx.notify();
@@ -435,6 +438,142 @@ impl Workspace {
         }
     }
 
+    /// Puts changes aside: all of them, untracked files included, or only what is staged.
+    fn stash_button(&self, colors: Palette, any: bool, staged: bool, cx: &mut Context<Self>) -> Div {
+        let enabled = any && !self.git_busy;
+        let trigger = row()
+            .id("stash-button")
+            .size(px(22.))
+            .flex_shrink_0()
+            .justify_center()
+            .rounded(px(5.))
+            .text_color(rgb(colors.muted))
+            .child(icon(Glyph::Archive).size(px(13.)))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(if enabled { "Stash changes" } else { "Nothing to stash" }).build(window, cx)
+            })
+            .map(|s| if enabled { s.cursor_pointer().hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text))) } else { s.opacity(0.5) });
+        if !enabled {
+            return div().child(trigger);
+        }
+        self.popover_trigger("stash", trigger, Corner::BottomRight, 240., None, move |_, weak, _| {
+            let all = weak.clone();
+            let only = weak.clone();
+            vec![
+                crate::menu::Entry::Label("Stash".into()),
+                crate::menu::Entry::Item(
+                    crate::menu::Item::new("Stash all changes")
+                        .icon(Glyph::Archive)
+                        .description("Untracked files included")
+                        .on_click(move |_, cx| {
+                            let _ = all.update(cx, |s, cx| s.git_operation(Operation::Stash { staged_only: false }, cx));
+                        }),
+                ),
+                crate::menu::Entry::Item(
+                    crate::menu::Item::new("Stash staged changes")
+                        .icon(Glyph::Archive)
+                        .description("Leaves unstaged and untracked files as they are")
+                        .disabled(!staged)
+                        .on_click(move |_, cx| {
+                            let _ = only.update(cx, |s, cx| s.git_operation(Operation::Stash { staged_only: true }, cx));
+                        }),
+                ),
+            ]
+        }, cx)
+    }
+
+    /// Stashed changes, newest first: pop one back (removing it), apply it
+    /// (keeping it), or drop it, which takes a second click.
+    fn stashes_section(&self, colors: Palette, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        if snapshot.stashes.is_empty() {
+            return None;
+        }
+        let busy = self.git_busy;
+        let mut section = col().child(
+            row()
+                .h(px(30.))
+                .px_3()
+                .gap_2()
+                .child(icon(Glyph::Archive).size(px(13.)).text_color(rgb(colors.muted)))
+                .child(div().text_size(px(crate::theme::scaled_ui(12.))).font_weight(FontWeight::MEDIUM).text_color(rgb(colors.muted)).child("Stashes"))
+                .child(count_badge(colors, snapshot.stashes.len()))
+                .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border))),
+        );
+        for stash in &snapshot.stashes {
+            let index = stash.index;
+            let armed = self.stash_drop_armed == Some(index);
+            let group = SharedString::from(format!("stash-{index}"));
+            let tip = SharedString::from(match &stash.branch {
+                Some(branch) => format!("{} · on {branch} · {}", stash.message, stash.when),
+                None => format!("{} · {}", stash.message, stash.when),
+            });
+            let action = |id: &'static str, text: &'static str, tip: &'static str, operation: Operation| {
+                Button::new((id, index))
+                    .ghost()
+                    .xsmall()
+                    .label(text)
+                    .tooltip(tip)
+                    .disabled(busy)
+                    .on_click(cx.listener(move |s, _, _, cx| s.git_operation(operation.clone(), cx)))
+            };
+            section = section.child(
+                row()
+                    .id(("stash", index))
+                    .group(group.clone())
+                    .h(px(28.))
+                    .mx_1()
+                    .pl_2()
+                    .pr_1()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .hover(|s| s.bg(rgb(colors.hover)))
+                    .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                    .child(
+                        line_with_detail(
+                            if stash.message.is_empty() { "Stashed changes".to_string() } else { stash.message.clone() },
+                            stash.branch.clone().map(|b| (SharedString::from(b), Hsla::from(rgb(colors.quiet)))),
+                            18.,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    )
+                    // Its age gives way to the actions on hover.
+                    .child(
+                        label(colors, stash.when.clone())
+                            .flex_shrink_0()
+                            .text_size(px(crate::theme::scaled_ui(11.)))
+                            .when(!armed, |s| s.group_hover(group.clone(), |s| s.opacity(0.)).absolute().right(px(8.))),
+                    )
+                    .child(
+                        row()
+                            .gap(px(2.))
+                            .flex_shrink_0()
+                            .when(!armed, |s| s.opacity(0.).group_hover(group.clone(), |s| s.opacity(1.)))
+                            .child(action("stash-pop", "Pop", "Restore these changes and remove the stash", Operation::StashPop(index)))
+                            .child(action("stash-apply", "Apply", "Restore these changes and keep the stash", Operation::StashApply(index)))
+                            .child(
+                                Button::new(("stash-drop", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .map(|b| if armed { b.label("Drop?").danger() } else { b.icon(IconName::Delete) })
+                                    .tooltip(if armed { "Click again to delete this stash for good" } else { "Delete this stash" })
+                                    .disabled(busy)
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        if s.stash_drop_armed == Some(index) {
+                                            s.git_operation(Operation::StashDrop(index), cx);
+                                        } else {
+                                            s.stash_drop_armed = Some(index);
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                    .relative(),
+            );
+        }
+        Some(section)
+    }
+
     pub(super) fn changes_page(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
         let mut page = col().flex_1().min_h_0();
@@ -584,7 +723,15 @@ impl Workspace {
                 "Git changes appear here as files are edited.",
             ));
         }
-        page = page.child(div().id("git-changes-list").flex_1().min_h_0().overflow_y_scroll().child(list));
+        list = list.children(self.stashes_section(colors, snapshot, cx));
+        page = page.child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(div().id("git-changes-list").size_full().overflow_y_scroll().track_scroll(&self.git_changes_scroll).child(list))
+                .vertical_scrollbar(&self.git_changes_scroll),
+        );
 
         let staged = snapshot.entries.iter().filter(|e| e.staged()).count();
         let message = !self.commit_message.read(cx).value().trim().is_empty();
@@ -760,7 +907,8 @@ impl Workspace {
             .when(!visible.is_empty(), |s| {
                 s.child(label(colors, format!("{} change{}", visible.len(), if visible.len() == 1 { "" } else { "s" })))
                     .child(stat(colors, adds, dels))
-            });
+            })
+            .child(self.stash_button(colors, !visible.is_empty() && !conflicted, staged > 0, cx));
         page.child(summary).child(commit_box).children(footer)
     }
 

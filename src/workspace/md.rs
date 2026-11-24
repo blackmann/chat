@@ -78,6 +78,8 @@ struct Inline {
     chips: Vec<(Range<usize>, SharedString)>,
     /// Local images, drawn below the text: as written, and where they are.
     images: Vec<(String, std::path::PathBuf)>,
+    /// Whether file paths written as plain text become links.
+    autolink: bool,
 }
 
 impl Inline {
@@ -95,15 +97,28 @@ impl Inline {
             }
         }
     }
+    /// `s`, with any file paths in it linked to themselves.
+    fn push_linking_paths(&mut self, s: &str, style: &Style) {
+        if !self.autolink || style.link.is_some() || style.chip {
+            return self.push(s, style);
+        }
+        let mut at = 0;
+        for span in path_spans(s) {
+            self.push(&s[at..span.start], style);
+            self.push(&s[span.clone()], &Style { link: Some(s[span.clone()].to_string()), ..style.clone() });
+            at = span.end;
+        }
+        self.push(&s[at..], style);
+    }
     fn walk(&mut self, nodes: &[Node], style: &Style, breaks: Breaks) {
         for n in nodes {
             match n {
                 Node::Text(t) => match breaks {
-                    Breaks::Soft => self.push(&t.value.replace('\n', " "), style),
-                    Breaks::Hard => self.push(&t.value, style),
+                    Breaks::Soft => self.push_linking_paths(&t.value.replace('\n', " "), style),
+                    Breaks::Hard => self.push_linking_paths(&t.value, style),
                 },
                 Node::Break(_) => self.push("\n", style),
-                Node::InlineCode(c) => self.push(
+                Node::InlineCode(c) => self.push_linking_paths(
                     &c.value,
                     &Style {
                         code: true,
@@ -331,7 +346,7 @@ fn inline(nodes: &[Node], cx: &Ctx) -> AnyElement {
 }
 
 fn inline_styled(nodes: &[Node], style: &Style, cx: &Ctx) -> AnyElement {
-    let mut i = Inline::default();
+    let mut i = Inline { autolink: cx.on_link.is_some(), ..Inline::default() };
     i.walk(nodes, style, cx.breaks);
     i.element(cx)
 }
@@ -616,10 +631,60 @@ pub fn render(
     }
 }
 
+/// Where `s` names files or folders in plain text: `src/x.rs`, `src/x.rs:12`,
+/// `./out/a.webm`, `/Users/me/notes`, `~/Downloads/a.png`. Relative paths need
+/// a folder and an extension, so prose like "and/or" stays text.
+fn path_spans(s: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, ch) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
+        match (ch.is_whitespace(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(from)) => {
+                start = None;
+                let word = &s[from..i];
+                let lead = word.len() - word.trim_start_matches(['(', '[', '<', '"', '\'', '`']).len();
+                let word = word[lead..].trim_end_matches([')', ']', '>', '"', '\'', '`', '.', ',', ';', ':', '!', '?']);
+                if is_path(word) {
+                    spans.push(from + lead..from + lead + word.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+fn is_path(word: &str) -> bool {
+    if word.contains("://") || !word.contains('/') {
+        return false;
+    }
+    // A trailing `:12`, `:12:3` or `:12-20`.
+    let mut path = word;
+    for _ in 0..2 {
+        match path.rsplit_once(':') {
+            Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit() || b == b'-') => path = head,
+            _ => break,
+        }
+    }
+    if !path.chars().all(|c| c.is_alphanumeric() || "/._-~@+".contains(c)) || path.contains("//") {
+        return false;
+    }
+    let parts = path.split('/').filter(|p| !p.is_empty()).count();
+    if path.starts_with('/') || path.starts_with("~/") {
+        return parts >= 2;
+    }
+    let first = path.chars().next().unwrap_or(' ');
+    let named = path.rsplit('/').next().and_then(|name| name.rsplit_once('.')).is_some_and(|(stem, ext)| {
+        !stem.is_empty() && (1..=10).contains(&ext.len()) && ext.chars().all(|c| c.is_ascii_alphanumeric()) && ext.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    parts >= 2 && (first.is_alphanumeric() || first == '.' || first == '_') && (named || path.starts_with("./") || path.starts_with("../"))
+}
+
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the built-in one.
-    use super::{Breaks, Inline, Node, Style, strip_tags};
+    use super::{Breaks, Inline, Node, Style, path_spans, strip_tags};
     fn flatten(src: &str, breaks: Breaks) -> Inline {
         let Ok(Node::Root(root)) = markdown::to_mdast(src, &markdown::ParseOptions::gfm()) else {
             panic!()
@@ -650,6 +715,22 @@ mod tests {
         assert_eq!(i.chips[0].1.as_ref(), "app-icons/file-code.svg");
         assert!(i.text[i.chips[0].0.clone()].contains("my\u{a0}file.rs"));
         assert!(i.links.is_empty() && i.text.starts_with("see ") && i.text.ends_with(" now"));
+    }
+    #[test]
+    fn finds_paths_in_text() {
+        let found = |s: &str| path_spans(s).into_iter().map(|r| s[r].to_string()).collect::<Vec<_>>();
+        assert_eq!(found("Video: output/review-recordings/eng-1165/scan-to-admit.webm (about 35s)."), ["output/review-recordings/eng-1165/scan-to-admit.webm"]);
+        assert_eq!(found("see (src/x.rs:12), ~/Downloads/a.png and /Users/me/notes."), ["src/x.rs:12", "~/Downloads/a.png", "/Users/me/notes"]);
+        assert_eq!(found("and/or, km/h, 1.2/3.4, https://x.dev/a.rs, Cargo.toml, /"), Vec::<String>::new());
+    }
+    #[test]
+    fn links_paths_only_when_asked() {
+        let Ok(Node::Root(root)) = markdown::to_mdast("open `src/a.rs` or src/b.rs now", &markdown::ParseOptions::gfm()) else { panic!() };
+        let Node::Paragraph(p) = &root.children[0] else { panic!() };
+        let mut i = Inline { autolink: true, ..Inline::default() };
+        i.walk(&p.children, &Style::default(), Breaks::Soft);
+        assert_eq!(i.links.iter().map(|(_, u)| u.as_str()).collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
+        assert!(flatten("open src/b.rs now", Breaks::Soft).links.is_empty());
     }
     #[test]
     fn soft_and_hard_breaks() {
