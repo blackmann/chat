@@ -256,9 +256,14 @@ impl Workspace {
 
     /// The right-click menu on a diff — a row that opens one, or its tab.
     pub(super) fn diff_menu(&mut self, path: PathBuf, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        self.diff_menu_with(path, position, None, window, cx);
+    }
+
+    /// The diff menu, with `extra` entries after a separator.
+    pub(super) fn diff_menu_with(&mut self, path: PathBuf, position: Point<Pixels>, extra: Option<crate::menu::Builder>, window: &mut Window, cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         let editors = self.editors.clone();
-        let build: crate::menu::Builder = Rc::new(move |_: &App| {
+        let build: crate::menu::Builder = Rc::new(move |cx: &App| {
             let open = weak.clone();
             let target = path.clone();
             let mut entries = vec![crate::menu::Entry::Item(
@@ -269,6 +274,10 @@ impl Workspace {
             if path.is_file() {
                 entries.push(open_with_item(&editors, &path, false));
                 entries.extend(link_entries(&weak, &path, None, position));
+            }
+            if let Some(extra) = &extra {
+                entries.push(crate::menu::Entry::Separator);
+                entries.extend(extra(cx));
             }
             entries
         });
@@ -985,10 +994,11 @@ impl Workspace {
             TabKind::GitDiff(path, staged) => {
                 // Only once the file's repository has been read; until then it's unknown.
                 let snapshot = self.git_snapshots.values().filter_map(|s| s.as_ref().ok()).find(|s| path.starts_with(&s.root))?;
+                let relative = path.strip_prefix(&snapshot.root).ok()?;
                 let current = snapshot
                     .entries
                     .iter()
-                    .any(|e| snapshot.root.join(&e.path) == *path && if *staged { e.staged() } else { e.unstaged() });
+                    .any(|e| e.path == relative && if *staged { e.staged() } else { e.unstaged() });
                 (!current).then_some(if *staged {
                     "Nothing is staged in this file anymore. This diff is out of date."
                 } else {
@@ -1189,7 +1199,8 @@ fn link_entries(weak: &WeakEntity<Workspace>, path: &Path, lines: Option<(usize,
     }
     let item = |label: &'static str, permalink: bool| {
         let (weak, path) = (weak.clone(), path.to_path_buf());
-        crate::menu::Entry::Item(crate::menu::Item::new(label).icon(IconName::ExternalLink).on_click(move |_, cx| {
+        let glyph = if permalink { crate::icons::Glyph::Commit } else { crate::icons::Glyph::Link };
+        crate::menu::Entry::Item(crate::menu::Item::new(label).icon(glyph).on_click(move |_, cx| {
             let _ = weak.update(cx, |s, cx| s.copy_link(&path, lines, permalink, point, cx));
         }))
     };

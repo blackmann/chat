@@ -106,6 +106,12 @@ impl AgentSpec {
             })
     }
 
+    /// Whether a pick made in one session becomes the agent's default for the
+    /// next: Codex writes it to its config.
+    pub fn saves_picks(&self) -> bool {
+        self.uses_codex_adapter()
+    }
+
     fn uses_codex_adapter(&self) -> bool {
         Path::new(&self.command).file_name() == Some(OsStr::new("codex-acp"))
             || self.args.iter().any(|arg| {

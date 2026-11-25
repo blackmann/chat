@@ -13,6 +13,7 @@ mod settings;
 mod stats;
 mod store;
 mod theme;
+mod trash;
 mod workspace;
 mod worktree_tool;
 use gpui::*;

@@ -217,6 +217,9 @@ pub struct Workspace {
     file_scroll: HashMap<PathBuf, UniformListScrollHandle>,
     /// Each open file's changes since HEAD and blame, read in the background.
     file_git: HashMap<PathBuf, Rc<crate::git::FileInfo>>,
+    /// Changes in each open file whose replaced lines show above them, by
+    /// the first line of the change.
+    hunks_open: HashMap<PathBuf, HashSet<usize>>,
     /// The row last clicked in each file or diff pane, where its blame shows.
     cursor_line: HashMap<panes::LineSource, usize>,
     /// Blame for each diff pane's two sides, read in the background.
@@ -302,6 +305,9 @@ pub struct Workspace {
     git_snapshots: HashMap<PathBuf, Result<crate::git::Snapshot, String>>,
     git_diffs: HashMap<(PathBuf, bool), Result<crate::git::Diff, String>>,
     git_refreshing: bool,
+    /// How long the last refresh took to read; file events wait about that
+    /// long again, so a build in an unignored folder can't keep git running nonstop.
+    git_refresh_cost: Duration,
     /// Something changed during a refresh: read again once it lands.
     git_queued: bool,
     git_watch: Option<crate::git_watch::Watcher>,
@@ -319,6 +325,13 @@ pub struct Workspace {
     git_running: Option<GitRunning>,
     /// The stash a first click on Drop armed; a second click drops it.
     stash_drop_armed: Option<usize>,
+    /// The section, staged or not, a first click on Discard all armed; a
+    /// second click discards.
+    discard_armed: Option<bool>,
+    /// The commit button amends the last commit instead.
+    amend: bool,
+    /// Files of the last commit unticked while amending, to take out of it.
+    amend_drop: HashSet<PathBuf>,
     /// The repository the Changes page shows, when a project spans several folders.
     git_repo: Option<PathBuf>,
     /// Text selected in the transcript.
@@ -474,6 +487,7 @@ impl Workspace {
             media: HashMap::new(),
             file_scroll: HashMap::new(),
             file_git: HashMap::new(),
+            hunks_open: HashMap::new(),
             cursor_line: HashMap::new(),
             diff_blame: RefCell::new(HashMap::new()),
             show_blame: true,
@@ -526,6 +540,7 @@ impl Workspace {
             git_snapshots: HashMap::new(),
             git_diffs: HashMap::new(),
             git_refreshing: false,
+            git_refresh_cost: Duration::ZERO,
             git_queued: false,
             git_watch: None,
             git_busy: false,
@@ -537,6 +552,9 @@ impl Workspace {
             restore_commit_message: None,
             git_running: None,
             stash_drop_armed: None,
+            discard_armed: None,
+            amend: false,
+            amend_drop: HashSet::new(),
             git_repo: None,
             selection: Rc::default(),
             line_selection: None,
@@ -821,7 +839,8 @@ impl Workspace {
             return self.select_thread(blank, cx);
         }
         self.next_thread += 1;
-        let thread = Thread::new(self.next_thread, self.settings.agent);
+        let mut thread = Thread::new(self.next_thread, self.settings.agent);
+        thread.picks = self.starting_picks(self.project, thread.agent);
         self.projects[self.project].threads.insert(0, thread);
         self.select_thread(0, cx);
     }
@@ -865,6 +884,9 @@ impl Workspace {
     /// Write the rail back to settings: paths, names and folders.
     fn save_projects(&mut self) {
         self.settings.projects = self.projects.iter().filter_map(Project::entry).collect();
+        // Picks go with their project.
+        let kept: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone().unwrap_or_default()).collect();
+        self.settings.project_picks.retain(|path, _| kept.contains(path));
         let _ = self.settings.save();
     }
     /// Add folders to a project. Its agents are told about them from their next session on.
@@ -1176,6 +1198,22 @@ impl Workspace {
             ),
             _ => None,
         };
+        // A fresh session with nothing to put back opens on the agent's own
+        // defaults. One that saves picks as its defaults won't keep them, so
+        // note them first, for projects that never picked.
+        if let Event::Ready { settings, .. } = &event
+            && thread.session_id.is_none()
+            && thread.picks.is_empty()
+            && let Some(spec) = self.settings.agents.get(thread.agent)
+            && spec.saves_picks()
+            && !self.settings.base_picks.contains_key(&spec.name)
+        {
+            let base = model_and_effort(settings);
+            if !base.is_empty() {
+                self.settings.base_picks.insert(spec.name.clone(), base);
+                let _ = self.settings.save();
+            }
+        }
         thread.apply(event);
         // A turn that finishes out of sight waits to be read.
         let ended = was_busy && matches!(thread.state, ThreadState::Done | ThreadState::Failed);
@@ -1216,11 +1254,18 @@ impl Workspace {
         self.settings.agent = agent;
         let _ = self.settings.save();
         let (project, index) = (self.project, self.thread);
+        let picks = self.starting_picks(project, agent);
         if let Some(thread) = self.current_thread_mut()
             && thread.blocks.is_empty()
             && thread.agent != agent
         {
             thread.agent = agent;
+            // The old agent's session and choices mean nothing to the new one:
+            // reconnecting would try to resume that session and carry over its
+            // model (Claude's "default", which Codex then runs with).
+            thread.session_id = None;
+            thread.settings.clear();
+            thread.picks = picks;
             self.connect(project, index, cx);
         }
         cx.notify();
@@ -1234,8 +1279,39 @@ impl Workspace {
             }
             thread.send(Command::Set { setting, choice });
         }
+        self.remember_picks();
         self.save_soon(cx);
         cx.notify();
+    }
+    /// Where a project's picks are filed in settings.
+    fn picks_key(&self, project: usize) -> PathBuf {
+        self.projects[project].path.clone().unwrap_or_default()
+    }
+    /// The model and effort a new thread in `project` starts on: those last
+    /// picked there, else what the agent began on before any pick, if it keeps
+    /// picks as its default. Nothing means the agent's own default.
+    fn starting_picks(&self, project: usize, agent: usize) -> Vec<(String, String)> {
+        let Some(name) = self.settings.agents.get(agent).map(|a| &a.name) else { return Vec::new() };
+        self.settings
+            .project_picks
+            .get(&self.picks_key(project))
+            .and_then(|by_agent| by_agent.get(name))
+            .or_else(|| self.settings.base_picks.get(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+    /// Note the current thread's model and effort as its project's, so the
+    /// next thread there starts on them, and only there.
+    fn remember_picks(&mut self) {
+        let key = self.picks_key(self.project);
+        let Some(thread) = self.current_thread() else { return };
+        let Some(name) = self.settings.agents.get(thread.agent).map(|a| a.name.clone()) else { return };
+        let picks = model_and_effort(&thread.settings);
+        if picks.is_empty() {
+            return;
+        }
+        self.settings.project_picks.entry(key).or_default().insert(name, picks);
+        let _ = self.settings.save();
     }
     fn answer(&mut self, id: u64, answer: Option<(String, String)>, cx: &mut Context<Self>) {
         let Some(thread) = self.current_thread_mut() else {
@@ -1547,6 +1623,11 @@ impl Workspace {
                 if !s.files.contains_key(&path) {
                     return;
                 }
+                // Changes still there stay open; the rest close.
+                if let Some(open) = s.hunks_open.get_mut(&path) {
+                    let hunks = info.as_ref().map(|i| i.hunks.as_slice()).unwrap_or_default();
+                    open.retain(|start| hunks.iter().any(|h| h.new.start == *start && !h.old.is_empty()));
+                }
                 match info {
                     Some(info) => s.file_git.insert(path, Rc::new(info)),
                     None => s.file_git.remove(&path),
@@ -1566,7 +1647,7 @@ impl Workspace {
         let first = first.saturating_sub(1).min(end);
         let last = last.saturating_sub(1).clamp(first, end);
         if let Some(scroll) = self.file_scroll.get(&path) {
-            scroll.scroll_to_item(first, ScrollStrategy::Center);
+            scroll.scroll_to_item(self.file_list_index(&path, first), ScrollStrategy::Center);
         }
         self.flash = Some(Flash { path, rows: first..=last, at: std::time::Instant::now() });
         cx.notify();
@@ -1622,6 +1703,7 @@ impl Workspace {
             self.media.remove(path);
             self.file_scroll.remove(path);
             self.file_git.remove(path);
+            self.hunks_open.remove(path);
         }
         // Its server forgets the file once no tab shows it.
         if let TabKind::File(path) | TabKind::Diff(path) | TabKind::GitDiff(path, _) = &kind
@@ -2252,4 +2334,9 @@ fn choice_values(kind: &agent::QuestionKind) -> Vec<String> {
         agent::QuestionKind::Yes => vec!["true".into(), "false".into()],
         _ => Vec::new(),
     }
+}
+
+/// The model and effort among a session's settings, as picks.
+fn model_and_effort(settings: &[Setting]) -> Vec<(String, String)> {
+    settings.iter().filter(|s| matches!(s.role, Role::Model | Role::Effort)).map(|s| (s.id.clone(), s.current.clone())).collect()
 }

@@ -566,23 +566,53 @@ fn ago(seconds: i64) -> String {
     }
 }
 
+/// A row of a file view: one of the file's lines, or one of HEAD's lines a
+/// change replaced, shown above it while that change is open.
+#[derive(Clone)]
+pub(super) enum FileRow {
+    Line(usize),
+    Old { text: SharedString, at: usize, hunk: usize },
+}
+
+/// What a click on a change's bar does: open or close the change starting at
+/// `hunk`, and whether it's open now.
+struct BarToggle {
+    this: WeakEntity<Workspace>,
+    path: PathBuf,
+    hunk: usize,
+    open: bool,
+}
+
 /// The bar beside a file's line numbers marking its change since HEAD: green
-/// for added, amber for changed, and a red notch where lines were removed.
-fn change_bar(colors: Palette, mark: Option<crate::git::Mark>) -> Div {
+/// for added, amber for changed, and a red notch where lines were removed. A
+/// change that replaced or removed lines opens them above it on a click.
+fn change_bar(colors: Palette, id: usize, mark: Option<crate::git::Mark>, toggle: Option<BarToggle>) -> Stateful<Div> {
     use crate::git::Mark;
     let notch = || div().absolute().left(px(-2.)).w(px(7.)).h(px(2.)).bg(rgb(colors.red));
-    div()
+    let bar = div()
         .relative()
         .w(px(3.))
         .h_full()
-        .mr(px(10.))
-        .flex_shrink_0()
         .when_some(mark, |s, mark| match mark {
             Mark::Added => s.bg(rgb(colors.green)),
             Mark::Modified => s.bg(rgb(colors.amber)),
             Mark::RemovedAbove => s.child(notch().top_0()),
             Mark::RemovedBelow => s.child(notch().bottom_0()),
-        })
+        });
+    bar_cell(id, bar, toggle)
+}
+
+/// A change bar's room, wider than the bar so it's easy to hit.
+fn bar_cell(id: usize, bar: Div, toggle: Option<BarToggle>) -> Stateful<Div> {
+    div().id(("change-bar", id)).h_full().w(px(13.)).flex_shrink_0().child(bar).when_some(toggle, |s, t| {
+        let tip = if t.open { "Hide the previous version" } else { "Show the previous version" };
+        s.cursor_pointer()
+            .tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip).build(w, cx))
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                cx.stop_propagation();
+                t.this.update(cx, |s, cx| s.toggle_hunk(&t.path, t.hunk, cx)).ok();
+            })
+    })
 }
 
 fn number(colors: Palette, n: Option<usize>, width: f32) -> Div {
@@ -631,6 +661,10 @@ impl Workspace {
         let link = self.servers.link.clone();
         let tints = tints(colors);
         let git = self.file_git.get(&path).cloned();
+        let rows = self.file_rows(&path).map(Rc::new);
+        let list_count = rows.as_ref().map_or(count, |r| r.len());
+        let old_styles = rows.as_ref().and(git.as_ref()).and_then(|g| syntax::cached(&path.to_string_lossy(), &g.head));
+        let hunks_open = self.hunks_open.get(&path).cloned().unwrap_or_default();
         let has_blame = git.as_ref().is_some_and(|g| !g.blame.is_empty());
         let cursor = self.cursor_line.get(&source).copied();
         let blame = git.clone().filter(|_| has_blame && self.show_blame).zip(cursor);
@@ -638,11 +672,39 @@ impl Workspace {
         let code_text = self.code_text_for(&source);
         let file_path = path.clone();
         // Only the lines on screen are built, so long files stay cheap.
-        let list = uniform_list(key.clone(), count, move |range, _, _| {
+        let list = uniform_list(key.clone(), list_count, move |range, _, _| {
             // Rows paint themselves back in; ones scrolled away must not answer the pointer.
             code_text.borrow_mut().forget_layout();
             range
-                .map(|i| {
+                .map(|k| {
+                    let toggle = |hunk: usize| BarToggle { this: this.clone(), path: file_path.clone(), hunk, open: hunks_open.contains(&hunk) };
+                    let i = match rows.as_ref().map(|r| &r[k]) {
+                        Some(FileRow::Old { text, at, hunk }) => {
+                            let marks = old_styles
+                                .as_ref()
+                                .and_then(|h| h.line(colors.dark, *at))
+                                .filter(|marks| marks.iter().all(|(r, _)| r.end <= text.len() && text.is_char_boundary(r.end)))
+                                .cloned()
+                                .unwrap_or_default();
+                            let bar = div().w(px(3.)).h_full().bg(rgb(colors.red));
+                            return row()
+                                .w_full()
+                                .h(px(LINE))
+                                .bg(rgb(colors.red_tint))
+                                .child(div().w(px(GUTTER)).flex_shrink_0())
+                                .child(number(colors, None, 44.).mr_2())
+                                .child(bar_cell(count + k, bar, Some(toggle(*hunk))))
+                                .child(code_cell(offset, StyledText::new(text.clone()).with_highlights(marks), guides.at(0), None, None).text_color(rgb(colors.code)))
+                                .into_any_element();
+                        }
+                        Some(FileRow::Line(i)) => *i,
+                        None => k,
+                    };
+                    let mark = git.as_ref().and_then(|g| g.marks.get(i).copied().flatten());
+                    let hunk = mark
+                        .and(git.as_ref())
+                        .and_then(|g| g.hunks.iter().find(|h| !h.old.is_empty() && h.marks(i, count)))
+                        .map(|h| toggle(h.new.start));
                     let line = file.lines[i].clone();
                     let marks = file.highlights.as_ref().and_then(|h| h.line(colors.dark, i)).cloned().unwrap_or_default();
                     let decor = Decor { symbol: symbol.as_ref(), link: link.as_ref(), tints };
@@ -666,7 +728,7 @@ impl Workspace {
                         })
                         .when(selected.as_ref().is_some_and(|rows| rows.contains(&i)), |s| s.bg(rgb(colors.selected)))
                         .child(number(colors, Some(i + 1), 44.).mr_2())
-                        .child(change_bar(colors, git.as_ref().and_then(|g| g.marks.get(i).copied().flatten())))
+                        .child(change_bar(colors, i, mark, hunk))
                         .child(
                             code_cell(
                                 offset,
@@ -677,8 +739,9 @@ impl Workspace {
                             )
                                 .text_color(rgb(colors.code)),
                         )
+                        .into_any_element()
                 })
-                .collect()
+                .collect::<Vec<_>>()
         })
         .track_scroll(scroll.clone())
         .size_full()
@@ -733,6 +796,62 @@ impl Workspace {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(|s, _, _, cx| s.release_text(cx))),
             )
             .into_any_element()
+    }
+
+    /// A file view's rows while any of its changes are open, HEAD's lines for
+    /// each placed above the lines that replaced them; `None` when none are.
+    pub(super) fn file_rows(&self, path: &Path) -> Option<Vec<FileRow>> {
+        let open = self.hunks_open.get(path).filter(|o| !o.is_empty())?;
+        let git = self.file_git.get(path)?;
+        let Some(Ok(file)) = self.files.get(path) else { return None };
+        let head: Vec<&str> = git.head.lines().collect();
+        let mut hunks = git.hunks.iter().filter(|h| open.contains(&h.new.start)).peekable();
+        let mut rows = Vec::with_capacity(file.lines.len());
+        for i in 0..=file.lines.len() {
+            while let Some(h) = hunks.next_if(|h| h.new.start <= i) {
+                rows.extend(h.old.clone().filter_map(|at| {
+                    Some(FileRow::Old { text: syntax::expand_tabs(head.get(at)?).into(), at, hunk: h.new.start })
+                }));
+            }
+            if i < file.lines.len() {
+                rows.push(FileRow::Line(i));
+            }
+        }
+        Some(rows)
+    }
+
+    /// Where file line `line` sits in its view's list, past any open changes above it.
+    pub(super) fn file_list_index(&self, path: &Path, line: usize) -> usize {
+        let (Some(open), Some(git)) = (self.hunks_open.get(path), self.file_git.get(path)) else { return line };
+        line + git.hunks.iter().filter(|h| open.contains(&h.new.start) && h.new.start <= line).map(|h| h.old.len()).sum::<usize>()
+    }
+
+    /// The file line at row `index` of its view's list; an open change's old
+    /// lines count as the line below them.
+    pub(super) fn file_line_at(&self, path: &Path, index: usize) -> usize {
+        let (Some(open), Some(git)) = (self.hunks_open.get(path), self.file_git.get(path)) else { return index };
+        let mut shift = 0;
+        for h in git.hunks.iter().filter(|h| open.contains(&h.new.start)) {
+            let first = h.new.start + shift;
+            if index < first {
+                break;
+            }
+            if index < first + h.old.len() {
+                return h.new.start;
+            }
+            shift += h.old.len();
+        }
+        index - shift
+    }
+
+    /// Open or close the change starting at line `hunk`: HEAD's lines it
+    /// replaced show above it while open.
+    fn toggle_hunk(&mut self, path: &Path, hunk: usize, cx: &mut Context<Self>) {
+        let open = self.hunks_open.entry(path.to_path_buf()).or_default();
+        if !open.remove(&hunk) {
+            open.insert(hunk);
+        }
+        cx.notify();
     }
 
     /// The header's way out to another editor: a list of the installed ones.

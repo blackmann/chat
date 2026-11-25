@@ -1,9 +1,11 @@
 //! Local Git operations. Paths come from NUL-delimited status, never shell text.
 //! Workflow reference: Zed's git_ui/{git_panel,staged_diff,unstaged_diff}.rs.
 use std::{
+    collections::HashMap,
     ffi::{OsStr, OsString},
+    io::Write as _,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +56,12 @@ impl Entry {
         } else {
             vec![self.path.clone()]
         }
+    }
+    /// Whether discarding this side sends the file to the Trash: Git keeps no
+    /// copy of it to go back to (untracked, new since HEAD, or a copy or rename's new path).
+    pub fn discard_trashes(&self, staged: bool) -> bool {
+        let side = if staged { self.index } else { self.worktree };
+        self.untracked() || matches!(side, b'R' | b'C') || (staged && self.index == b'A')
     }
     pub fn paths(&self) -> Vec<PathBuf> {
         self.original
@@ -140,6 +148,29 @@ pub struct LastCommit {
     pub message: String,
     /// Whether it has a parent; undoing a root commit empties the branch instead.
     pub has_parent: bool,
+    /// What it changed, renames as a removal and an addition; empty for a merge.
+    pub files: Vec<CommitFile>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitFile {
+    pub path: PathBuf,
+    /// `A`, `M`, `D` or `T`, as against its parent.
+    pub status: u8,
+    pub stat: Option<(u32, u32)>,
+}
+/// The files `HEAD` changed against its parent, or against nothing for a root commit.
+fn commit_files(root: &Path) -> Vec<CommitFile> {
+    let tree = |format: &str| run(root, &["diff-tree", "--root", "-r", "--no-commit-id", "--no-renames", "--no-ext-diff", "-z", format, "HEAD"]);
+    let Ok(names) = tree("--name-status") else { return Vec::new() };
+    let stats = tree("--numstat").map(|out| parse_numstat(&out)).unwrap_or_default();
+    let mut fields = names.split(|b| *b == 0).filter(|f| !f.is_empty());
+    let mut files = Vec::new();
+    while let (Some(status), Some(name)) = (fields.next(), fields.next()) {
+        let path = path(name);
+        let stat = stats.iter().find(|(p, _)| *p == path).and_then(|(_, stat)| *stat);
+        files.push(CommitFile { path, status: status.first().copied().unwrap_or(b'M'), stat });
+    }
+    files
 }
 impl LastCommit {
     pub fn subject(&self) -> &str {
@@ -176,8 +207,15 @@ pub enum Operation {
     Commit(String),
     /// Push the branch, setting its upstream on the first remote if it has none.
     Push,
+    /// Fold what is staged into the last commit, with this message, taking
+    /// `drop` out of it: their changes stay in the working tree.
+    Amend { message: String, drop: Vec<PathBuf> },
     /// Undo the last commit, keeping its changes staged.
     UndoCommit,
+    /// Throw changes away. Under Unstaged, the working tree goes back to the
+    /// index; under Staged, the file goes back to HEAD, both sides. Files Git
+    /// would lose for good (untracked, or new since HEAD) go to the Trash.
+    Discard { entries: Vec<Entry>, staged: bool },
     /// Put changes aside: everything, untracked files included, or only what is staged.
     Stash { staged_only: bool },
     /// Bring a stash's changes back and remove it from the list.
@@ -214,6 +252,23 @@ fn checked(output: std::io::Result<Output>) -> Result<Vec<u8>, String> {
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
     }
+}
+/// Runs with `paths` fed on stdin (`--pathspec-from-file`), so thousands of
+/// them don't overflow the argument list.
+fn with_paths(mut cmd: Command, paths: &[PathBuf]) -> Result<Vec<u8>, String> {
+    cmd.args(["--pathspec-from-file=-", "--pathspec-file-nul"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut list = Vec::new();
+    for p in paths {
+        list.extend_from_slice(p.as_os_str().as_encoded_bytes());
+        list.push(0);
+    }
+    let mut stdin = child.stdin.take().ok_or("No stdin for git.")?;
+    // Written from a thread: git may fill stdout/stderr before reading it all.
+    let writer = std::thread::spawn(move || stdin.write_all(&list));
+    let output = child.wait_with_output();
+    let _ = writer.join();
+    checked(output)
 }
 fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     checked(command(root).args(args).output())
@@ -313,23 +368,28 @@ pub fn snapshot(folder: &Path) -> Result<Snapshot, String> {
         run(&root, &args).map(|out| parse_numstat(&out)).unwrap_or_default()
     };
     let (staged, unstaged) = (numstat(true), numstat(false));
-    let find = |stats: &[(PathBuf, Option<(u32, u32)>)], path: &Path| {
-        stats.iter().find(|(p, _)| p == path).and_then(|(_, stat)| *stat)
-    };
+    let (staged, unstaged): (HashMap<_, _>, HashMap<_, _>) = (staged.into_iter().collect(), unstaged.into_iter().collect());
+    // Counting reads every file: past a few hundred (an unignored `target/`),
+    // the rest go without a count rather than read gigabytes on every refresh.
+    let mut counted = 0;
     for entry in &mut entries {
         if entry.untracked() {
-            entry.unstaged_stat = line_count(&root.join(&entry.path)).map(|n| (n, 0));
+            if counted < MAX_COUNTED {
+                counted += 1;
+                entry.unstaged_stat = line_count(&root.join(&entry.path)).map(|n| (n, 0));
+            }
         } else {
-            entry.staged_stat = find(&staged, &entry.path);
-            entry.unstaged_stat = find(&unstaged, &entry.path);
+            entry.staged_stat = staged.get(&entry.path).copied().flatten();
+            entry.unstaged_stat = unstaged.get(&entry.path).copied().flatten();
         }
     }
     // Parents, then the message; fails before the first commit.
     let last_commit = run(&root, &["log", "-1", "--format=%P%x00%B"]).ok().and_then(|out| {
         let out = String::from_utf8_lossy(&out);
         let (parents, message) = out.split_once('\0')?;
-        Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty() })
+        Some(LastCommit { message: message.trim_end().to_owned(), has_parent: !parents.trim().is_empty(), files: Vec::new() })
     });
+    let last_commit = last_commit.map(|c| LastCommit { files: commit_files(&root), ..c });
     let worktrees = run(&root, &["worktree", "list", "--porcelain"]).map(|out| parse_worktrees(&out)).unwrap_or_default();
     let stashes = run(&root, &["stash", "list", "--format=%gd%x1f%gs%x1f%cr"]).map(|out| parse_stashes(&out)).unwrap_or_default();
     Ok(Snapshot { root, git_dir, branch, entries, upstream, ahead, last_commit, worktrees, stashes })
@@ -359,6 +419,9 @@ fn parse_numstat(bytes: &[u8]) -> Vec<(PathBuf, Option<(u32, u32)>)> {
     }
     out
 }
+
+/// Untracked files whose lines a refresh counts.
+const MAX_COUNTED: usize = 500;
 
 /// Lines in an untracked file, when it is small enough and text.
 fn line_count(file: &Path) -> Option<u32> {
@@ -466,9 +529,52 @@ impl Commit {
 #[derive(Clone, Debug, Default)]
 pub struct FileInfo {
     pub marks: Vec<Option<Mark>>,
+    /// The file as HEAD has it, empty when HEAD doesn't.
+    pub head: String,
+    /// Each change since HEAD, in order.
+    pub hunks: Vec<Hunk>,
     pub commits: Vec<Commit>,
     /// Each line's commit, as an index into `commits`.
     pub blame: Vec<Option<usize>>,
+}
+
+/// A run of lines changed since HEAD.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hunk {
+    /// The working file's lines that replaced the old ones; empty when lines
+    /// were only removed, at the line they were removed above (or the line
+    /// count, when removed from the end).
+    pub new: std::ops::Range<usize>,
+    /// HEAD's lines this change removed or replaced; empty for an addition.
+    pub old: std::ops::Range<usize>,
+}
+impl Hunk {
+    /// Whether the gutter mark on working line `line`, of `count`, is this change's.
+    pub fn marks(&self, line: usize, count: usize) -> bool {
+        self.new.contains(&line) || (self.new.is_empty() && (self.new.start == line || (self.new.start == count && line + 1 == count)))
+    }
+}
+
+/// The changes from `old` to `new`, each a run of lines that differ.
+pub fn line_hunks(old: &str, new: &str) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut joins = false;
+    for op in similar::TextDiff::from_lines(old, new).ops() {
+        if let similar::DiffOp::Equal { .. } = op {
+            joins = false;
+            continue;
+        }
+        let (o, n) = (op.old_range(), op.new_range());
+        match hunks.last_mut() {
+            Some(last) if joins => {
+                last.old.end = o.end;
+                last.new.end = n.end;
+            }
+            _ => hunks.push(Hunk { new: n, old: o }),
+        }
+        joins = true;
+    }
+    hunks
 }
 
 /// Per-line marks for `new` against `old`, as an editor gutter shows them.
@@ -546,13 +652,14 @@ pub fn file_info(file: &Path) -> Option<FileInfo> {
         return None;
     }
     let marks = line_marks(head.as_deref().unwrap_or(""), &text);
+    let hunks = line_hunks(head.as_deref().unwrap_or(""), &text);
     let (commits, blame) = head
         .is_some()
         .then(|| checked(command(&root).args(["blame", "--porcelain", "--"]).arg(relative).output()).ok())
         .flatten()
         .map(|out| parse_blame(&out))
         .unwrap_or_default();
-    Some(FileInfo { marks, commits, blame })
+    Some(FileInfo { marks, head: head.unwrap_or_default(), hunks, commits, blame })
 }
 
 /// Blame for `text` as if it were `file`'s contents, which may differ from
@@ -581,24 +688,26 @@ pub fn blame_text(file: &Path, text: &str) -> Option<FileInfo> {
     let out = checked(child.wait_with_output()).ok()?;
     let _ = writer.join();
     let (commits, blame) = parse_blame(&out);
-    Some(FileInfo { marks: Vec::new(), commits, blame })
+    Some(FileInfo { commits, blame, ..Default::default() })
 }
 
 pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
     match operation {
         Operation::Stage(paths) | Operation::Unstage(paths) if paths.is_empty() => return Ok(()),
         Operation::Stage(paths) => {
-            checked(command(root).args(["add", "-A", "--"]).args(paths).output())?;
+            let mut cmd = command(root);
+            cmd.args(["add", "-A"]);
+            with_paths(cmd, &paths)?;
         }
         Operation::Unstage(paths) => {
             let has_head = run(root, &["rev-parse", "--verify", "HEAD"]).is_ok();
             let mut cmd = command(root);
             if has_head {
-                cmd.args(["reset", "-q", "HEAD", "--"]);
+                cmd.args(["reset", "-q", "HEAD"]);
             } else {
-                cmd.args(["rm", "--cached", "-f", "-q", "--"]);
+                cmd.args(["rm", "--cached", "-f", "-q"]);
             }
-            checked(cmd.args(paths).output())?;
+            with_paths(cmd, &paths)?;
         }
         Operation::Commit(message) if message.trim().is_empty() => {
             return Err("Enter a commit message.".into());
@@ -636,6 +745,29 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
         Operation::StashDrop(index) => {
             checked(stash_command(root).args(["stash", "drop", "-q"]).arg(format!("stash@{{{index}}}")).output())?;
         }
+        Operation::Amend { message, .. } if message.trim().is_empty() => {
+            return Err("Enter a commit message.".into());
+        }
+        Operation::Amend { message, drop } => {
+            // The index takes the parent's side of each dropped file, so the
+            // amended commit leaves it as it was before.
+            if !drop.is_empty() {
+                let mut cmd = command(root);
+                if run(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
+                    cmd.args(["reset", "-q", "HEAD~1", "--"]);
+                } else {
+                    cmd.args(["rm", "--cached", "-q", "-f", "--ignore-unmatch", "--"]);
+                }
+                checked(cmd.args(&drop).output())?;
+            }
+            let amended = checked(command(root).args(["commit", "--amend", "-m"]).arg(OsString::from(message)).output());
+            if amended.is_err() && !drop.is_empty() {
+                // Nothing was amended, so the dropped files go back as committed.
+                let _ = checked(command(root).args(["reset", "-q", "HEAD", "--"]).args(&drop).output());
+            }
+            amended?;
+        }
+        Operation::Discard { entries, staged } => discard(root, &entries, staged)?,
         Operation::UndoCommit => {
             if run(root, &["rev-parse", "--verify", "-q", "HEAD~1"]).is_ok() {
                 run(root, &["reset", "--soft", "-q", "HEAD~1"])?;
@@ -643,6 +775,55 @@ pub fn operate(root: &Path, operation: Operation) -> Result<(), String> {
                 // The first commit: the branch goes back to having none, the index stays.
                 run(root, &["update-ref", "-d", "HEAD"])?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// What discarding takes: paths to check out from the index, from HEAD, to
+/// drop from the index, and files to move to the Trash once Git lets go.
+fn discard(root: &Path, entries: &[Entry], staged: bool) -> Result<(), String> {
+    let (mut from_index, mut from_head, mut untrack, mut trash) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for e in entries.iter().filter(|e| !e.conflict()) {
+        let side = if staged { e.index } else { e.worktree };
+        if e.untracked() {
+            trash.push(e.path.clone());
+        } else if matches!(side, b'R' | b'C') {
+            // The new path goes; a rename's old one comes back.
+            untrack.push(e.path.clone());
+            trash.push(e.path.clone());
+            if side == b'R' {
+                let original = e.original.clone().into_iter();
+                if staged { from_head.extend(original) } else { from_index.extend(original) }
+            }
+        } else if staged && e.index == b'A' {
+            untrack.push(e.path.clone());
+            trash.push(e.path.clone());
+        } else if staged {
+            from_head.push(e.path.clone());
+        } else {
+            from_index.push(e.path.clone());
+        }
+    }
+    if !from_index.is_empty() {
+        let mut cmd = command(root);
+        cmd.args(["checkout", "-q"]);
+        with_paths(cmd, &from_index)?;
+    }
+    if !from_head.is_empty() {
+        let mut cmd = command(root);
+        cmd.args(["checkout", "-q", "HEAD"]);
+        with_paths(cmd, &from_head)?;
+    }
+    if !untrack.is_empty() {
+        let mut cmd = command(root);
+        cmd.args(["rm", "--cached", "-q", "-f", "--ignore-unmatch"]);
+        with_paths(cmd, &untrack)?;
+    }
+    for path in trash {
+        let file = root.join(&path);
+        if file.symlink_metadata().is_ok() {
+            crate::trash::trash(&file).map_err(|e| format!("Couldn't move {} to the Trash: {e}", path.display()))?;
         }
     }
     Ok(())
@@ -934,6 +1115,116 @@ mod tests {
         assert!(s.git_dir.ends_with(".git"));
     }
     #[test]
+    fn discard_unstaged_keeps_what_is_staged() {
+        let r = Repo::new();
+        r.write("a", "base\n");
+        r.write("gone", "kept\n");
+        r.stage("a");
+        r.stage("gone");
+        r.commit();
+        r.write("a", "index\n");
+        r.stage("a");
+        r.write("a", "worktree\n");
+        std::fs::remove_file(r.0.join("gone")).unwrap();
+        r.write("new", "untracked\n");
+        let s = snapshot(&r.0).unwrap();
+        let unstaged: Vec<Entry> = s.entries.iter().filter(|e| e.unstaged()).cloned().collect();
+        operate(&r.0, Operation::Discard { entries: unstaged, staged: false }).unwrap();
+        assert_eq!(std::fs::read_to_string(r.0.join("a")).unwrap(), "index\n");
+        assert_eq!(std::fs::read_to_string(r.0.join("gone")).unwrap(), "kept\n");
+        assert!(!r.0.join("new").exists());
+        let s = snapshot(&r.0).unwrap();
+        assert_eq!(s.entries.len(), 1);
+        assert!(s.entries[0].staged() && !s.entries[0].unstaged());
+    }
+    #[test]
+    fn discard_staged_goes_back_to_head() {
+        let r = Repo::new();
+        r.write("a", "base\n");
+        r.write("old", "moved\n");
+        r.stage("a");
+        r.stage("old");
+        r.commit();
+        r.write("a", "index\n");
+        r.stage("a");
+        r.write("a", "worktree\n");
+        r.write("added", "new\n");
+        r.stage("added");
+        std::fs::rename(r.0.join("old"), r.0.join("renamed")).unwrap();
+        operate(&r.0, Operation::Stage(vec!["old".into(), "renamed".into()])).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        let staged: Vec<Entry> = s.entries.iter().filter(|e| e.staged()).cloned().collect();
+        assert_eq!(staged.len(), 3);
+        operate(&r.0, Operation::Discard { entries: staged, staged: true }).unwrap();
+        assert_eq!(std::fs::read_to_string(r.0.join("a")).unwrap(), "base\n");
+        assert_eq!(std::fs::read_to_string(r.0.join("old")).unwrap(), "moved\n");
+        assert!(!r.0.join("renamed").exists() && !r.0.join("added").exists());
+        assert!(snapshot(&r.0).unwrap().entries.is_empty());
+    }
+    #[test]
+    fn discard_before_the_first_commit() {
+        let r = Repo::new();
+        r.write("a", "new\n");
+        r.stage("a");
+        let s = snapshot(&r.0).unwrap();
+        operate(&r.0, Operation::Discard { entries: s.entries.clone(), staged: true }).unwrap();
+        assert!(!r.0.join("a").exists());
+        assert!(snapshot(&r.0).unwrap().entries.is_empty());
+    }
+    #[test]
+    fn amend_folds_staged_changes_into_the_last_commit() {
+        let r = Repo::new();
+        r.write("a", "one\n");
+        r.stage("a");
+        r.commit();
+        r.write("b", "two\n");
+        r.stage("b");
+        operate(&r.0, Operation::Amend { message: "better message".into(), drop: Vec::new() }).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.entries.is_empty());
+        assert_eq!(s.last_commit.unwrap().message, "better message");
+        assert_eq!(run(&r.0, &["rev-list", "--count", "HEAD"]).unwrap().trim_ascii(), b"1");
+        assert!(operate(&r.0, Operation::Amend { message: "  ".into(), drop: Vec::new() }).is_err());
+    }
+    #[test]
+    fn amend_drops_files_back_to_the_working_tree() {
+        let r = Repo::new();
+        r.write("a", "one\n");
+        r.write("gone", "kept\n");
+        r.stage("a");
+        r.stage("gone");
+        r.commit();
+        r.write("a", "two\n");
+        r.write("b", "new\n");
+        std::fs::remove_file(r.0.join("gone")).unwrap();
+        operate(&r.0, Operation::Stage(vec!["a".into(), "b".into(), "gone".into()])).unwrap();
+        r.commit();
+        let files = snapshot(&r.0).unwrap().last_commit.unwrap().files;
+        let names: Vec<_> = files.iter().map(|f| (f.path.to_string_lossy().into_owned(), f.status)).collect();
+        assert_eq!(names, [("a".into(), b'M'), ("b".into(), b'A'), ("gone".into(), b'D')]);
+        operate(&r.0, Operation::Amend { message: "only a".into(), drop: vec!["b".into(), "gone".into()] }).unwrap();
+        let s = snapshot(&r.0).unwrap();
+        let last = s.last_commit.unwrap();
+        assert_eq!(last.files.len(), 1);
+        assert_eq!(last.files[0].path, Path::new("a"));
+        // Their changes are still there, now uncommitted.
+        assert_eq!(std::fs::read_to_string(r.0.join("b")).unwrap(), "new\n");
+        assert!(s.entries.iter().any(|e| e.path == Path::new("b") && e.untracked()));
+        assert!(s.entries.iter().any(|e| e.path == Path::new("gone") && e.worktree == b'D' && !e.staged()));
+    }
+    #[test]
+    fn a_failed_amend_keeps_the_commit_whole() {
+        let r = Repo::new();
+        r.write("a", "one\n");
+        r.stage("a");
+        r.commit();
+        // Dropping the only file would leave the commit empty.
+        assert!(operate(&r.0, Operation::Amend { message: "x".into(), drop: vec!["a".into()] }).is_err());
+        let s = snapshot(&r.0).unwrap();
+        assert!(s.entries.is_empty());
+        assert_eq!(s.last_commit.unwrap().files.len(), 1);
+    }
+    #[test]
     fn undo_commit_keeps_changes_staged() {
         let r = Repo::new();
         r.write("a", "one\n");
@@ -978,6 +1269,19 @@ mod tests {
         assert_eq!(line_marks("a\nb\nc\n", "a\nc\n"), [None, Some(Mark::RemovedAbove)]);
         assert_eq!(line_marks("a\nb\n", "a\n"), [Some(Mark::RemovedBelow)]);
         assert_eq!(line_marks("a\n", "a\nb\n"), [None, Some(Mark::Added)]);
+    }
+
+    #[test]
+    fn hunks_hold_the_lines_they_replaced() {
+        use super::{Hunk, line_hunks};
+        assert_eq!(line_hunks("a\nb\nc\nd\n", "a\nB\nc\nnew\n"), [Hunk { new: 1..2, old: 1..2 }, Hunk { new: 3..4, old: 3..4 }]);
+        let removed = line_hunks("a\nb\nc\n", "a\nc\n");
+        assert_eq!(removed, [Hunk { new: 1..1, old: 1..2 }]);
+        assert!(removed[0].marks(1, 2) && !removed[0].marks(0, 2));
+        let end = line_hunks("a\nb\n", "a\n");
+        assert_eq!(end, [Hunk { new: 1..1, old: 1..2 }]);
+        assert!(end[0].marks(0, 1));
+        assert_eq!(line_hunks("a\n", "a\nb\n"), [Hunk { new: 1..2, old: 1..1 }]);
     }
     #[test]
     fn file_info_blames_committed_and_uncommitted_lines() {

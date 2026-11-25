@@ -90,16 +90,49 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 /// What a checkbox does: unstage what is under Staged, stage what is under Unstaged.
 fn toggle_operation(entries: &[&git::Entry], staged: bool) -> Operation {
+    let mut seen = std::collections::HashSet::new();
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         for path in if staged { entry.paths() } else { entry.stage_paths() } {
-            if !paths.contains(&path) {
+            if seen.insert(path.clone()) {
                 paths.push(path);
             }
         }
     }
     if staged { Operation::Unstage(paths) } else { Operation::Stage(paths) }
 }
+
+/// The Changes page's sections: conflicts are settled in the editor first, then staged from Unstaged.
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Conflicts,
+    Staged,
+    Unstaged,
+}
+impl Section {
+    const ALL: [Section; 3] = [Section::Conflicts, Section::Staged, Section::Unstaged];
+    fn title(self) -> &'static str {
+        match self {
+            Section::Conflicts => "Conflicts",
+            Section::Staged => "Staged",
+            Section::Unstaged => "Unstaged",
+        }
+    }
+    fn holds(self, e: &git::Entry) -> bool {
+        match self {
+            Section::Conflicts => e.conflict(),
+            Section::Staged => e.staged(),
+            Section::Unstaged => e.unstaged() && !e.conflict(),
+        }
+    }
+    fn entries(self, snapshot: &git::Snapshot) -> Vec<&git::Entry> {
+        snapshot.entries.iter().filter(|e| self.holds(e)).collect()
+    }
+}
+
+/// Rows a section draws; an unignored build folder can put tens of thousands
+/// of files in one, and drawing them all stalls every frame.
+const MAX_ROWS: usize = 300;
 
 impl Workspace {
     /// The folder whose repository the Changes page shows.
@@ -149,6 +182,11 @@ impl Workspace {
                         // A save, checkout or build is a burst of events: let it
                         // settle a moment and refresh once for all of it.
                         cx.background_executor().timer(Duration::from_millis(150)).await;
+                        let Ok(cost) = this.update(cx, |s, _| s.git_refresh_cost) else { break };
+                        let wait = (cost * 2).min(Duration::from_secs(3));
+                        if wait > Duration::from_millis(50) {
+                            cx.background_executor().timer(wait).await;
+                        }
                         while changes.try_recv().is_ok() {}
                         if this.update(cx, |s, cx| s.refresh_git(cx)).is_err() {
                             break;
@@ -210,6 +248,7 @@ impl Workspace {
             TabKind::GitDiff(path, staged) => Some((path.clone(), *staged)),
             _ => None,
         };
+        let started = std::time::Instant::now();
         cx.spawn(async move |this, cx| {
             let (snapshots, diff) = cx
                 .background_executor()
@@ -220,9 +259,10 @@ impl Workspace {
                     }).collect();
                     let diff = selected.map(|(path, staged)| {
                         let found = snapshots.iter().filter_map(|(_, s)| s.as_ref().ok()).find_map(|s| {
+                            let relative = path.strip_prefix(&s.root).ok()?;
                             s.entries
                                 .iter()
-                                .find(|e| s.root.join(&e.path) == path && if staged { e.staged() } else { e.unstaged() })
+                                .find(|e| e.path == relative && if staged { e.staged() } else { e.unstaged() })
                                 .map(|e| (s, e))
                         });
                         let result = match found {
@@ -236,6 +276,7 @@ impl Workspace {
                 .await;
             let _ = this.update(cx, |s, cx| {
                 s.git_refreshing = false;
+                s.git_refresh_cost = started.elapsed();
                 if revision != s.git_revision {
                     s.refresh_git(cx);
                     return;
@@ -272,20 +313,22 @@ impl Workspace {
         };
         self.git_busy = true;
         self.git_running = Some(match &operation {
-            Operation::Commit(_) => GitRunning::Commit,
+            Operation::Commit(_) | Operation::Amend { .. } => GitRunning::Commit,
             Operation::Push => GitRunning::Push,
             Operation::UndoCommit => GitRunning::Undo,
             Operation::Stash { .. } | Operation::StashPop(_) | Operation::StashApply(_) | Operation::StashDrop(_) => GitRunning::Stash,
             _ => GitRunning::Other,
         });
         self.stash_drop_armed = None;
+        self.discard_armed = None;
         self.git_revision += 1;
         self.git_errors.remove(&folder);
         cx.notify();
         let committed = match &operation {
-            Operation::Commit(message) => Some(message.clone()),
+            Operation::Commit(message) | Operation::Amend { message, .. } => Some(message.clone()),
             _ => None,
         };
+        let amended = matches!(operation, Operation::Amend { .. });
         let undone = matches!(operation, Operation::UndoCommit)
             .then(|| self.git_snapshot().and_then(|s| s.last_commit.as_ref()).map(|c| c.message.clone()))
             .flatten();
@@ -300,6 +343,10 @@ impl Workspace {
                         s.git_errors.insert(folder, error);
                     }
                     Ok(()) => {
+                        if amended {
+                            s.amend = false;
+                            s.amend_drop.clear();
+                        }
                         s.clear_commit_message = committed;
                         s.restore_commit_message = undone;
                     }
@@ -436,6 +483,180 @@ impl Workspace {
         if std::mem::take(&mut self.commit_height_unsaved) {
             let _ = self.settings.save();
         }
+    }
+
+    /// While amending, the files the last commit changed, ticked to keep.
+    /// Unticked ones leave the commit on Amend; their changes stay uncommitted.
+    fn amend_section(&self, colors: Palette, snapshot: &git::Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        let last = snapshot.last_commit.as_ref().filter(|_| self.amend && !snapshot.pushed())?;
+        if last.files.is_empty() {
+            return None;
+        }
+        let enabled = !self.git_busy;
+        let kept = last.files.iter().filter(|f| !self.amend_drop.contains(&f.path)).count();
+        let all: Vec<PathBuf> = last.files.iter().map(|f| f.path.clone()).collect();
+        let (adds, dels) = last
+            .files
+            .iter()
+            .filter(|f| !self.amend_drop.contains(&f.path))
+            .filter_map(|f| f.stat)
+            .fold((0, 0), |(a, d), (x, y)| (a + x, d + y));
+        let mut section = col().child(
+            row()
+                .h(px(30.))
+                .px_3()
+                .gap_2()
+                .child(tick(colors, "amend-section-tick", kept == all.len(), enabled).when(enabled, |s| {
+                    s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(if kept == 0 { "Keep all" } else { "Take all out" }).build(w, cx))
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            if kept == 0 {
+                                s.amend_drop.clear();
+                            } else {
+                                s.amend_drop.extend(all.iter().cloned());
+                            }
+                            cx.notify();
+                        }))
+                }))
+                .child(div().text_size(px(crate::theme::scaled_ui(12.))).font_weight(FontWeight::MEDIUM).text_color(rgb(colors.muted)).child("In last commit"))
+                .child(count_badge(colors, kept))
+                .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border)))
+                .child(stat(colors, adds, dels)),
+        );
+        for (i, file) in last.files.iter().enumerate() {
+            let dropped = self.amend_drop.contains(&file.path);
+            let relative = file.path.to_string_lossy().into_owned();
+            let (name, dir) = split_path(&relative);
+            let path = file.path.clone();
+            let tip = if dropped { "Keep in the commit" } else { "Take out of the commit, keeping its changes" };
+            section = section.child(
+                row()
+                    .id(("amend-file", i))
+                    .h(px(26.))
+                    .mx_1()
+                    .px_2()
+                    .gap_2()
+                    .rounded(px(5.))
+                    .when(dropped, |s| s.opacity(0.6))
+                    .child(tick(colors, ("amend-tick", i), !dropped, enabled).when(enabled, |s| {
+                        s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(tip).build(w, cx))
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                if !s.amend_drop.remove(&path) {
+                                    s.amend_drop.insert(path.clone());
+                                }
+                                cx.notify();
+                            }))
+                    }))
+                    .child(
+                        line_with_detail(
+                            name.to_string(),
+                            (!dir.is_empty()).then(|| (SharedString::from(dir.to_string()), Hsla::from(rgb(colors.quiet)))),
+                            18.,
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(rgb(if dropped || file.status == b'D' { colors.muted } else { colors.text })),
+                    )
+                    .when_some(file.stat, |s, (adds, dels)| s.child(stat(colors, adds, dels)))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_shrink_0()
+                            .text_center()
+                            .font_family(mono())
+                            .text_size(px(crate::theme::scaled_mono(11.)))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(status_color(colors, file.status)))
+                            .child(char::from(file.status).to_string()),
+                    ),
+            );
+        }
+        Some(section)
+    }
+
+    /// Throws away a whole section's changes. The first click arms it; the
+    /// second discards.
+    fn discard_button(&self, id: impl Into<ElementId>, section: Section, cx: &mut Context<Self>) -> Button {
+        let staged = section == Section::Staged;
+        let armed = self.discard_armed == Some(staged);
+        let tip = match (armed, staged) {
+            (true, _) => "Click again to discard. Files Git never kept go to the Trash",
+            (false, false) => "Discard all unstaged changes",
+            (false, true) => "Discard all changes to these files, staged and unstaged",
+        };
+        Button::new(id)
+            .ghost()
+            .xsmall()
+            .map(|b| if armed { b.label("Discard?").danger() } else { b.icon(IconName::Undo2) })
+            .tooltip(tip)
+            .disabled(self.git_busy)
+            .on_click(cx.listener(move |s, _, window, cx| {
+                // Read on click, not every frame: a section can hold thousands.
+                let Some(snapshot) = s.git_snapshot() else { return };
+                let entries: Vec<git::Entry> = section.entries(snapshot).into_iter().cloned().collect();
+                // Files bound for the Trash get an alert, which is confirmation enough.
+                let trashes = entries.iter().any(|e| e.discard_trashes(staged));
+                if trashes || s.discard_armed == Some(staged) {
+                    s.discard_armed = None;
+                    s.confirm_discard(entries, staged, window, cx);
+                } else {
+                    s.discard_armed = Some(staged);
+                    cx.notify();
+                }
+            }))
+    }
+
+    /// Discards, first asking with an alert when files would go to the Trash.
+    fn confirm_discard(&mut self, entries: Vec<git::Entry>, staged: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let trashed: Vec<&git::Entry> = entries.iter().filter(|e| e.discard_trashes(staged)).collect();
+        if trashed.is_empty() {
+            self.git_operation(Operation::Discard { entries, staged }, cx);
+            return;
+        }
+        let message = match trashed.as_slice() {
+            [one] => format!("Move “{}” to the Trash?", one.path.file_name().map_or_else(|| one.path.to_string_lossy(), |n| n.to_string_lossy())),
+            many => format!("Move {} files to the Trash?", many.len()),
+        };
+        let others = entries.len() - trashed.len();
+        let detail = match (trashed.len(), others) {
+            (1, 0) => "Git has no copy of this file. You can get it back from the Trash.".to_string(),
+            (_, 0) => "Git has no copy of these files. You can get them back from the Trash.".to_string(),
+            (_, n) => format!("Git has no copy of them. You can get them back from the Trash. Changes to {n} other file{} are discarded too.", if n == 1 { "" } else { "s" }),
+        };
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &["Move to Trash", "Cancel"], cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update(cx, |s, cx| s.git_operation(Operation::Discard { entries, staged }, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// A changed file's right-click menu: the diff menu, and Discard changes,
+    /// which asks before throwing anything away.
+    fn change_menu(&mut self, path: PathBuf, entry: git::Entry, staged: bool, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let extra: crate::menu::Builder = std::rc::Rc::new(move |cx: &App| {
+            let busy = weak.upgrade().is_none_or(|w| w.read(cx).git_busy);
+            // Files bound for the Trash are confirmed with an alert; others take a second click.
+            let ask = entry.discard_trashes(staged) || armed.get();
+            let item = crate::menu::Item::new(if armed.get() { "Click again to discard" } else { "Discard changes" })
+                .icon(IconName::Undo2)
+                .disabled(busy);
+            let item = if ask {
+                let weak = weak.clone();
+                let entry = entry.clone();
+                item.on_click(move |window, cx| {
+                    let _ = weak.update(cx, |s, cx| s.confirm_discard(vec![entry.clone()], staged, window, cx));
+                })
+            } else {
+                // Stays open, asking again.
+                let armed = armed.clone();
+                item.keep_open().on_click(move |_, _| armed.set(true))
+            };
+            vec![crate::menu::Entry::Item(item)]
+        });
+        self.diff_menu_with(path, position, Some(extra), window, cx);
     }
 
     /// Puts changes aside: all of them, untracked files included, or only what is staged.
@@ -615,25 +836,20 @@ impl Workspace {
             page = page.child(div().px_3().py_2().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.red)).child(error.clone()));
         }
 
-        // Conflicts are settled in the editor first, then staged from Unstaged.
-        let sections: [(&str, bool, Vec<&git::Entry>); 3] = [
-            ("Conflicts", false, visible.iter().copied().filter(|e| e.conflict()).collect()),
-            ("Staged", true, visible.iter().copied().filter(|e| e.staged()).collect()),
-            ("Unstaged", false, visible.iter().copied().filter(|e| e.unstaged() && !e.conflict()).collect()),
-        ];
+        let sections = Section::ALL.map(|section| (section, section.entries(snapshot)));
         let open = match &self.tabs[self.active].kind {
             TabKind::GitDiff(path, staged) => Some((path.clone(), *staged)),
             _ => None,
         };
         let mut list = col().pb_2();
-        for (n, (title, staged, entries)) in sections.iter().enumerate() {
-            let (title, staged) = (*title, *staged);
+        list = list.children(self.amend_section(colors, snapshot, cx));
+        for (n, (section, entries)) in sections.iter().enumerate() {
+            let (section, title, staged) = (*section, section.title(), *section == Section::Staged);
             if entries.is_empty() {
                 continue;
             }
-            let conflicts = title == "Conflicts";
+            let conflicts = section == Section::Conflicts;
             let can_toggle = !self.git_busy && !conflicts;
-            let operation = toggle_operation(entries, staged);
             let group_tip = if staged { "Unstage all" } else { "Stage all" };
             let (adds, dels) = entries.iter().filter_map(|e| e.stat(staged)).fold((0, 0), |(a, d), (x, y)| (a + x, d + y));
             list = list.child(
@@ -645,15 +861,22 @@ impl Workspace {
                         tick(colors, ("section-tick", n), staged, can_toggle)
                             .when(can_toggle, |s| {
                                 s.tooltip(move |w, cx| gpui_component::tooltip::Tooltip::new(group_tip).build(w, cx))
-                                    .on_click(cx.listener(move |s, _, _, cx| s.git_operation(operation.clone(), cx)))
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        let Some(snapshot) = s.git_snapshot() else { return };
+                                        let operation = toggle_operation(&section.entries(snapshot), staged);
+                                        s.git_operation(operation, cx)
+                                    }))
                             }),
                     )
                     .child(div().text_size(px(crate::theme::scaled_ui(12.))).font_weight(FontWeight::MEDIUM).text_color(rgb(if conflicts { colors.red } else { colors.muted })).child(title))
                     .child(count_badge(colors, entries.len()))
                     .child(div().flex_1().h(px(1.)).bg(rgb(colors.row_border)))
-                    .when(!conflicts, |s| s.child(stat(colors, adds, dels))),
+                    .when(!conflicts, |s| {
+                        s.child(stat(colors, adds, dels))
+                            .child(self.discard_button(("discard-section", n), section, cx))
+                    }),
             );
-            for (i, entry) in entries.iter().enumerate() {
+            for (i, entry) in entries.iter().take(MAX_ROWS).enumerate() {
                 let path = snapshot.root.join(&entry.path);
                 let status = entry.status(staged);
                 let hue = status_color(colors, status);
@@ -709,9 +932,23 @@ impl Workspace {
                         )
                         .on_mouse_down(MouseButton::Right, {
                             let path = path.clone();
-                            cx.listener(move |s, e: &MouseDownEvent, window, cx| s.diff_menu(path.clone(), e.position, window, cx))
+                            // Conflicts are settled in the editor, not thrown away from here.
+                            let entry = (!conflicts).then(|| (*entry).clone());
+                            cx.listener(move |s, e: &MouseDownEvent, window, cx| match &entry {
+                                Some(entry) => s.change_menu(path.clone(), entry.clone(), staged, e.position, window, cx),
+                                None => s.diff_menu(path.clone(), e.position, window, cx),
+                            })
                         })
                         .on_click(cx.listener(move |s, _, _, cx| s.open(TabKind::GitDiff(path.clone(), staged), cx))),
+                );
+            }
+            if entries.len() > MAX_ROWS {
+                let more = entries.len() - MAX_ROWS;
+                list = list.child(
+                    label(colors, format!("{more} more file{} not shown", if more == 1 { "" } else { "s" }))
+                        .px_3()
+                        .py_1()
+                        .text_size(px(crate::theme::scaled_ui(11.))),
                 );
             }
         }
@@ -736,10 +973,25 @@ impl Workspace {
         let staged = snapshot.entries.iter().filter(|e| e.staged()).count();
         let message = !self.commit_message.read(cx).value().trim().is_empty();
         let conflicted = snapshot.entries.iter().any(|e| e.conflict());
-        // Only what is staged is committed; nothing is staged on the way.
-        let can_commit = !self.git_busy && message && !conflicted && staged > 0;
+        // A pushed commit is left alone, as with undo: amending it would need a force push.
+        let can_amend = snapshot.last_commit.is_some() && !snapshot.pushed();
+        let amending = self.amend && can_amend;
+        // Only what is staged is committed; nothing is staged on the way. An
+        // amend may only reword the message.
+        let can_commit = !self.git_busy && message && !conflicted && (staged > 0 || amending);
         let commit_tip: SharedString = if conflicted {
             "Resolve conflicts before committing".into()
+        } else if amending && !message {
+            "Enter a commit message".into()
+        } else if amending {
+            let plural = |n: usize| if n == 1 { "" } else { "s" };
+            let dropped = snapshot.last_commit.as_ref().map_or(0, |c| c.files.iter().filter(|f| self.amend_drop.contains(&f.path)).count());
+            match (staged, dropped) {
+                (0, 0) => "Reword the last commit".into(),
+                (n, 0) => format!("Add {n} staged file{} to the last commit", plural(n)).into(),
+                (0, d) => format!("Take {d} file{} out of the last commit", plural(d)).into(),
+                (n, d) => format!("Add {n} staged file{} and take {d} out of the last commit", plural(n)).into(),
+            }
         } else if staged == 0 {
             "Nothing staged. Tick the files to commit".into()
         } else if !message {
@@ -826,11 +1078,29 @@ impl Workspace {
                     .h(px(40.))
                     .px(px(10.))
                     .gap(px(8.))
-                    .child(
-                        bar_button(colors, "push", Some(IconName::ArrowUp), push_label, pushable)
-                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(push_tip.clone()).build(window, cx))
-                            .when(pushable, |s| s.on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::Push, cx)))),
-                    )
+                    // While amending, Push gives way to Amend and Commit to Cancel.
+                    .map(|s| if amending {
+                        let tip = commit_tip.clone();
+                        s.child(
+                            bar_button(colors, "amend", Some(IconName::Check), if running == Some(GitRunning::Commit) { "Amending…" } else { "Amend" }, can_commit)
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx))
+                                .when(can_commit, |s| {
+                                    s.on_click(cx.listener(|s, _, _, cx| {
+                                        let message = s.commit_message.read(cx).value().to_string();
+                                        // Only files still in the commit can be taken out of it.
+                                        let files = s.git_snapshot().and_then(|s| s.last_commit.as_ref()).map(|c| c.files.clone()).unwrap_or_default();
+                                        let drop = files.into_iter().map(|f| f.path).filter(|p| s.amend_drop.contains(p)).collect();
+                                        s.git_operation(Operation::Amend { message, drop }, cx);
+                                    }))
+                                }),
+                        )
+                    } else {
+                        s.child(
+                            bar_button(colors, "push", Some(IconName::ArrowUp), push_label, pushable)
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(push_tip.clone()).build(window, cx))
+                                .when(pushable, |s| s.on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::Push, cx)))),
+                        )
+                    })
                     .child(
                         row()
                             .flex_1()
@@ -840,22 +1110,33 @@ impl Workspace {
                                 s.child(label(colors, format!("{staged} file{} staged", if staged == 1 { "" } else { "s" })).truncate())
                             }),
                     )
-                    .child(
-                        bar_button(
-                            colors,
-                            "commit",
-                            None,
-                            if running == Some(GitRunning::Commit) { "Committing…" } else { "Commit" },
-                            can_commit,
+                    .map(|s| if amending {
+                        let last = snapshot.last_commit.as_ref().map(|c| c.message.clone()).unwrap_or_default();
+                        s.child(
+                            bar_button(colors, "amend-cancel", None, "Cancel", !self.git_busy)
+                                .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Stop amending").build(window, cx))
+                                .when(!self.git_busy, |s| {
+                                    s.on_click(cx.listener(move |s, _, _, cx| {
+                                        s.amend = false;
+                                        s.amend_drop.clear();
+                                        // The last commit's message goes again if it wasn't touched.
+                                        s.clear_commit_message = Some(last.clone());
+                                        cx.notify();
+                                    }))
+                                }),
                         )
-                        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(commit_tip.clone()).build(window, cx))
-                        .when(can_commit, |s| {
-                            s.on_click(cx.listener(|s, _, _, cx| {
-                                let message = s.commit_message.read(cx).value().to_string();
-                                s.git_operation(Operation::Commit(message), cx);
-                            }))
-                        }),
-                    ),
+                    } else {
+                        s.child(
+                            bar_button(colors, "commit", None, if running == Some(GitRunning::Commit) { "Committing…" } else { "Commit" }, can_commit)
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(commit_tip.clone()).build(window, cx))
+                                .when(can_commit, |s| {
+                                    s.on_click(cx.listener(|s, _, _, cx| {
+                                        let message = s.commit_message.read(cx).value().to_string();
+                                        s.git_operation(Operation::Commit(message), cx);
+                                    }))
+                                }),
+                        )
+                    })
             );
         // The last commit, with a way to take it back while it is still local.
         let footer = last.map(|last| {
@@ -884,12 +1165,36 @@ impl Workspace {
                         }),
                 )
                 .child(
+                    Button::new("amend-commit")
+                        .icon(Glyph::Pencil)
+                        .ghost()
+                        .small()
+                        .disabled(self.git_busy || !can_amend || amending)
+                        .tooltip(if !can_amend {
+                            "Already pushed, so it can't be amended here"
+                        } else if amending {
+                            "Amending: edit the message, then Amend"
+                        } else {
+                            "Amend last commit: reword it, or add what is staged"
+                        })
+                        .on_click({
+                            let message = last.message.clone();
+                            cx.listener(move |s, _, _, cx| {
+                                s.amend = true;
+                                s.amend_drop.clear();
+                                // Its message comes up to edit, unless one is being written.
+                                s.restore_commit_message = Some(message.clone());
+                                cx.notify();
+                            })
+                        }),
+                )
+                .child(
                     Button::new("undo-commit")
                         .icon(IconName::Undo2)
                         .ghost()
                         .small()
                         .loading(running == Some(GitRunning::Undo))
-                        .disabled(!undoable)
+                        .disabled(!undoable || amending)
                         .tooltip(if pushed { "Already pushed, so it can't be undone here" } else { "Undo last commit, keeping its changes staged" })
                         .on_click(cx.listener(|s, _, _, cx| s.git_operation(Operation::UndoCommit, cx))),
                 )

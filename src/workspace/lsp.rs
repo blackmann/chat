@@ -991,7 +991,8 @@ impl Workspace {
                 let state = s.0.borrow();
                 let item = state.last_item_size.map_or(px(20.), |i| i.item.height).max(px(1.));
                 let handle = &state.base_handle;
-                ((-handle.offset().y + handle.bounds().size.height / 2.) / item).max(0.) as usize
+                let index = ((-handle.offset().y + handle.bounds().size.height / 2.) / item).max(0.) as usize;
+                self.file_line_at(path, index)
             }),
             _ => None,
         };

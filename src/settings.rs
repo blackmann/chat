@@ -3,7 +3,7 @@
 //! agent uses whatever sign-in its own CLI already holds.
 pub use crate::agent::AgentSpec;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 /// What sending another message does while the agent is still working.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +110,18 @@ pub struct Settings {
     /// Language servers beside or instead of the defaults, matched by name.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub language_servers: Vec<crate::lsp::ServerSpec>,
+    /// The model and effort last picked in each project, by agent name, that
+    /// new threads there start on. Chats are under the empty path.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_picks: BTreeMap<PathBuf, BTreeMap<String, Picks>>,
+    /// What an agent that saves a pick as its own default (Codex does) started
+    /// on before any pick, by agent name, so projects with no picks keep it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub base_picks: BTreeMap<String, Picks>,
 }
+
+/// Setting choices as (id, value).
+pub type Picks = Vec<(String, String)>;
 
 /// The commit box can't be dragged shorter than this.
 pub const COMMIT_BOX_MIN: f32 = 96.;

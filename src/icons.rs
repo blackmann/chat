@@ -23,6 +23,9 @@ pub enum Glyph {
     CircleDashed,
     CircleDot,
     Pin,
+    Link,
+    /// A commit, for links pinned to one.
+    Commit,
     Pencil,
     Plug,
     Brain,
@@ -60,7 +63,7 @@ const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 44] = [
+    pub const ALL: [Glyph; 46] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -78,6 +81,8 @@ impl Glyph {
         Self::CircleDashed,
         Self::CircleDot,
         Self::Pin,
+        Self::Link,
+        Self::Commit,
         Self::Pencil,
         Self::Plug,
         Self::Brain,
@@ -125,6 +130,8 @@ impl Glyph {
             Self::CircleDashed => "circle-dashed.svg",
             Self::CircleDot => "circle-dot.svg",
             Self::Pin => "pin.svg",
+            Self::Link => "link.svg",
+            Self::Commit => "git-commit.svg",
             Self::Pencil => "pencil.svg",
             Self::Plug => "plug.svg",
             Self::Brain => "brain.svg",
@@ -200,6 +207,10 @@ fn svg(file: &str) -> Option<&'static str> {
             r#"<path d="M10.1 2.182a10 10 0 0 1 3.8 0"/><path d="M13.9 21.818a10 10 0 0 1-3.8 0"/><path d="M17.609 3.721a10 10 0 0 1 2.69 2.7"/><path d="M2.182 13.9a10 10 0 0 1 0-3.8"/><path d="M20.279 17.609a10 10 0 0 1-2.7 2.69"/><path d="M21.818 10.1a10 10 0 0 1 0 3.8"/><path d="M3.721 6.391a10 10 0 0 1 2.7-2.69"/><path d="M6.391 20.279a10 10 0 0 1-2.69-2.7"/>"#
         }
         "circle-dot.svg" => r#"<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="1"/>"#,
+        "link.svg" => {
+            r#"<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>"#
+        }
+        "git-commit.svg" => r#"<circle cx="12" cy="12" r="3"/><path d="M3 12h6"/><path d="M15 12h6"/>"#,
         "pin.svg" => {
             r#"<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>"#
         }
