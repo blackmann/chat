@@ -234,6 +234,15 @@ impl Workspace {
                     let _ = add.update(cx, |s, cx| s.add_folders(index, window, cx));
                 }),
             ));
+            if project.path.is_some() {
+                let remove = weak.clone();
+                entries.push(crate::menu::Entry::Separator);
+                entries.push(crate::menu::Entry::Item(
+                    crate::menu::Item::new("Remove project…").icon(IconName::Delete).on_click(move |window, cx| {
+                        let _ = remove.update(cx, |s, cx| s.confirm_remove_project(index, window, cx));
+                    }),
+                ));
+            }
             entries
         });
         self.open_popover("project-menu", position, Corner::TopLeft, 200., None, build, window, cx);

@@ -1,4 +1,5 @@
 mod agent;
+mod copy;
 mod editors;
 mod icons;
 mod git;

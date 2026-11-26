@@ -218,10 +218,13 @@ pub struct Missions {
     idle_turns: u32,
 }
 
-/// Turns that end, at least, between one mission and the next being offered.
+/// Turns that end, at least, between the mailbox emptying and a new mission.
 const MIN_IDLE_TURNS: u32 = 2;
-/// After that, the chance a turn ending brings a mission, in 1/N.
-const OFFER_ODDS: u64 = 3;
+/// Turns between missions on average. From the minimum on, each turn has the
+/// same chance of bringing one, so when isn't predictable.
+const MEAN_IDLE_TURNS: u32 = 6;
+/// That chance, in 1/N: N - 1 misses on average after the minimum.
+const OFFER_ODDS: u64 = (MEAN_IDLE_TURNS - MIN_IDLE_TURNS + 1) as u64;
 
 impl Missions {
     /// From what was saved, newest first.
@@ -408,16 +411,21 @@ mod tests {
     }
 
     #[test]
-    fn offers_now_and_then_when_the_mailbox_is_empty() {
+    fn offers_every_six_turns_or_so_never_before_two() {
         let mut ms = Missions::default();
-        let offered = (0..200).filter(|t| {
-            let got = ms.turn_ended(*t * 7919);
-            if got {
+        let mut gaps = Vec::new();
+        let mut since = 0;
+        for t in 0..20_000i64 {
+            since += 1;
+            if ms.turn_ended(t * 7919 + 13) {
+                gaps.push(since);
+                since = 0;
                 ms.active = None;
             }
-            got
-        });
-        let n = offered.count();
-        assert!(n > 10 && n < 100, "{n}");
+        }
+        assert!(gaps.iter().all(|g| *g >= MIN_IDLE_TURNS), "never sooner than the minimum");
+        let mean = gaps.iter().sum::<u32>() as f64 / gaps.len() as f64;
+        assert!((5.5..6.5).contains(&mean), "{mean}");
+        assert!(gaps.iter().any(|g| *g == MIN_IDLE_TURNS) && gaps.iter().any(|g| *g > 12), "spread out, not fixed");
     }
 }

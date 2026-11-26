@@ -321,10 +321,19 @@ impl Workspace {
                 }
             }
         }
+        // Where dragged files would land: that folder and all shown inside it
+        // light up. The whole page, when it's the project's only folder.
+        let single = match roots.as_slice() {
+            [root] => Some(root.clone()),
+            _ => None,
+        };
+        let landing = self.file_drop.as_ref().filter(|_| cx.has_active_drag()).map(|d| d.target.clone());
+        let whole = landing.is_some() && landing == single;
         let mut list = col().py_1();
         for (i, (depth, entry)) in rows.into_iter().enumerate() {
             let expanded = self.expanded.contains(&entry.path);
             let active = open.as_ref() == Some(&entry.path);
+            let lit = !whole && landing.as_ref().is_some_and(|d| entry.path.starts_with(d));
             let status = if entry.dir { inside(&entry.path) } else { changed.get(&entry.path).copied() };
             let mark = status.map(|s| change_mark(colors, s));
             let (path, dir) = (entry.path.clone(), entry.dir);
@@ -343,7 +352,9 @@ impl Workspace {
                     .rounded(px(5.))
                     .cursor_pointer()
                     .when(active, |s| s.bg(rgb(colors.selected)))
-                    .when(!active, |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                    .when(!active && landing.is_none(), |s| s.hover(|s| s.bg(rgb(colors.hover))))
+                    // Lit rows join up into one block.
+                    .when(lit && !active, |s| s.bg(rgb(colors.blue_tint)).rounded_none())
                     // What git ignores fades back, unless it's the file open.
                     .when(entry.ignored && !active, |s| s.opacity(0.45))
                     .child(if dir {
@@ -382,6 +393,17 @@ impl Workspace {
                         let path = path.clone();
                         cx.listener(move |s, e: &MouseDownEvent, window, cx| s.file_menu(path.clone(), dir, e.position, window, cx))
                     })
+                    // Dragged over a folder, files go in; over a file, beside it.
+                    .on_drag_move::<ExternalPaths>({
+                        let probe = self.file_drop_probe.clone();
+                        let into = if dir { path.clone() } else { path.parent().map(Path::to_path_buf).unwrap_or_default() };
+                        let over = dir.then(|| path.clone());
+                        move |e, _, _| {
+                            if e.bounds.contains(&e.event.position) {
+                                *probe.borrow_mut() = Some((into.clone(), over.clone()));
+                            }
+                        }
+                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         if dir {
                             s.toggle_folder(&path, cx)
@@ -391,7 +413,26 @@ impl Workspace {
                     })),
             );
         }
-        list
+        // The page hears a drag move before its rows: off the rows means the
+        // project's folder, when it has just one, and off the page nowhere. The
+        // rows say more, then it's all taken up at once.
+        let probe = self.file_drop_probe.clone();
+        let weak = cx.weak_entity();
+        list.min_h_full()
+            .when(whole, |s| s.bg(rgb(colors.blue_tint)))
+            .on_drag_move::<ExternalPaths>(move |e, _, cx| {
+                *probe.borrow_mut() = single.clone().filter(|_| e.bounds.contains(&e.event.position)).map(|root| (root, None));
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |s, cx| s.take_file_drop_probe(cx));
+                });
+            })
+            .on_drop(cx.listener(|s, paths: &ExternalPaths, window, cx| {
+                if let Some(drop) = s.file_drop.take() {
+                    s.drop_files(paths.paths().to_vec(), drop.target, window, cx);
+                }
+                cx.notify();
+            }))
     }
 
     pub(super) fn side_view(&self, cx: &mut Context<Self>) -> AnyElement {

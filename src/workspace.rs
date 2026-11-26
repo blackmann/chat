@@ -146,6 +146,17 @@ struct ProjectView {
     git_repo: Option<PathBuf>,
 }
 
+/// Files dragged over the Files page: the folder they'd land in, and the
+/// folder row under the pointer, which opens if they rest on it.
+#[derive(Clone, PartialEq)]
+struct FileDrop {
+    target: PathBuf,
+    over: Option<PathBuf>,
+}
+
+/// How long dragged files rest on a closed folder before it opens.
+const SPRING_DELAY: Duration = Duration::from_millis(600);
+
 /// Shells by the folder each started in, or why one couldn't start.
 type Terminals = HashMap<PathBuf, Result<Entity<terminal::TerminalView>, SharedString>>;
 
@@ -390,6 +401,11 @@ pub struct Workspace {
     /// While a project is dragged along the rail: which one, and the gap it
     /// would drop into, counted as the index of the project below that gap.
     drop_slot: Option<(usize, usize)>,
+    /// Where files dragged from Finder over the Files page would land.
+    file_drop: Option<FileDrop>,
+    /// What the rows under the pointer said on the last drag move, before it's
+    /// taken up: the folder it would land in, and the folder row under it.
+    file_drop_probe: Rc<RefCell<Option<(PathBuf, Option<PathBuf>)>>>,
     /// The usage limits each agent (by index) last reported, by window. They
     /// belong to the account, so any of the agent's threads updates them.
     limits: HashMap<usize, HashMap<String, agent::RateLimit>>,
@@ -587,6 +603,8 @@ impl Workspace {
             mention_dismissed: false,
             sideways: Rc::default(),
             drop_slot: None,
+            file_drop: None,
+            file_drop_probe: Rc::default(),
             limits: HashMap::new(),
             commit_height_unsaved: false,
             window_active: window.is_window_active(),
@@ -925,6 +943,57 @@ impl Workspace {
         }
         self.save_projects();
         self.refresh_git(cx);
+        cx.notify();
+    }
+    /// Ask before taking a project off the rail.
+    fn confirm_remove_project(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.get(index).filter(|p| p.path.is_some()) else {
+            return;
+        };
+        let message = format!("Remove “{}”?", project.name);
+        let detail = "Its folders stay on disk, and its threads are kept: add the folder again to get them back. Agents and terminals running in it are stopped.";
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(detail), &["Remove", "Cancel"], cx);
+        cx.spawn(async move |this, cx| {
+            if answer.await == Ok(0) {
+                let _ = this.update(cx, |s, cx| s.remove_project(index, cx));
+            }
+        })
+        .detach();
+    }
+    /// Take a project off the rail. Its threads stay in the store, so adding
+    /// the folder back brings them back. Chats can't be removed.
+    fn remove_project(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index == 0 || self.projects.get(index).is_none_or(|p| p.path.is_none()) {
+            return;
+        }
+        // Everything it has goes to disk before it goes.
+        self.save_now();
+        if self.project == index {
+            self.select_project(index - 1, cx);
+        }
+        let project = self.projects.remove(index);
+        let ids: HashSet<usize> = project.threads.iter().map(|t| t.id).collect();
+        // Dropping the sessions and the view stops its agents and shells.
+        drop(project);
+        self.live.retain(|id| !ids.contains(id));
+        self.drafts.retain(|id, _| !ids.contains(id));
+        self.git_picks.retain(|(thread, _), _| thread.is_none_or(|t| !ids.contains(&t)));
+        self.views.remove(&index);
+        self.project_inputs.remove(&index);
+        // Everything kept by project index after it moves up one.
+        let shift = |i: usize| if i > index { i - 1 } else { i };
+        self.project = shift(self.project);
+        self.renaming = self.renaming.filter(|&i| i != index).map(shift);
+        self.drop_slot = None;
+        self.views = std::mem::take(&mut self.views).into_iter().map(|(k, v)| (shift(k), v)).collect();
+        self.project_inputs = std::mem::take(&mut self.project_inputs).into_iter().map(|(k, v)| (shift(k), v)).collect();
+        if self.thread_hits.as_ref().is_some_and(|r| r.project >= index) {
+            self.thread_hits = None;
+        }
+        if self.thread_searching.as_ref().is_some_and(|(p, _, _)| *p >= index) {
+            self.thread_searching = None;
+        }
+        self.save_projects();
         cx.notify();
     }
     /// Move a project to another place on the rail. Chats stay first.
@@ -1772,6 +1841,67 @@ impl Workspace {
             self.listings.insert(path.to_path_buf(), list(path, ignored));
         }
         cx.notify();
+    }
+
+    /// Take up what the rows said about the drag's last move. A closed
+    /// folder rested on opens after a moment, as in Finder.
+    pub(super) fn take_file_drop_probe(&mut self, cx: &mut Context<Self>) {
+        let next = self.file_drop_probe.borrow_mut().take().map(|(target, over)| FileDrop { target, over });
+        if next == self.file_drop {
+            return;
+        }
+        let over = next.as_ref().and_then(|d| d.over.clone()).filter(|f| !self.expanded.contains(f));
+        let changed = self.file_drop.as_ref().and_then(|d| d.over.as_ref()) != next.as_ref().and_then(|d| d.over.as_ref());
+        self.file_drop = next;
+        if let Some(folder) = over.filter(|_| changed) {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SPRING_DELAY).await;
+                let _ = this.update(cx, |s, cx| {
+                    let resting = s.file_drop.as_ref().is_some_and(|d| d.over.as_ref() == Some(&folder));
+                    if resting && cx.has_active_drag() && !s.expanded.contains(&folder) {
+                        s.toggle_folder(&folder, cx);
+                    }
+                });
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Copy what was dropped from Finder into `dir`, off the main thread, then
+    /// show it: the folder opens and the listings are read again.
+    pub(super) fn drop_files(&mut self, paths: Vec<PathBuf>, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if paths.is_empty() || !dir.is_dir() {
+            return;
+        }
+        let point = window.mouse_position();
+        cx.spawn(async move |this, cx| {
+            let copied = cx
+                .background_executor()
+                .spawn({
+                    let dir = dir.clone();
+                    async move { paths.iter().map(|p| crate::copy::copy_into(p, &dir)).collect::<Vec<_>>() }
+                })
+                .await;
+            let _ = this.update(cx, |s, cx| {
+                let roots = s.current_project().roots();
+                // Open the folder and those above it, so what landed shows.
+                for folder in dir.ancestors().take_while(|d| roots.iter().any(|r| d.starts_with(r))) {
+                    if !roots.contains(&folder.to_path_buf()) || roots.len() > 1 {
+                        s.expanded.insert(folder.to_path_buf());
+                    }
+                }
+                s.refresh_listings(cx);
+                let failed: Vec<String> = copied.into_iter().filter_map(Result::err).map(|e| e.to_string()).collect();
+                match failed.as_slice() {
+                    [] => {}
+                    [one] => s.notice(format!("Couldn't copy: {one}"), point, cx),
+                    many => s.notice(format!("Couldn't copy {} items: {}", many.len(), many[0]), point, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Read the Files page's showing folders again: the project's roots and the

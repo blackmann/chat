@@ -1373,3 +1373,57 @@ fn plays_a_pin_mission_from_the_status_bar(cx: &mut TestAppContext) {
     assert!(d.cx.update(|_, cx| ws.update(cx, |s, cx| s.mission_button(cx).is_none())));
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// Files dragged from Finder over the Files page: a folder row is where they'd
+/// land, a file row means its folder, the rest of the page the project, and a
+/// closed folder rested on opens.
+#[gpui::test]
+fn drags_files_into_folders(cx: &mut TestAppContext) {
+    use gpui::{ExternalPaths, FileDropEvent};
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.act(|s, cx| {
+        s.side = super::Side::Files;
+        s.side_open = true;
+        cx.notify();
+    });
+    let row = |d: &mut Driver, name: &str| {
+        let key: &'static str = Box::leak(format!("file-row:{name}").into_boxed_str());
+        d.cx.debug_bounds(key).unwrap_or_else(|| panic!("{name} isn't drawn")).center()
+    };
+    let landing = |d: &mut Driver| d.read(|s| s.file_drop.as_ref().map(|f| f.target.clone()));
+    let src = project.join("src");
+
+    let at = row(&mut d, "src");
+    d.cx.simulate_event(FileDropEvent::Entered { position: at, paths: ExternalPaths::default() });
+    d.cx.simulate_event(FileDropEvent::Pending { position: at });
+    d.settle();
+    assert_eq!(landing(&mut d), Some(src.clone()), "over a folder: into it");
+    assert!(d.read(|s| !s.expanded.contains(&project.join("src"))), "not open yet");
+    d.cx.executor().advance_clock(super::SPRING_DELAY + Duration::from_millis(50));
+    d.settle();
+    assert!(d.read(|s| s.expanded.contains(&project.join("src"))), "rested on, it opens");
+
+    let at = row(&mut d, "util.rs");
+    d.cx.simulate_event(FileDropEvent::Pending { position: at });
+    d.settle();
+    assert_eq!(landing(&mut d), Some(src.clone()), "over a file: beside it");
+
+    let at = row(&mut d, "notes.go");
+    d.cx.simulate_event(FileDropEvent::Pending { position: at });
+    d.settle();
+    assert_eq!(landing(&mut d), Some(project.clone()), "a file at the top: the project");
+
+    // Off the Files page altogether: nowhere.
+    d.cx.simulate_event(FileDropEvent::Pending { position: point(px(20.), px(300.)) });
+    d.settle();
+    assert_eq!(landing(&mut d), None);
+
+    let at = row(&mut d, "main.rs");
+    d.cx.simulate_event(FileDropEvent::Pending { position: at });
+    d.cx.simulate_event(FileDropEvent::Submit { position: at });
+    d.settle();
+    assert!(d.read(|s| s.file_drop.is_none()), "taken up by the drop");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
