@@ -1,0 +1,4 @@
+module ChatBridge {
+    header "chat_bridge.h"
+    export *
+}

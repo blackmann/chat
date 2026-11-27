@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chat Mobile — design</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #fcfcfc; --chrome: #f3f3f4; --panel: #f6f6f7; --border: #e0e0e3; --row: #ededef;
+    --text: #2c2d31; --muted: #76787f; --quiet: #a2a4aa;
+    --blue: #2f6fde; --green: #3b7d3e; --amber: #a86a00; --orange: #d9620f; --red: #c2414b;
+    --selected: #e2e8f1; --blue-tint: #e7effc; --green-tint: #e8f3e9; --amber-tint: #fbf3e3; --red-tint: #fbe9ea;
+    --popover: #f5f5f6; --popover-border: #d8d8dc; --primary-text: #fff;
+    --l0: #2f6fde; --l1: #8a3fc7; --l2: #3b8a3e; --l3: #b07800; --l4: #c2414b; --l5: #1f8a99;
+    --stage: #e9e9ee; --frame: #1c1c1f;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  body.dark {
+    --bg: #24272d; --chrome: #2b2e35; --panel: #2f333a; --border: #3a3e47; --row: #31353c;
+    --text: #dcdfe4; --muted: #959ba6; --quiet: #6c727d;
+    --blue: #74ade8; --green: #98c379; --amber: #e5c07b; --orange: #f0883e; --red: #e06c75;
+    --selected: #2f3d52; --blue-tint: #2a3647; --green-tint: #2c3a2e; --amber-tint: #3b3427; --red-tint: #3e2b2f;
+    --popover: #2e3138; --popover-border: #434852; --primary-text: #1e2127;
+    --l0: #74ade8; --l1: #c678dd; --l2: #98c379; --l3: #e5c07b; --l4: #e06c75; --l5: #56b6c2;
+    --stage: #17181b; --frame: #000;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--stage); color: var(--text);
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  header.page { display: flex; align-items: center; gap: 16px; padding: 28px 40px 8px; }
+  header.page h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  header.page p { margin: 0; color: var(--muted); font-size: 13px; }
+  .toggle { margin-left: auto; border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    border-radius: 8px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  .stage { display: flex; flex-wrap: wrap; gap: 40px 36px; padding: 24px 40px 60px; align-items: flex-start; }
+  figure { margin: 0; display: flex; flex-direction: column; gap: 12px; }
+  figcaption { font-size: 13px; color: var(--muted); max-width: 300px; }
+  figcaption b { color: var(--text); font-weight: 600; display: block; margin-bottom: 2px; }
+
+  /* Phone */
+  .phone { width: 300px; height: 630px; border-radius: 46px; background: var(--frame); padding: 9px;
+    box-shadow: 0 20px 50px rgba(0,0,0,.18); }
+  .screen { position: relative; width: 100%; height: 100%; border-radius: 38px; overflow: hidden; background: var(--bg);
+    display: flex; flex-direction: column; }
+  .status { height: 44px; flex: none; display: flex; align-items: center; justify-content: space-between; padding: 6px 26px 0;
+    font-size: 13px; font-weight: 600; }
+  .status .island { width: 88px; height: 26px; background: #000; border-radius: 14px; }
+  .status .sys { display: flex; gap: 5px; align-items: center; }
+  .bars { display: flex; gap: 1.5px; align-items: flex-end; height: 10px; }
+  .bars i { width: 3px; background: var(--text); border-radius: 1px; }
+  .batt { width: 22px; height: 11px; border: 1.5px solid var(--text); border-radius: 3px; padding: 1px; opacity: .9; }
+  .batt i { display: block; height: 100%; width: 70%; background: var(--text); border-radius: 1px; }
+  .home-ind { position: absolute; bottom: 7px; left: 50%; transform: translateX(-50%); width: 110px; height: 4px; border-radius: 2px;
+    background: var(--text); opacity: .85; }
+
+  .nav { padding: 4px 16px 8px; flex: none; }
+  .nav-row { display: flex; align-items: center; justify-content: space-between; height: 32px; }
+  .nav-btn { color: var(--blue); font-size: 15px; display: flex; align-items: center; gap: 2px; }
+  .nav-title { font-weight: 600; font-size: 15px; }
+  .large { font-size: 28px; font-weight: 700; letter-spacing: -.3px; margin: 2px 0 0; }
+  .mac { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; padding: 2px 7px; border-radius: 99px; font-weight: 500; }
+  .pill.green { background: var(--green-tint); color: var(--green); }
+  .pill.amber { background: var(--amber-tint); color: var(--amber); }
+  .pill.red { background: var(--red-tint); color: var(--red); }
+  .pill.blue { background: var(--blue-tint); color: var(--blue); }
+  .search { margin: 10px 0 2px; background: var(--chrome); border-radius: 10px; height: 34px; display: flex; align-items: center;
+    gap: 6px; padding: 0 10px; color: var(--quiet); font-size: 14px; }
+
+  .body { flex: 1; overflow: hidden; }
+  .section { font-size: 12px; color: var(--muted); padding: 14px 16px 6px; font-weight: 500; }
+  .list { margin: 0 16px; background: var(--panel); border-radius: 12px; overflow: hidden; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; position: relative; }
+  .row + .row::before { content: ""; position: absolute; top: 0; left: 52px; right: 0; border-top: 1px solid var(--row); }
+  .row.thread + .row.thread::before { left: 32px; }
+  .proj { width: 30px; height: 26px; border-radius: 6px; display: grid; place-items: center; font-size: 11px; font-weight: 700;
+    flex: none; position: relative; }
+  .proj::before { content: ""; position: absolute; top: -3px; left: 0; width: 12px; height: 5px; border-radius: 3px 3px 0 0; background: inherit; filter: brightness(.95); }
+  .row .main { flex: 1; min-width: 0; }
+  .row .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 15px; }
+  .row .s { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+  .chev { color: var(--quiet); font-size: 18px; }
+  .badge { min-width: 18px; height: 18px; border-radius: 9px; font-size: 11px; font-weight: 600; display: grid; place-items: center;
+    padding: 0 5px; color: #fff; }
+  .spin { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--orange); border-right-color: transparent;
+    animation: spin 1s linear infinite; flex: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .tabbar { flex: none; height: 74px; border-top: 1px solid var(--border); background: var(--chrome); display: flex;
+    justify-content: space-around; padding-top: 8px; font-size: 10px; color: var(--quiet); }
+  .tabbar div { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .tabbar .on { color: var(--blue); }
+
+  /* Thread */
+  .thread-nav { border-bottom: 1px solid var(--border); background: var(--chrome); }
+  .thread-nav .nav-row { gap: 8px; }
+  .thread-nav .titles { flex: 1; text-align: center; min-width: 0; }
+  .thread-nav .titles .nav-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+  .thread-nav .titles .sub { font-size: 11px; color: var(--muted); }
+  .convo { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; font-size: 14px; }
+  .user { align-self: flex-end; max-width: 85%; background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 8px 11px; }
+  .meta { font-size: 11px; color: var(--quiet); }
+  .meta.r { align-self: flex-end; margin-top: -6px; }
+  .tool { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  .tool code { font-family: var(--mono); font-size: 11.5px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tool .pr { color: var(--quiet); font-family: var(--mono); font-size: 12px; }
+  .assistant p { margin: 0 0 6px; }
+  .assistant code, .inline { font-family: var(--mono); font-size: 12px; background: var(--chrome); border-radius: 4px; padding: 0 4px; }
+  .assistant ul { margin: 0 0 6px; padding-left: 18px; }
+  .assistant li { margin-bottom: 4px; }
+  .working { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+
+  .composer { flex: none; border-top: 1px solid var(--border); background: var(--chrome); padding: 8px 12px 30px; }
+  .input { background: var(--bg); border: 1px solid var(--border); border-radius: 18px; padding: 8px 8px 8px 14px; display: flex;
+    align-items: flex-end; gap: 8px; color: var(--quiet); font-size: 14px; min-height: 38px; }
+  .input span { flex: 1; padding-bottom: 2px; }
+  .send { width: 26px; height: 26px; border-radius: 50%; background: var(--blue); color: var(--primary-text); display: grid;
+    place-items: center; font-size: 14px; font-weight: 700; flex: none; }
+  .send.stop { background: var(--text); }
+  .send.stop i { width: 9px; height: 9px; background: var(--bg); border-radius: 2px; }
+  .chips { display: flex; gap: 6px; margin-top: 7px; }
+  .chip { font-size: 11px; color: var(--muted); border: 1px solid var(--border); border-radius: 99px; padding: 2px 8px; background: var(--bg); }
+
+  /* Sheet */
+  .scrim { position: absolute; inset: 0; background: rgba(0,0,0,.28); }
+  .sheet { position: absolute; left: 0; right: 0; bottom: 0; background: var(--popover); border-radius: 16px 16px 0 0;
+    padding: 8px 16px 30px; border-top: 1px solid var(--popover-border); }
+  .grabber { width: 36px; height: 5px; border-radius: 3px; background: var(--quiet); opacity: .5; margin: 0 auto 12px; }
+  .sheet h3 { margin: 0 0 4px; font-size: 17px; }
+  .sheet .lead { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  .cmd { font-family: var(--mono); font-size: 11.5px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; }
+  .kv { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin: 8px 2px 14px; }
+  .kv b { color: var(--text); font-weight: 500; font-family: var(--mono); font-size: 11.5px; }
+  .btn { display: block; text-align: center; border-radius: 12px; padding: 12px; font-weight: 600; font-size: 15px; margin-top: 8px; }
+  .btn.primary { background: var(--blue); color: var(--primary-text); }
+  .btn.secondary { background: var(--bg); border: 1px solid var(--border); color: var(--text); }
+  .btn.danger { color: var(--red); }
+  .note { font-size: 11px; color: var(--quiet); text-align: center; margin-top: 10px; }
+
+  /* Pair */
+  .pair { flex: 1; display: flex; flex-direction: column; align-items: center; padding: 18px 26px 0; text-align: center; }
+  .pair h2 { font-size: 24px; margin: 14px 0 6px; letter-spacing: -.2px; }
+  .pair p { color: var(--muted); font-size: 14px; margin: 0; }
+  .viewfinder { margin-top: 20px; width: 180px; height: 180px; border-radius: 26px; background: #0d0e10; position: relative;
+    overflow: hidden; }
+  .viewfinder::after { content: ""; position: absolute; inset: 0;
+    background: radial-gradient(circle at 40% 35%, rgba(255,255,255,.07), transparent 60%); }
+  .corner { position: absolute; width: 34px; height: 34px; border: 4px solid #fff; }
+  .corner.tl { top: 30px; left: 30px; border-right: 0; border-bottom: 0; border-radius: 10px 0 0 0; }
+  .corner.tr { top: 30px; right: 30px; border-left: 0; border-bottom: 0; border-radius: 0 10px 0 0; }
+  .corner.bl { bottom: 30px; left: 30px; border-right: 0; border-top: 0; border-radius: 0 0 0 10px; }
+  .corner.br { bottom: 30px; right: 30px; border-left: 0; border-top: 0; border-radius: 0 0 10px 0; }
+  .qr { position: absolute; inset: 44px; display: grid; grid-template-columns: repeat(13, 1fr); gap: 1px; opacity: .55; }
+  .qr i { background: #fff; border-radius: 1px; }
+  .qr i.o { background: transparent; }
+  .steps { margin-top: 20px; text-align: left; font-size: 13px; color: var(--muted); display: flex; flex-direction: column; gap: 8px; width: 100%; }
+  .steps div { display: flex; gap: 10px; align-items: baseline; }
+  .steps b { width: 20px; height: 20px; border-radius: 50%; background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    display: inline-grid; place-items: center; font-size: 11px; flex: none; }
+  .appicon { width: 64px; height: 64px; border-radius: 15px; background: url("../assets/icon/AppIcon.png") center/cover, var(--blue); }
+
+  /* Offline */
+  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 0 34px 60px; }
+  .empty .icon { width: 64px; height: 64px; border-radius: 18px; background: var(--panel); border: 1px solid var(--border);
+    display: grid; place-items: center; margin-bottom: 18px; color: var(--muted); }
+  .empty h2 { font-size: 20px; margin: 0 0 6px; }
+  .empty p { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  .empty .btn { width: 100%; }
+
+  /* Desktop popover */
+  .desk { width: 420px; height: 430px; border-radius: 12px; overflow: hidden; background: var(--bg); border: 1px solid var(--border);
+    display: flex; box-shadow: 0 20px 50px rgba(0,0,0,.15); position: relative; font-size: 13px; }
+  .rail { width: 52px; background: var(--chrome); border-right: 1px solid var(--border); display: flex; flex-direction: column;
+    align-items: center; padding: 10px 0; gap: 12px; }
+  .rail .proj { width: 30px; }
+  .rail .spacer { flex: 1; }
+  .rail .ic { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; color: var(--muted); }
+  .rail .ic.on { background: var(--selected); color: var(--blue); }
+  .desk .side { flex: 1; background: var(--panel); }
+  .pop { position: absolute; left: 58px; bottom: 30px; width: 300px; background: var(--popover); border: 1px solid var(--popover-border);
+    border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.18); padding: 6px; }
+  .pop .hd { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px 8px; }
+  .pop .hd b { font-weight: 600; }
+  .switch { width: 30px; height: 18px; border-radius: 9px; background: var(--green); position: relative; }
+  .switch::after { content: ""; position: absolute; right: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; }
+  .dev { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px; }
+  .dev:hover, .dev.h { background: var(--popover-hover, var(--selected)); }
+  .dev .main { flex: 1; min-width: 0; }
+  .dev .s { color: var(--muted); font-size: 11.5px; }
+  .dev .x { color: var(--quiet); font-size: 12px; }
+  .dev .x.red { color: var(--red); }
+  .pop .sep { border-top: 1px solid var(--popover-border); margin: 6px -6px; }
+  .pop .pairbtn { display: flex; gap: 8px; align-items: center; padding: 7px 8px; color: var(--blue); border-radius: 6px; }
+  .pop .foot { color: var(--quiet); font-size: 11px; padding: 2px 8px 4px; }
+  .qrpop { position: absolute; left: 58px; bottom: 30px; width: 300px; background: var(--popover); border: 1px solid var(--popover-border);
+    border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.18); padding: 14px; text-align: center; }
+  .qrbox { width: 170px; height: 170px; margin: 10px auto; background: #fff; border-radius: 10px; padding: 12px; }
+  .qrbox .qr { position: static; inset: auto; opacity: 1; width: 100%; height: 100%; grid-template-columns: repeat(17, 1fr); gap: 0; }
+  .qrbox .qr i { background: #111; border-radius: 0; }
+  .qrbox .qr i.o { background: transparent; }
+  .code { font-family: var(--mono); letter-spacing: 3px; font-size: 15px; margin: 4px 0; }
+</style>
+</head>
+<body>
+<header class="page">
+  <div>
+    <h1>Chat for iPhone — design</h1>
+    <p>Native SwiftUI · palette and density taken from the Mac app · connects to your Mac over iroh</p>
+  </div>
+  <button class="toggle" onclick="document.body.classList.toggle('dark')">Toggle light / dark</button>
+</header>
+
+<div class="stage">
+
+  <!-- 1. Pair -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:10px"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="pair">
+        <div class="appicon"></div>
+        <h2>Pair with your Mac</h2>
+        <p>Scan the code Chat shows on your Mac. Your phone and Mac talk directly, end-to-end encrypted.</p>
+        <div class="viewfinder">
+          <div class="qr" id="qr-a"></div>
+          <span class="corner tl"></span><span class="corner tr"></span><span class="corner bl"></span><span class="corner br"></span>
+        </div>
+        <div class="steps">
+          <div><b>1</b><span>Open Chat on your Mac</span></div>
+          <div><b>2</b><span>Click the <span class="inline">phone</span> icon above Settings</span></div>
+          <div><b>3</b><span>Choose <span style="color:var(--text)">Pair device</span> and scan</span></div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div></div>
+    <figcaption><b>1 · Pairing</b>First launch. The QR carries the Mac's iroh node ID and a one-time secret; the Mac confirms the new device before it's added.</figcaption>
+  </figure>
+
+  <!-- 2. Projects -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:10px"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="nav">
+        <div class="nav-row"><span></span><span class="nav-btn">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 4v12M4 10h12" stroke-linecap="round"/></svg></span></div>
+        <div class="large">Projects</div>
+        <div class="mac"><span class="dot" style="background:var(--green)"></span>MacBook Pro <span class="pill green">Direct</span></div>
+      </div>
+      <div class="body">
+        <div class="section">Needs you</div>
+        <div class="list">
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--l1) 22%,var(--bg));color:var(--l1)">CH</div>
+            <div class="main"><div class="t">chat</div><div class="s" style="color:var(--amber)">Permission: run cargo test</div></div>
+            <span class="badge" style="background:var(--orange)">2</span>
+          </div>
+        </div>
+        <div class="section">All projects</div>
+        <div class="list">
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--l0) 22%,var(--bg));color:var(--l0)">MO</div>
+            <div class="main"><div class="t">mobile-site</div><div class="s">Working · Hero image lazy loading</div></div>
+            <span class="spin"></span>
+          </div>
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--l2) 22%,var(--bg));color:var(--l2)">IN</div>
+            <div class="main"><div class="t">invoices</div><div class="s">Done · 12 min ago</div></div>
+            <span class="badge" style="background:var(--blue)">1</span>
+          </div>
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--l3) 22%,var(--bg));color:var(--l3)">ST</div>
+            <div class="main"><div class="t">studio</div><div class="s">Yesterday</div></div>
+            <span class="chev">›</span>
+          </div>
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--quiet) 25%,var(--bg));color:var(--muted)">GI</div>
+            <div class="main"><div class="t">gitflow</div><div class="s">3 days ago</div></div>
+            <span class="chev">›</span>
+          </div>
+          <div class="row">
+            <div class="proj" style="background:color-mix(in srgb,var(--l5) 22%,var(--bg));color:var(--l5)">BA</div>
+            <div class="main"><div class="t">backend</div><div class="s">Last week</div></div>
+            <span class="chev">›</span>
+          </div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div></div>
+    <figcaption><b>2 · Projects</b>Same folder tiles and lane colours as the Mac rail. Anything waiting on you floats to the top. The pill shows whether traffic is direct or relayed.</figcaption>
+  </figure>
+
+  <!-- 3. Threads -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:10px"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="nav">
+        <div class="nav-row"><span class="nav-btn">‹ Projects</span><span class="nav-btn">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 16h4l8-8-4-4-8 8z" stroke-linejoin="round"/></svg></span></div>
+        <div class="large">chat</div>
+        <div class="search">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="7" cy="7" r="5"/><path d="M11 11l3.5 3.5" stroke-linecap="round"/></svg>
+          Search threads</div>
+      </div>
+      <div class="body">
+        <div class="section">Today</div>
+        <div class="list">
+          <div class="row thread"><span class="spin"></span><div class="main"><div class="t">Diff page image layout</div></div><span class="pill amber">Needs you</span></div>
+          <div class="row thread"><span class="dot" style="background:var(--blue)"></span><div class="main"><div class="t">Chat icon stylization</div></div></div>
+          <div class="row thread"><span class="dot" style="background:var(--quiet)"></span><div class="main"><div class="t">3D Mac empty state POC</div></div></div>
+          <div class="row thread"><span class="dot" style="background:var(--quiet)"></span><div class="main"><div class="t">Usage dashboard mockup</div></div></div>
+          <div class="row thread"><span class="dot" style="background:var(--red)"></span><div class="main"><div class="t">ACP new version</div><div class="s" style="color:var(--red)">Failed · agent exited</div></div></div>
+        </div>
+        <div class="section">Yesterday</div>
+        <div class="list">
+          <div class="row thread"><span class="dot" style="background:var(--quiet)"></span><div class="main"><div class="t">Usage status bar widget</div></div></div>
+          <div class="row thread"><span class="dot" style="background:var(--quiet)"></span><div class="main"><div class="t">Missions feature design</div></div></div>
+        </div>
+      </div>
+      <div class="home-ind"></div>
+    </div></div>
+    <figcaption><b>3 · Threads</b>Mirrors the Mac's thread list: spinner while running, blue dot for unread, red for failed. The pencil starts a new thread in this project.</figcaption>
+  </figure>
+
+  <!-- 4. Conversation -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:10px"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="nav thread-nav">
+        <div class="nav-row">
+          <span class="nav-btn">‹</span>
+          <div class="titles"><div class="nav-title">Notifications for unfocused…</div><div class="sub">chat · Claude Code</div></div>
+          <span class="nav-btn">•••</span>
+        </div>
+      </div>
+      <div class="body convo">
+        <div class="user">Also notify when a thread finishes while the window is unfocused</div>
+        <div class="meta r">2:20 PM</div>
+        <div class="tool"><span class="pr">&gt;_</span> Ran 3 commands <span class="chev" style="font-size:14px">›</span></div>
+        <div class="tool"><span class="pr">✎</span> Edited <code>src/notify.rs</code> <span class="pill green">+42</span></div>
+        <div class="assistant">
+          <p>Done. Finished and failed turns now post a notification when the window isn't focused.</p>
+          <ul>
+            <li><b>Grouped:</b> one per thread, replaced as it updates.</li>
+            <li><b>Clickable:</b> opens the thread in <code>workspace.rs</code>.</li>
+          </ul>
+        </div>
+        <div class="meta">Worked for 2m 00s · 2:23 PM</div>
+        <div class="user">Run the tests</div>
+        <div class="working"><span class="spin"></span>Working · 14s</div>
+      </div>
+      <div class="composer">
+        <div class="input"><span>Queue a message…</span><div class="send stop"><i></i></div></div>
+        <div class="chips"><span class="chip">Opus 5.5</span><span class="chip">High effort</span><span class="chip">Ask before edits</span></div>
+      </div>
+      <div class="home-ind"></div>
+    </div></div>
+    <figcaption><b>4 · Conversation</b>Tool calls stay collapsed to one line each; tap to expand. While the agent works, send becomes stop and new messages queue, like on the Mac.</figcaption>
+  </figure>
+
+  <!-- 5. Permission -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px"></i><i style="height:10px"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="nav thread-nav">
+        <div class="nav-row">
+          <span class="nav-btn">‹</span>
+          <div class="titles"><div class="nav-title">Diff page image layout</div><div class="sub">chat · Claude Code</div></div>
+          <span class="nav-btn">•••</span>
+        </div>
+      </div>
+      <div class="body convo">
+        <div class="user">Fix the failing image diff test</div>
+        <div class="tool"><span class="pr">&gt;_</span> Ran 2 commands <span class="chev" style="font-size:14px">›</span></div>
+        <div class="assistant"><p>The snapshot is stale. I'll regenerate it and rerun the suite.</p></div>
+      </div>
+      <div class="scrim"></div>
+      <div class="sheet">
+        <div class="grabber"></div>
+        <h3>Run a command?</h3>
+        <p class="lead">Claude Code wants to run this in <b style="color:var(--text);font-weight:500">chat</b>.</p>
+        <div class="cmd">UPDATE_SNAPSHOTS=1 cargo test -p chat media::image_diff -- --nocapture</div>
+        <div class="kv"><span>Directory</span><b>~/Documents/codes/mine/chat</b></div>
+        <div class="btn primary">Allow once</div>
+        <div class="btn secondary">Always allow <span style="font-family:var(--mono);font-size:12px;color:var(--muted)">cargo test</span></div>
+        <div class="btn danger">Deny</div>
+        <div class="note">Bypass-permissions mode can only be turned on from the Mac.</div>
+      </div>
+      <div class="home-ind" style="background:var(--text)"></div>
+    </div></div>
+    <figcaption><b>5 · Permission request</b>Full command, never truncated, with the working directory. Also arrives as a push notification with Allow / Deny actions that open this sheet.</figcaption>
+  </figure>
+
+  <!-- 6. Offline -->
+  <figure>
+    <div class="phone"><div class="screen">
+      <div class="status"><span>9:41</span><span class="island"></span><span class="sys"><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:8px;opacity:.3"></i><i style="height:10px;opacity:.3"></i></span><span class="batt"><i></i></span></span></div>
+      <div class="nav">
+        <div class="large">Projects</div>
+        <div class="mac"><span class="dot" style="background:var(--quiet)"></span>MacBook Pro <span class="pill amber">Unreachable</span></div>
+      </div>
+      <div class="empty">
+        <div class="icon">
+          <svg width="30" height="30" viewBox="0 0 30 30" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="6" width="20" height="13" rx="2"/><path d="M2 23h26" stroke-linecap="round"/><path d="M12 11l6 5M18 11l-6 5" stroke-linecap="round"/></svg>
+        </div>
+        <h2>Can't reach your Mac</h2>
+        <p>It may be asleep, offline, or Chat isn't open. Keep the Mac plugged in with “Stay awake for remote” on in Chat's settings.</p>
+        <div class="btn primary">Try again</div>
+        <div class="note" style="margin-top:12px">Last connected 4 min ago · via relay</div>
+      </div>
+      <div class="home-ind"></div>
+    </div></div>
+    <figcaption><b>6 · Mac unreachable</b>Shown instead of a stale list. Reconnects automatically when the network changes (Wi-Fi ↔ cellular).</figcaption>
+  </figure>
+
+  <!-- 7. Desktop popover: devices -->
+  <figure>
+    <div class="desk">
+      <div class="rail">
+        <div class="ic" style="background:var(--panel)"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 3h10v7H7l-3 3v-3H3z" stroke-linejoin="round"/></svg></div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l1) 22%,var(--bg));color:var(--l1)">CH</div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l0) 22%,var(--bg));color:var(--l0)">MO</div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l2) 22%,var(--bg));color:var(--l2)">IN</div>
+        <div class="spacer"></div>
+        <div class="ic on" title="Devices"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4.5" y="1.5" width="7" height="13" rx="1.6"/><path d="M7 12.5h2" stroke-linecap="round"/></svg></div>
+        <div class="ic" title="Settings"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" stroke-linecap="round"/></svg></div>
+      </div>
+      <div class="side"></div>
+      <div class="pop">
+        <div class="hd"><b>Remote access</b><span class="switch"></span></div>
+        <div class="dev h">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="var(--muted)" stroke-width="1.4"><rect x="4.5" y="1.5" width="7" height="13" rx="1.6"/></svg>
+          <div class="main"><div>De-Great's iPhone</div><div class="s"><span class="dot" style="background:var(--green);width:6px;height:6px"></span> Connected · direct</div></div>
+          <span class="x red">Remove</span>
+        </div>
+        <div class="dev">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="var(--muted)" stroke-width="1.4"><rect x="4.5" y="1.5" width="7" height="13" rx="1.6"/></svg>
+          <div class="main"><div>iPad mini</div><div class="s">Last seen 2 days ago</div></div>
+        </div>
+        <div class="sep"></div>
+        <div class="pairbtn"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 3v10M3 8h10" stroke-linecap="round"/></svg>Pair device…</div>
+        <div class="foot">Paired devices can run agents on this Mac.</div>
+      </div>
+    </div>
+    <figcaption><b>7 · Mac: devices popover</b>New phone icon sits above Settings at the bottom of the projects rail. Remove shows on hover. The switch turns remote access off without unpairing.</figcaption>
+  </figure>
+
+  <!-- 8. Desktop popover: QR -->
+  <figure>
+    <div class="desk">
+      <div class="rail">
+        <div class="ic" style="background:var(--panel)"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 3h10v7H7l-3 3v-3H3z" stroke-linejoin="round"/></svg></div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l1) 22%,var(--bg));color:var(--l1)">CH</div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l0) 22%,var(--bg));color:var(--l0)">MO</div>
+        <div class="proj" style="background:color-mix(in srgb,var(--l2) 22%,var(--bg));color:var(--l2)">IN</div>
+        <div class="spacer"></div>
+        <div class="ic on"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="4.5" y="1.5" width="7" height="13" rx="1.6"/><path d="M7 12.5h2" stroke-linecap="round"/></svg></div>
+        <div class="ic"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.4 3.4l1.4 1.4M11.2 11.2l1.4 1.4M3.4 12.6l1.4-1.4M11.2 4.8l1.4-1.4" stroke-linecap="round"/></svg></div>
+      </div>
+      <div class="side"></div>
+      <div class="qrpop">
+        <b>Scan with Chat on your phone</b>
+        <div class="qrbox"><div class="qr" id="qr-b"></div></div>
+        <div style="color:var(--muted);font-size:12px">Then confirm this code matches on your phone</div>
+        <div class="code">482 913</div>
+        <div style="color:var(--quiet);font-size:11px;margin-top:6px">Expires in 4:52 · Cancel</div>
+      </div>
+    </div>
+    <figcaption><b>8 · Mac: pairing</b>One-time QR, valid for 5 minutes. Both sides show the same 6-digit code so you know nobody intercepted the pairing.</figcaption>
+  </figure>
+
+</div>
+
+<script>
+  // Deterministic fake QR patterns.
+  function qr(el, n, seed) {
+    let s = seed;
+    const rnd = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+    const finder = (r, c) => {
+      for (const [fr, fc] of [[0, 0], [0, n - 7], [n - 7, 0]]) {
+        const y = r - fr, x = c - fc;
+        if (y >= 0 && y < 7 && x >= 0 && x < 7) {
+          return y === 0 || y === 6 || x === 0 || x === 6 || (y >= 2 && y <= 4 && x >= 2 && x <= 4);
+        }
+        if (y >= -1 && y <= 7 && x >= -1 && x <= 7) return false;
+      }
+      return null;
+    };
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
+      const f = finder(r, c);
+      const on = f === null ? rnd() > 0.5 : f;
+      const i = document.createElement('i');
+      if (!on) i.className = 'o';
+      el.appendChild(i);
+    }
+  }
+  qr(document.getElementById('qr-a'), 13, 7);
+  qr(document.getElementById('qr-b'), 17, 42);
+</script>
+</body>
+</html>

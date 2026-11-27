@@ -10,6 +10,7 @@ mod missions;
 mod model;
 mod notify;
 mod pasteboard;
+mod remote;
 mod settings;
 mod stats;
 mod store;

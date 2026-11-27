@@ -4,3 +4,7 @@ build/
 .signing-identity
 mockups
 poc
+mobile/bridge/target/
+mobile/ChatBridge.xcframework/
+mobile/**/xcuserdata/
+mobile/Chat.xcodeproj/project.xcworkspace/

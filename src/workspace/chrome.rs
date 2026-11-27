@@ -621,10 +621,12 @@ impl Workspace {
                     .child(list),
             )
             .child(
-                row()
-                    .h(px(BAR + 4.))
+                col()
                     .flex_shrink_0()
-                    .justify_center()
+                    .items_center()
+                    .gap(px(2.))
+                    .pb(px(6.))
+                    .child(self.remote_button(cx))
                     .child(
                         icon_button("open-prefs", IconName::Settings, "Settings · ⌘ ,")
                             .on_click(cx.listener(|s, _, w, cx| s.open_prefs(&OpenPreferences, w, cx))),

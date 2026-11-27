@@ -14,6 +14,7 @@ mod missions;
 mod panes;
 mod retro_mac;
 mod preferences;
+mod remote;
 mod search;
 mod select;
 mod side;
@@ -415,6 +416,8 @@ pub struct Workspace {
     missions: crate::missions::Missions,
     /// What the mission card shows beyond the mission itself.
     mission_ui: missions::MissionUi,
+    /// Phones paired to reach this Mac, and the ones connected.
+    remote: remote::RemoteState,
     _quit: Option<Subscription>,
 }
 
@@ -612,6 +615,7 @@ impl Workspace {
             missions: crate::missions::Missions::from_saved(store.as_ref().map(|s| s.load_missions()).unwrap_or_default()),
             mission_ui: missions::MissionUi::new(cx),
             store,
+            remote: remote::RemoteState::new(),
             _quit: None,
         };
         cx.spawn(async move |this, cx| {
@@ -650,6 +654,7 @@ impl Workspace {
         }
         workspace.start_git_watch(window, cx);
         workspace.listen_for_notification_clicks(window, cx);
+        workspace.remote_init(cx);
         cx.observe_window_activation(window, |s, window, cx| {
             s.window_active = window.is_window_active();
             // Coming back to the window is seeing the thread on show.
@@ -2310,6 +2315,8 @@ impl Render for Workspace {
                 }
                 if s.servers.hover.as_ref().is_some_and(|h| h.text.is_some()) {
                     s.close_card(cx);
+                } else if s.remote.open {
+                    s.close_remote(cx);
                 } else if s.effort_open {
                     s.close_effort(cx);
                 } else if s.usage_open() {
@@ -2352,6 +2359,19 @@ impl Render for Workspace {
                             .position(at.unwrap_or_default())
                             .snap_to_window_with_margin(px(8.))
                             .child(view),
+                    )
+                    .with_priority(2),
+                )
+            })
+            .when(self.remote.open, |root| {
+                let at = self.anchors.borrow().get(remote::ANCHOR).map(|b| b.bottom_right() + point(px(6.), px(0.)));
+                root.child(
+                    deferred(
+                        anchored()
+                            .anchor(Corner::BottomLeft)
+                            .position(at.unwrap_or_default())
+                            .snap_to_window_with_margin(px(8.))
+                            .child(self.remote_view(cx)),
                     )
                     .with_priority(2),
                 )

@@ -1427,3 +1427,151 @@ fn drags_files_into_folders(cx: &mut TestAppContext) {
     assert!(d.read(|s| s.file_drop.is_none()), "taken up by the drop");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// A phone pairs, is let in only once accepted, sees projects, threads and a
+/// transcript, starts a thread, answers the permission it asks, and is turned
+/// away once removed. Messages are fed in as the transport would deliver them.
+#[gpui::test]
+fn serves_a_paired_phone(cx: &mut TestAppContext) {
+    use crate::remote::Incoming;
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let sent = |d: &mut Driver, conn: u64, kind: &str| -> Vec<serde_json::Value> {
+        d.read(|s| {
+            s.remote.log.borrow().iter()
+                .filter(|(c, _)| *c == conn)
+                .filter_map(|(_, t)| serde_json::from_str::<serde_json::Value>(t).ok())
+                .filter(|v| v["type"] == kind)
+                .collect()
+        })
+    };
+    let line = |d: &mut Driver, conn: u64, value: serde_json::Value| {
+        d.act(|s, cx| s.remote_incoming(Incoming::Line { conn, line: value.to_string() }, cx));
+    };
+
+    d.act(|s, cx| s.set_remote_enabled(true, cx));
+    // The phone button opens the devices popover over the rail.
+    d.act(|s, cx| s.toggle_remote(cx));
+    assert!(d.cx.debug_bounds("remote-popover").is_some(), "the popover is drawn");
+    d.act(|s, cx| s.start_pairing(cx));
+    assert!(d.cx.debug_bounds("remote-popover").is_some(), "and the QR code in it");
+    let mac = d.read(|s| s.remote.mac_id()).expect("the endpoint is up");
+    let secret = d.read(|s| s.remote.pairing_secret()).expect("pairing");
+
+    // A phone without the secret is turned away.
+    d.act(|s, cx| s.remote_incoming(Incoming::Hello { conn: 9, device: "stranger".into(), name: "X".into(), secret: Some("wrong".into()) }, cx));
+    assert_eq!(sent(&mut d, 9, "rejected").len(), 1);
+
+    // With it, it waits for the Mac, seeing the same code the phone computes.
+    d.act(|s, cx| s.remote_incoming(Incoming::Hello { conn: 1, device: "phone".into(), name: "Test phone".into(), secret: Some(secret.clone()) }, cx));
+    let pairing = sent(&mut d, 1, "pairing");
+    assert_eq!(pairing[0]["code"], crate::remote::pair_code(&mac, "phone", &secret));
+    line(&mut d, 1, serde_json::json!({"type": "view"}));
+    assert!(sent(&mut d, 1, "projects").is_empty(), "nothing shown before it's accepted");
+
+    assert!(d.cx.debug_bounds("remote-popover").is_some(), "the code to compare");
+    d.act(|s, cx| s.end_pairing(true, cx));
+    assert!(d.cx.debug_bounds("remote-popover").is_some(), "back to the device list");
+    assert_eq!(sent(&mut d, 1, "paired").len(), 1);
+    assert_eq!(d.read(|s| s.remote.devices()), vec!["phone".to_string()]);
+    let projects = sent(&mut d, 1, "projects");
+    let key = project.display().to_string();
+    assert!(projects.last().unwrap()["projects"].as_array().unwrap().iter().any(|p| p["key"] == key.as_str()), "the project is listed");
+
+    // Start a thread from the phone; the mock agent asks before editing.
+    line(&mut d, 1, serde_json::json!({"type": "new_thread", "project": key, "text": "greet the user"}));
+    let id = sent(&mut d, 1, "created")[0]["thread"].as_u64().unwrap() as usize;
+    line(&mut d, 1, serde_json::json!({"type": "view", "project": key, "thread": id}));
+    let permission = |d: &mut Driver| {
+        sent(d, 1, "thread").last().and_then(|t| {
+            t["thread"]["blocks"].as_array()?.iter().find(|b| b["kind"] == "permission" && b["chosen"].is_null()).cloned()
+        })
+    };
+    d.wait("the permission request on the phone", 60, |d| {
+        d.act(|s, cx| s.remote_tick(cx));
+        permission(d).is_some()
+    });
+    let asked = permission(&mut d).unwrap();
+    assert!(asked["answers"].as_array().unwrap().iter().any(|a| a["id"] == "yes"));
+    let threads = sent(&mut d, 1, "threads");
+    assert!(threads.last().unwrap()["threads"].as_array().unwrap().iter().any(|t| t["id"] == id && t["waiting"] == true));
+
+    // An answer the agent didn't offer is ignored; a real one goes through.
+    line(&mut d, 1, serde_json::json!({"type": "answer", "thread": id, "permission": asked["id"], "answer": "sudo"}));
+    assert!(permission(&mut d).is_some());
+    line(&mut d, 1, serde_json::json!({"type": "answer", "thread": id, "permission": asked["id"], "answer": "yes"}));
+    let done = |d: &mut Driver| {
+        sent(d, 1, "thread").last().is_some_and(|t| {
+            t["thread"]["state"] == "done"
+                && t["thread"]["blocks"].as_array().unwrap().iter().any(|b| b["kind"] == "text" && b["text"].as_str().unwrap().contains("Done."))
+        })
+    };
+    d.wait("the turn to finish on the phone", 60, |d| {
+        d.act(|s, cx| s.remote_tick(cx));
+        done(d)
+    });
+
+    // Beside the transcript: the Context page's contents and git's changes.
+    let detail = sent(&mut d, 1, "thread").last().unwrap()["thread"].clone();
+    assert!(!detail["context"]["plan"].as_array().unwrap().is_empty(), "the mock agent's plan");
+    assert!(detail["context"]["files"].as_array().unwrap().iter().any(|f| f["path"] == "src/main.rs" && f["touch"] != "read"));
+    d.wait("git's changes on the phone", 30, |d| {
+        d.act(|s, cx| s.remote_tick(cx));
+        sent(d, 1, "changes").last().is_some_and(|c| {
+            c["repos"].as_array().unwrap().iter().any(|r| {
+                r["unstaged"].as_array().is_some_and(|u| u.iter().any(|f| f["path"] == "src/main.rs" && f["status"] == "M"))
+            })
+        })
+    });
+
+    // The agent's questions, answered from the phone: an offered choice and
+    // the free-text companion; a choice it didn't offer is dropped.
+    line(&mut d, 1, serde_json::json!({"type": "new_thread", "project": key, "text": "a question for you"}));
+    let id = sent(&mut d, 1, "created").last().unwrap()["thread"].as_u64().unwrap() as usize;
+    line(&mut d, 1, serde_json::json!({"type": "view", "project": key, "thread": id}));
+    let open_ask = |d: &mut Driver| {
+        sent(d, 1, "thread").last().and_then(|t| {
+            if t["thread"]["id"] != id {
+                return None;
+            }
+            t["thread"]["blocks"].as_array()?.iter().find(|b| b["kind"] == "ask" && b["open"] == true).cloned()
+        })
+    };
+    d.wait("the questions on the phone", 60, |d| {
+        d.act(|s, cx| s.remote_tick(cx));
+        open_ask(d).is_some()
+    });
+    let ask = open_ask(&mut d).unwrap();
+    let first = &ask["questions"][0];
+    assert_eq!(first["kind"], "single");
+    assert!(first["choices"].as_array().unwrap().iter().any(|c| c["value"] == "Redis"));
+    line(&mut d, 1, serde_json::json!({
+        "type": "reply", "thread": id, "ask": ask["id"],
+        "picks": {"question_0": ["Redis", "Mongo"], "question_0_custom": ["ignored"]},
+        "typed": {"question_0_custom": "it's fast"},
+    }));
+    d.wait("the agent to get the answers", 60, |d| {
+        d.act(|s, cx| s.remote_tick(cx));
+        sent(d, 1, "thread").last().is_some_and(|t| {
+            t["thread"]["blocks"].as_array().unwrap().iter().any(|b| {
+                b["kind"] == "text" && b["text"].as_str().unwrap().contains("Redis") && b["text"].as_str().unwrap().contains("it's fast")
+            })
+        })
+    });
+    let answered = sent(&mut d, 1, "thread").last().unwrap()["thread"]["blocks"].as_array().unwrap().iter()
+        .find(|b| b["kind"] == "ask").unwrap()["answered"].clone();
+    assert!(answered.to_string().contains("Redis") && !answered.to_string().contains("Mongo"), "{answered}");
+    line(&mut d, 1, serde_json::json!({"type": "reply", "thread": id, "ask": ask["id"], "skip": true}));
+    assert!(sent(&mut d, 1, "ask_error").last().unwrap()["message"].as_str().unwrap().contains("already answered"));
+
+    // A known phone comes back in without the secret; removed, it's turned away.
+    d.act(|s, cx| s.remote_incoming(Incoming::Hello { conn: 2, device: "phone".into(), name: "Test phone".into(), secret: None }, cx));
+    assert_eq!(sent(&mut d, 2, "welcome").len(), 1);
+    d.act(|s, cx| s.remove_device("phone", cx));
+    assert_eq!(sent(&mut d, 2, "rejected").len(), 1);
+    d.act(|s, cx| s.remote_incoming(Incoming::Hello { conn: 3, device: "phone".into(), name: "Test phone".into(), secret: None }, cx));
+    assert_eq!(sent(&mut d, 3, "rejected").len(), 1);
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
