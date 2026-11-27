@@ -44,7 +44,12 @@ final class Store {
     /// Why the last answers to a set of questions weren't taken, by its id.
     var askErrors: [UInt64: String] = [:]
 
-    @ObservationIgnored private let bridge = Bridge()
+    /// Thumbnails and downloaded files, by media ref, as they load.
+    var thumbs: [String: MediaLoad] = [:]
+    var downloads: [String: MediaLoad] = [:]
+
+    @ObservationIgnored let bridge = Bridge()
+    @ObservationIgnored var fetching: [String: UInt64] = [:]
     @ObservationIgnored private var retry: Task<Void, Never>?
     @ObservationIgnored private var attempts = 0
     /// What's showing, re-sent after a reconnect.
@@ -228,7 +233,11 @@ final class Store {
 
     private func handle(_ event: Bridge.Event) {
         switch event {
-        case .connected(let direct), .path(let direct):
+        case .connected(let direct):
+            self.direct = direct
+            // Whatever failed for want of a connection can be tried again.
+            thumbs = thumbs.filter { if case .failed = $0.value { return false } else { return true } }
+        case .path(let direct):
             self.direct = direct
         case .line(let line):
             receive(line)

@@ -239,10 +239,14 @@ enum Out {
     Close,
 }
 
+/// The files each connection may fetch, by the token it was given for each.
+type Allowed = Arc<Mutex<HashMap<ConnId, HashMap<String, PathBuf>>>>;
+
 /// The running endpoint. Dropping it closes every connection.
 pub struct Server {
     id: String,
     outs: Arc<Mutex<HashMap<ConnId, tokio::sync::mpsc::UnboundedSender<Out>>>>,
+    allowed: Allowed,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
@@ -253,6 +257,8 @@ impl Server {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let id = public_id(&key);
         let thread_outs = outs.clone();
+        let allowed: Allowed = Arc::default();
+        let thread_allowed = allowed.clone();
         std::thread::Builder::new()
             .name("remote".into())
             .spawn(move || {
@@ -263,10 +269,10 @@ impl Server {
                         return;
                     }
                 };
-                runtime.block_on(serve(key, tx, thread_outs, stopped));
+                runtime.block_on(serve(key, tx, thread_outs, thread_allowed, stopped));
             })
             .expect("could not start the remote thread");
-        (Self { id, outs, shutdown: Some(stop) }, rx)
+        (Self { id, outs, allowed, shutdown: Some(stop) }, rx)
     }
     /// What a phone dials: the endpoint's public key.
     pub fn id(&self) -> &str {
@@ -276,6 +282,10 @@ impl Server {
         if let Some(out) = self.outs.lock().unwrap().get(&conn) {
             let _ = out.send(Out::Line(line));
         }
+    }
+    /// Let this connection fetch these files, by their tokens, from now on.
+    pub fn allow(&self, conn: ConnId, files: impl IntoIterator<Item = (String, PathBuf)>) {
+        self.allowed.lock().unwrap().entry(conn).or_default().extend(files);
     }
     pub fn close(&self, conn: ConnId) {
         if let Some(out) = self.outs.lock().unwrap().remove(&conn) {
@@ -296,6 +306,7 @@ async fn serve(
     key: [u8; 32],
     tx: UnboundedSender<Incoming>,
     outs: Arc<Mutex<HashMap<ConnId, tokio::sync::mpsc::UnboundedSender<Out>>>>,
+    allowed: Allowed,
     mut stopped: tokio::sync::oneshot::Receiver<()>,
 ) {
     let endpoint = match iroh::Endpoint::builder(iroh::endpoint::presets::N0)
@@ -316,14 +327,15 @@ async fn serve(
             _ = &mut stopped => break,
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break };
-                let (tx, outs, next) = (tx.clone(), outs.clone(), next.clone());
+                let (tx, outs, next, allowed) = (tx.clone(), outs.clone(), next.clone(), allowed.clone());
                 tokio::spawn(async move {
                     let Ok(connection) = incoming.await else { return };
                     let conn = next.fetch_add(1, Ordering::Relaxed);
                     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
                     outs.lock().unwrap().insert(conn, out_tx);
-                    handle(conn, connection, &tx, out_rx).await;
+                    handle(conn, connection, &tx, out_rx, allowed.clone()).await;
                     outs.lock().unwrap().remove(&conn);
+                    allowed.lock().unwrap().remove(&conn);
                     let _ = tx.unbounded_send(Incoming::Closed { conn });
                 });
             }
@@ -342,6 +354,7 @@ async fn handle(
     connection: iroh::endpoint::Connection,
     tx: &UnboundedSender<Incoming>,
     mut out: tokio::sync::mpsc::UnboundedReceiver<Out>,
+    allowed: Allowed,
 ) {
     let device = connection.remote_id().to_string();
     let Ok((mut send, recv)) = connection.accept_bi().await else { return };
@@ -376,6 +389,18 @@ async fn handle(
             }
         }
     });
+    // Every stream after the first asks for one file.
+    let files = tokio::spawn({
+        let connection = connection.clone();
+        async move {
+            while let Ok((send, recv)) = connection.accept_bi().await {
+                let allowed = allowed.clone();
+                tokio::spawn(async move {
+                    let _ = serve_file(conn, send, recv, &allowed).await;
+                });
+            }
+        }
+    });
     let mut check = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
@@ -402,12 +427,131 @@ async fn handle(
         }
     }
     reading.abort();
+    files.abort();
     // Let the last lines (a "rejected" and its reason, say) reach the phone
     // before the connection goes: closing at once can drop what's in flight.
     if send.finish().is_ok() {
         let _ = tokio::time::timeout(Duration::from_secs(2), send.stopped()).await;
     }
     connection.close(0u32.into(), b"bye");
+}
+
+/// What a phone asks for on a file stream.
+#[derive(Deserialize)]
+struct FileRequest {
+    get: String,
+    /// Where to start, to pick up a download that broke off.
+    #[serde(default)]
+    offset: u64,
+    /// A small picture standing for it, rather than the file.
+    #[serde(default)]
+    thumb: bool,
+}
+
+/// The longest side of a thumbnail, in pixels.
+const THUMB_SIZE: u32 = 640;
+
+/// Answer one file stream: a JSON line saying what's coming (`size`, `mime`)
+/// or why not (`error`), then the bytes from `offset`, then the end.
+async fn serve_file(
+    conn: ConnId,
+    mut send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+    allowed: &Allowed,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncSeekExt;
+    let mut reader = BufReader::new(recv);
+    let mut line = String::new();
+    let read = tokio::time::timeout(HELLO_TIMEOUT, (&mut reader).take(4096).read_line(&mut line)).await;
+    let request = match read {
+        Ok(Ok(n)) if n > 0 => serde_json::from_str::<FileRequest>(&line).ok(),
+        _ => None,
+    };
+    let refuse = |message: &str| format!("{}\n", serde_json::json!({"error": message}));
+    let Some(request) = request else {
+        send.write_all(refuse("Unknown request").as_bytes()).await?;
+        return send.finish().map_err(std::io::Error::other);
+    };
+    let path = allowed.lock().unwrap().get(&conn).and_then(|files| files.get(&request.get).cloned());
+    let Some(path) = path else {
+        send.write_all(refuse("That file isn't shared with this phone.").as_bytes()).await?;
+        return send.finish().map_err(std::io::Error::other);
+    };
+    let path = if request.thumb {
+        let source = path.clone();
+        match tokio::task::spawn_blocking(move || thumbnail(&source, THUMB_SIZE)).await.ok().flatten() {
+            Some(still) => still,
+            None => {
+                send.write_all(refuse("No picture for this file").as_bytes()).await?;
+                return send.finish().map_err(std::io::Error::other);
+            }
+        }
+    } else {
+        path
+    };
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(_) => {
+            send.write_all(refuse("The file is no longer on the Mac.").as_bytes()).await?;
+            return send.finish().map_err(std::io::Error::other);
+        }
+    };
+    let size = file.metadata().await?.len();
+    let offset = request.offset.min(size);
+    let header = serde_json::json!({"size": size, "offset": offset, "mime": mime(&path)});
+    send.write_all(format!("{header}\n").as_bytes()).await?;
+    file.seek(std::io::SeekFrom::Start(offset)).await?;
+    tokio::io::copy(&mut file, &mut send).await?;
+    send.finish().map_err(std::io::Error::other)?;
+    let _ = send.stopped().await;
+    Ok(())
+}
+
+/// What kind of file this is, for the phone, by its extension.
+fn mime(path: &std::path::Path) -> &'static str {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A Quick Look picture of `path`, at most `size` pixels on a side, made once
+/// per version of the file and kept in the temporary folder.
+fn thumbnail(path: &std::path::Path, size: u32) -> Option<PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hash);
+    size.hash(&mut hash);
+    std::fs::metadata(path).and_then(|m| m.modified()).ok().hash(&mut hash);
+    let dir = std::env::temp_dir().join("chat-thumbs").join(format!("{:016x}", hash.finish()));
+    let out = dir.join(format!("{}.png", path.file_name()?.to_string_lossy()));
+    if out.exists() {
+        return Some(out);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    std::process::Command::new("qlmanage")
+        .args(["-t", "-s", &size.to_string(), "-o"])
+        .arg(&dir)
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    out.exists().then_some(out)
 }
 
 #[cfg(test)]
@@ -484,5 +628,72 @@ mod tests {
     #[test]
     fn pair_url_escapes_the_name() {
         assert_eq!(pair_url("m", "s", "De's Mac"), "chat-remote://pair?mac=m&secret=s&name=De%27s%20Mac");
+    }
+}
+
+/// A real endpoint and a real client: files come on streams of their own,
+/// only the ones shared with the connection, resuming from an offset.
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn ask(connection: &iroh::endpoint::Connection, request: &str) -> (serde_json::Value, Vec<u8>) {
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        send.write_all(format!("{request}\n").as_bytes()).await.unwrap();
+        send.finish().unwrap();
+        let mut reader = BufReader::new(recv);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.unwrap();
+        (serde_json::from_str(&line).unwrap(), body)
+    }
+
+    #[test]
+    #[ignore = "needs the network to reach iroh's relays"]
+    fn serves_shared_files() {
+        let dir = std::env::temp_dir().join(format!("chat-remote-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let bytes: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&clip, &bytes).unwrap();
+        let (server, _rx) = Server::start(iroh::SecretKey::generate().to_bytes());
+        // Connections are numbered from 1: the first is the client below.
+        server.allow(1, [("abc".to_string(), clip.clone())]);
+        let mac: iroh::EndpointId = server.id().parse().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0).bind().await.unwrap();
+            // The Mac's address takes a moment to be published.
+            let mut tries = 0;
+            let connection = loop {
+                match endpoint.connect(mac, ALPN).await {
+                    Ok(c) => break c,
+                    Err(_) if tries < 30 => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => panic!("couldn't reach the endpoint: {e}"),
+                }
+            };
+            let (mut send, _recv) = connection.open_bi().await.unwrap();
+            send.write_all(b"{\"type\":\"hello\",\"name\":\"Test\"}\n").await.unwrap();
+
+            let (header, body) = ask(&connection, r#"{"get":"abc"}"#).await;
+            assert_eq!(header["size"], 300_000);
+            assert_eq!(header["mime"], "video/mp4");
+            assert_eq!(body, bytes);
+
+            let (header, body) = ask(&connection, r#"{"get":"abc","offset":250000}"#).await;
+            assert_eq!(header["offset"], 250_000);
+            assert_eq!(body, bytes[250_000..]);
+
+            let (header, body) = ask(&connection, r#"{"get":"elsewhere"}"#).await;
+            assert!(header["error"].is_string());
+            assert!(body.is_empty());
+            connection.close(0u32.into(), b"bye");
+        });
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

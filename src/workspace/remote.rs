@@ -53,6 +53,9 @@ pub(super) struct RemoteState {
     /// every so often while they look: when, and what it said.
     git: HashMap<PathBuf, (Instant, serde_json::Value)>,
     git_reading: HashSet<PathBuf>,
+    /// The paths each message names, by a hash of its text, so transcripts
+    /// aren't parsed again on every push.
+    mentions: RefCell<HashMap<u64, Rc<Vec<String>>>>,
     /// Everything sent, for tests to read.
     #[cfg(test)]
     pub(super) log: RefCell<Vec<(ConnId, String)>>,
@@ -114,6 +117,7 @@ impl RemoteState {
             _pump: None,
             git: HashMap::new(),
             git_reading: HashSet::new(),
+            mentions: RefCell::default(),
             #[cfg(test)]
             log: RefCell::default(),
         }
@@ -129,6 +133,43 @@ impl RemoteState {
     pub(super) fn connected(&self) -> bool {
         self.conns.values().any(|c| c.authorized)
     }
+}
+
+/// Where a path a message names points on this Mac, when it's a picture or a
+/// video: `file://`, `~/` and absolute paths as they are, relative ones in the
+/// first of the thread's folders that has them.
+fn media_path(written: &str, folders: &[PathBuf]) -> Option<PathBuf> {
+    let written = written.trim_start_matches('<').trim_end_matches('>');
+    if written.contains("://") && !written.starts_with("file://") {
+        return None;
+    }
+    let written = written.strip_prefix("file://").map(|w| w.replace("%20", " ")).unwrap_or_else(|| written.to_string());
+    let path = PathBuf::from(&written);
+    super::media::kind(&path)?;
+    if let Some(rest) = written.strip_prefix("~/") {
+        return Some(std::env::home_dir()?.join(rest));
+    }
+    if path.is_absolute() {
+        return Some(path);
+    }
+    let candidates: Vec<PathBuf> = folders.iter().map(|f| f.join(&path)).collect();
+    candidates.iter().find(|c| c.is_file()).or(candidates.first()).cloned()
+}
+
+/// What a phone asks for a file by: the same for the same file until it
+/// changes, so the phone can keep what it fetched. Only files shared with a
+/// connection can be fetched by it, so the token needn't be secret.
+fn media_token(path: &Path, meta: Option<&std::fs::Metadata>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(path.as_os_str().as_encoded_bytes());
+    if let Some(m) = meta {
+        h.update(m.len().to_le_bytes());
+        if let Ok(at) = m.modified().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {
+            h.update(at.as_nanos().to_le_bytes());
+        }
+    }
+    hex::encode(&h.finalize()[..16])
 }
 
 /// What a phone asks for, once it's in.
@@ -653,7 +694,11 @@ impl Workspace {
             if let Some(id) = thread
                 && let Some((p, i)) = self.locate(id)
             {
-                out[2] = Some(json!({"type": "thread", "thread": self.thread_detail(p, i)}).to_string());
+                let mut media = Vec::new();
+                out[2] = Some(json!({"type": "thread", "thread": self.thread_detail(p, i, &mut media)}).to_string());
+                if let Some(server) = &self.remote.server {
+                    server.allow(conn, media);
+                }
                 let folders = self.thread_folders(p, i);
                 self.read_git_soon(&folders, cx);
                 let repos: Vec<serde_json::Value> = folders.iter().filter_map(|f| self.remote.git.get(f).map(|(_, v)| v.clone())).collect();
@@ -695,9 +740,51 @@ impl Workspace {
             .collect()
     }
 
-    fn thread_detail(&self, p: usize, i: usize) -> serde_json::Value {
+    /// The pictures and videos a message points at that are on this Mac, as
+    /// the phone is told of them, each added to `shared` by its token.
+    fn message_media(&self, text: &str, folders: &[PathBuf], shared: &mut Vec<(String, PathBuf)>) -> Vec<serde_json::Value> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let named = {
+            let key = hash(text);
+            let mut cache = self.remote.mentions.borrow_mut();
+            if cache.len() > 4000 {
+                cache.clear();
+            }
+            cache.entry(key).or_insert_with(|| Rc::new(super::md::mentioned_paths(text))).clone()
+        };
+        named
+            .iter()
+            .filter_map(|written| media_path(written, folders))
+            .map(|path| {
+                let kind = match super::media::kind(&path) {
+                    Some(super::media::Kind::Video) => "video",
+                    _ => "image",
+                };
+                let meta = std::fs::metadata(&path).ok();
+                let token = media_token(&path, meta.as_ref());
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let exists = meta.as_ref().is_some_and(|m| m.is_file());
+                if exists {
+                    shared.push((token.clone(), path));
+                }
+                json!({"ref": token, "name": name, "kind": kind, "size": meta.map(|m| m.len()), "exists": exists})
+            })
+            .collect()
+    }
+
+    fn thread_detail(&self, p: usize, i: usize, shared: &mut Vec<(String, PathBuf)>) -> serde_json::Value {
         let project = &self.projects[p];
         let t = &project.threads[i];
+        let folders = self.thread_folders(p, i);
+        let with_media = |mut block: serde_json::Value, text: &str, shared: &mut Vec<(String, PathBuf)>| {
+            let media = self.message_media(text, &folders, shared);
+            if !media.is_empty() {
+                block["media"] = media.into();
+            }
+            block
+        };
         let settings: Vec<String> = [Role::Model, Role::Effort, Role::Mode]
             .iter()
             .filter_map(|role| t.settings.iter().find(|s| s.role == *role))
@@ -710,41 +797,38 @@ impl Workspace {
             })
         };
         let start = t.blocks.len().saturating_sub(MAX_BLOCKS);
-        let blocks: Vec<serde_json::Value> = t.blocks[start..]
-            .iter()
-            .enumerate()
-            .filter_map(|(n, b)| {
-                let index = start + n;
-                Some(match b {
-                    Block::User(m) => json!({"kind": "user", "index": index, "text": m.text.to_string(), "at": m.at}),
-                    Block::Text(text) => json!({"kind": "text", "index": index, "text": text}),
-                    Block::Thought(_) => return None,
-                    Block::Tool(call) => {
-                        let (adds, dels) = call.diffs.iter().fold((0, 0), |(a, d), diff| {
-                            let (x, y) = crate::model::count(diff.old.as_deref().unwrap_or(""), &diff.new);
-                            (a + x, d + y)
-                        });
-                        json!({
-                            "kind": "tool", "index": index, "title": call.title, "tool": call.kind, "status": call.status,
-                            "output": tail(&call.output, MAX_OUTPUT),
-                            "files": call.diffs.iter().map(|d| project.relative(&d.path).display().to_string()).collect::<Vec<_>>(),
-                            "adds": adds, "dels": dels,
-                        })
-                    }
-                    Block::Permission(perm) => json!({
-                        "kind": "permission", "index": index, "id": perm.id, "title": perm.title,
-                        "detail": tool(&perm.tool).map(|c| c.title.clone()),
-                        "tool": tool(&perm.tool).map(|c| c.kind),
-                        "answers": perm.answers.iter().map(|a| json!({"id": a.id, "name": a.name, "allow": a.allow})).collect::<Vec<_>>(),
-                        "chosen": perm.chosen,
-                    }),
-                    Block::Ask(ask) => ask_json(index, ask),
-                    Block::Notice(text) => json!({"kind": "notice", "index": index, "text": text}),
-                    Block::SignIn { agent, .. } => json!({"kind": "notice", "index": index, "text": format!("{agent} needs you to sign in on the Mac.")}),
-                    Block::TurnEnded { at, worked_ms } => json!({"kind": "ended", "index": index, "at": at, "worked_ms": worked_ms}),
-                })
-            })
-            .collect();
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        for (n, b) in t.blocks[start..].iter().enumerate() {
+            let index = start + n;
+            blocks.push(match b {
+                Block::User(m) => with_media(json!({"kind": "user", "index": index, "text": m.text.to_string(), "at": m.at}), &m.text, shared),
+                Block::Text(text) => with_media(json!({"kind": "text", "index": index, "text": text}), text, shared),
+                Block::Thought(_) => continue,
+                Block::Tool(call) => {
+                    let (adds, dels) = call.diffs.iter().fold((0, 0), |(a, d), diff| {
+                        let (x, y) = crate::model::count(diff.old.as_deref().unwrap_or(""), &diff.new);
+                        (a + x, d + y)
+                    });
+                    json!({
+                        "kind": "tool", "index": index, "title": call.title, "tool": call.kind, "status": call.status,
+                        "output": tail(&call.output, MAX_OUTPUT),
+                        "files": call.diffs.iter().map(|d| project.relative(&d.path).display().to_string()).collect::<Vec<_>>(),
+                        "adds": adds, "dels": dels,
+                    })
+                }
+                Block::Permission(perm) => json!({
+                    "kind": "permission", "index": index, "id": perm.id, "title": perm.title,
+                    "detail": tool(&perm.tool).map(|c| c.title.clone()),
+                    "tool": tool(&perm.tool).map(|c| c.kind),
+                    "answers": perm.answers.iter().map(|a| json!({"id": a.id, "name": a.name, "allow": a.allow})).collect::<Vec<_>>(),
+                    "chosen": perm.chosen,
+                }),
+                Block::Ask(ask) => ask_json(index, ask),
+                Block::Notice(text) => json!({"kind": "notice", "index": index, "text": text}),
+                Block::SignIn { agent, .. } => json!({"kind": "notice", "index": index, "text": format!("{agent} needs you to sign in on the Mac.")}),
+                Block::TurnEnded { at, worked_ms } => json!({"kind": "ended", "index": index, "at": at, "worked_ms": worked_ms}),
+            });
+        }
         json!({
             "id": t.id,
             "project": project_key(project),
@@ -1163,4 +1247,38 @@ fn thread_infos(project: &Project) -> Vec<ThreadInfo> {
         .collect();
     threads.sort_by(|a, b| b.active_at.cmp(&a.active_at));
     threads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{media_path, media_token};
+    use std::path::PathBuf;
+
+    #[test]
+    fn media_paths_resolve_in_the_threads_folders() {
+        let base = std::env::temp_dir().join(format!("chat-media-paths-{}", std::process::id()));
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(b.join("out")).unwrap();
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(b.join("out/demo.webm"), b"x").unwrap();
+        let folders = [a.clone(), b.clone()];
+        assert_eq!(media_path("out/demo.webm", &folders), Some(b.join("out/demo.webm")), "the folder that has it");
+        assert_eq!(media_path("out/gone.mp4", &folders), Some(a.join("out/gone.mp4")), "else the first, to say it's gone");
+        assert_eq!(media_path("file:///tmp/My%20Shot.png", &folders), Some(PathBuf::from("/tmp/My Shot.png")));
+        assert_eq!(media_path("<~/Movies/a.mov>", &folders), std::env::home_dir().map(|h| h.join("Movies/a.mov")));
+        assert_eq!(media_path("src/main.rs", &folders), None, "not media");
+        assert_eq!(media_path("https://x.dev/a.png", &folders), None, "not on this Mac");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn tokens_change_with_the_file() {
+        let path = std::env::temp_dir().join(format!("chat-media-token-{}.png", std::process::id()));
+        std::fs::write(&path, b"one").unwrap();
+        let first = media_token(&path, std::fs::metadata(&path).ok().as_ref());
+        assert_eq!(first, media_token(&path, std::fs::metadata(&path).ok().as_ref()), "stable");
+        std::fs::write(&path, b"three").unwrap();
+        assert_ne!(first, media_token(&path, std::fs::metadata(&path).ok().as_ref()), "a new version, a new token");
+        std::fs::remove_file(&path).ok();
+    }
 }

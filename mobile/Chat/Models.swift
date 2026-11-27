@@ -54,6 +54,24 @@ struct Question: Decodable, Hashable {
     var label: String { title ?? prompt ?? field }
 }
 
+/// A picture or video on the Mac that a message points at, fetched by `ref`.
+struct Media: Decodable, Identifiable, Hashable {
+    let ref: String
+    let name: String
+    /// image, video.
+    let kind: String
+    let size: Int64?
+    /// Still on the Mac where the message says.
+    let exists: Bool
+    var id: String { ref }
+
+    var isVideo: Bool { kind == "video" }
+    var ext: String { (name as NSString).pathExtension.lowercased() }
+    /// A video AVFoundation plays; the rest (WebM, say) play in a web view.
+    var playsNatively: Bool { !isVideo || ["mp4", "m4v", "mov"].contains(ext) }
+    var sizeText: String? { size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } }
+}
+
 struct Block: Decodable, Identifiable, Hashable {
     let kind: String
     let index: Int
@@ -79,6 +97,8 @@ struct Block: Decodable, Identifiable, Hashable {
     let skipped: Bool?
     // Turn ends
     let workedMs: Int64?
+    /// Pictures and videos a message points at.
+    let media: [Media]?
 
     var id: Int { index }
 
@@ -86,7 +106,7 @@ struct Block: Decodable, Identifiable, Hashable {
         case kind, index, text, at, title, tool, status, output, files, adds, dels
         case permissionId = "id"
         case detail, answers, chosen, open, questions, answered, skipped
-        case workedMs
+        case workedMs, media
     }
 }
 

@@ -263,6 +263,9 @@ struct BlockView: View {
                     .padding(.vertical, 9)
                     .background(Theme.panel, in: RoundedRectangle(cornerRadius: 14))
                     .overlay(RoundedRectangle(cornerRadius: 14).stroke(Theme.border))
+                if let media = block.media, !media.isEmpty {
+                    MediaGallery(media: media).frame(maxWidth: 280)
+                }
                 if let at = block.at {
                     Text(Date(timeIntervalSince1970: TimeInterval(at) / 1000).formatted(date: .omitted, time: .shortened))
                         .font(.caption2).foregroundStyle(Theme.quiet)
@@ -271,7 +274,12 @@ struct BlockView: View {
             .frame(maxWidth: .infinity, alignment: .trailing)
             .padding(.leading, 40)
         case "text":
-            Markdown(text: block.text ?? "")
+            VStack(alignment: .leading, spacing: 10) {
+                Markdown(text: block.text ?? "")
+                if let media = block.media, !media.isEmpty {
+                    MediaGallery(media: media)
+                }
+            }
         case "tool":
             tool
         case "permission":

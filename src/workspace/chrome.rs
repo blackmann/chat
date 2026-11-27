@@ -73,6 +73,7 @@ pub fn tab_glyph(kind: &TabKind) -> Icon {
         TabKind::Diff(_) | TabKind::GitDiff(..) => Glyph::FileDiff.into(),
         TabKind::Terminal(_) => Glyph::Terminal.into(),
         TabKind::ServerLog(..) => Glyph::Zap.into(),
+        TabKind::GitOutput(_) => Glyph::Branch.into(),
     }
 }
 
@@ -891,6 +892,10 @@ impl Workspace {
                     let folder = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     (format!("{name} logs"), folder)
                 }
+                TabKind::GitOutput(root) => {
+                    let many = self.current_project().roots().len() > 1;
+                    ("Git output".to_string(), if many { crate::model::folder_name(root) } else { String::new() })
+                }
             };
             // What the tab holds in full: the label is cut short, the tooltip isn't.
             let tip = {
@@ -902,6 +907,7 @@ impl Workspace {
                     TabKind::GitDiff(path, staged) => format!("{} changes · {}", if *staged { "Staged" } else { "Unstaged" }, full(path)),
                     TabKind::Terminal(cwd) => format!("Terminal · {}", full(cwd)),
                     TabKind::ServerLog(name, root) => format!("{name} logs · {}", full(root)),
+                    TabKind::GitOutput(root) => format!("Git output · {}", full(root)),
                 };
                 SharedString::from(if stale { format!("{what}\nOut of date — open it to see why") } else { what })
             };
@@ -1035,7 +1041,7 @@ impl Workspace {
                     "Nothing is unstaged in this file anymore. This diff is out of date."
                 })
             }
-            TabKind::Chat | TabKind::Terminal(_) | TabKind::ServerLog(..) => None,
+            TabKind::Chat | TabKind::Terminal(_) | TabKind::ServerLog(..) | TabKind::GitOutput(_) => None,
         }
     }
 
@@ -1049,6 +1055,7 @@ impl Workspace {
             TabKind::GitDiff(path, staged) => self.git_diff_view(path, *staged, window, cx),
             TabKind::Terminal(cwd) => return self.terminal_view(cwd, cx),
             TabKind::ServerLog(name, root) => return self.server_log_view(name, root, cx),
+            TabKind::GitOutput(root) => return self.git_output_view(root, cx),
         };
         // A Git diff that failed to load already says why in its place.
         let explained = match kind {

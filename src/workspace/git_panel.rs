@@ -55,6 +55,23 @@ fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: 
         .when(!enabled, |s| s.opacity(0.5))
 }
 
+/// What an operation is called when it fails, in a toast and the output tab.
+fn operation_name(operation: &Operation) -> &'static str {
+    match operation {
+        Operation::Stage(_) => "Stage",
+        Operation::Unstage(_) => "Unstage",
+        Operation::Commit(_) => "Commit",
+        Operation::Push => "Push",
+        Operation::Amend { .. } => "Amend",
+        Operation::UndoCommit => "Undo commit",
+        Operation::Discard { .. } => "Discard",
+        Operation::Stash { .. } => "Stash",
+        Operation::StashPop(_) => "Stash pop",
+        Operation::StashApply(_) => "Stash apply",
+        Operation::StashDrop(_) => "Stash drop",
+    }
+}
+
 /// What the agent is asked, around the changes.
 fn commit_prompt(changes: &str) -> String {
     format!(
@@ -159,6 +176,15 @@ impl Section {
 const MAX_ROWS: usize = 300;
 
 impl Workspace {
+    /// Keep what a failed Git command printed for the output tab, refresh the
+    /// tab if it's open, and say so in a toast rather than in the panel.
+    fn git_failed(&mut self, folder: PathBuf, what: &'static str, output: String, cx: &mut Context<Self>) {
+        let failure = super::toast::GitFailure::new(what, output);
+        let detail = failure.summary();
+        self.git_errors.insert(folder.clone(), failure);
+        self.show_toast(format!("{what} failed"), detail, Some(super::toast::ToastAction::GitOutput(folder)), cx);
+    }
+
     /// The folder whose repository the Changes page shows.
     pub(super) fn git_folder(&self) -> Option<PathBuf> {
         let roots = self.current_project().roots();
@@ -346,8 +372,8 @@ impl Workspace {
         self.stash_drop_armed = None;
         self.discard_armed = None;
         self.git_revision += 1;
-        self.git_errors.remove(&folder);
         cx.notify();
+        let what = operation_name(&operation);
         let committed = match &operation {
             Operation::Commit(message) | Operation::Amend { message, .. } => Some(message.clone()),
             _ => None,
@@ -363,9 +389,7 @@ impl Workspace {
                 s.git_running = None;
                 s.git_revision += 1;
                 match result {
-                    Err(error) => {
-                        s.git_errors.insert(folder, error);
-                    }
+                    Err(error) => s.git_failed(folder, what, error, cx),
                     Ok(()) => {
                         if amended {
                             s.amend = false;
@@ -397,7 +421,6 @@ impl Workspace {
         let Some(spec) = self.settings.agents.get(self.settings.agent).cloned() else {
             return;
         };
-        self.git_errors.remove(&folder);
         let task = cx.spawn({
             let folder = folder.clone();
             async move |this, cx| {
@@ -413,9 +436,7 @@ impl Workspace {
                     s.commit_writing = None;
                     match result {
                         Ok(message) => s.written_commit_message = Some((folder, message)),
-                        Err(error) => {
-                            s.git_errors.insert(folder, error);
-                        }
+                        Err(error) => s.git_failed(folder, "Writing a commit message", error, cx),
                     }
                     cx.notify();
                 });
@@ -897,10 +918,6 @@ impl Workspace {
                 .child(div().flex_1())
                 .child(self.worktree_picker(colors, &folder, snapshot, cx)),
         );
-        let folder = tree;
-        if let Some(error) = self.git_errors.get(&folder) {
-            page = page.child(div().px_3().py_2().text_size(px(crate::theme::scaled_ui(12.))).text_color(rgb(colors.red)).child(error.clone()));
-        }
 
         let sections = Section::ALL.map(|section| (section, section.entries(snapshot)));
         let open = match &self.tabs[self.active].kind {

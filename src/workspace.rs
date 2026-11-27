@@ -25,6 +25,7 @@ mod servers;
 mod git_panel;
 mod syntax;
 mod terminal;
+mod toast;
 mod usage;
 pub use terminal::init_terminal_keys;
 mod ui;
@@ -102,6 +103,8 @@ pub enum TabKind {
     Terminal(PathBuf),
     /// A language server's log, by its name and root.
     ServerLog(String, PathBuf),
+    /// What the last failed Git command in a folder printed.
+    GitOutput(PathBuf),
 }
 
 pub struct Tab {
@@ -326,7 +329,9 @@ pub struct Workspace {
     git_watch: Option<crate::git_watch::Watcher>,
     git_busy: bool,
     git_revision: usize,
-    git_errors: HashMap<PathBuf, String>,
+    git_errors: HashMap<PathBuf, toast::GitFailure>,
+    toast: Option<toast::Toast>,
+    toast_count: usize,
     /// Worktrees picked in the Changes page, by thread and project folder. They
     /// win over what the thread's agent reported until it reports again.
     git_picks: HashMap<(Option<usize>, PathBuf), PathBuf>,
@@ -580,6 +585,8 @@ impl Workspace {
             git_busy: false,
             git_revision: 0,
             git_errors: HashMap::new(),
+            toast: None,
+            toast_count: 0,
             git_picks: HashMap::new(),
             commit_message,
             clear_commit_message: None,
@@ -2395,6 +2402,7 @@ impl Render for Workspace {
             .when_some(self.new_project_view(cx), |root, view| root.child(view))
             .when_some(self.lsp_overlay(cx), |root, overlay| root.child(overlay))
             .when_some(self.mission_overlay(cx), |root, card| root.child(card))
+            .when_some(self.toast_view(cx), |root, toast| root.child(toast))
             .when_some(self.popup.clone(), |root, menu| {
                 root.child(
                     deferred(

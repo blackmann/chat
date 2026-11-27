@@ -6,7 +6,10 @@ they can see each other and through a relay when they can't. Relays only see
 ciphertext.
 
 The phone can browse projects and threads, read transcripts, send messages, start
-threads, stop turns, answer permission requests and answer the agent's questions. It can't change a thread's mode,
+threads, stop turns, answer permission requests and answer the agent's questions.
+Pictures and videos a message points at (screenshots, screen recordings) show
+under it and open full screen; the Mac sends only files a transcript names, each
+on its own stream, and a download that breaks off resumes. It can't change a thread's mode,
 model or effort; raising what an agent may do stays on the Mac.
 
 ## Build

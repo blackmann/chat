@@ -631,6 +631,43 @@ pub fn render(
     }
 }
 
+/// Every file a message points at, as written: image and link targets, the
+/// paths of mentions, and paths named in its prose or code spans. Not yet
+/// resolved, so relative ones are still relative.
+pub(super) fn mentioned_paths(text: &str) -> Vec<String> {
+    fn walk(nodes: &[Node], out: &mut Vec<String>) {
+        for n in nodes {
+            match n {
+                Node::Text(t) => out.extend(path_spans(&t.value).into_iter().map(|r| t.value[r].to_string())),
+                Node::InlineCode(c) => out.extend(path_spans(&c.value).into_iter().map(|r| c.value[r].to_string())),
+                Node::Image(i) => out.push(i.url.clone()),
+                Node::Link(l) if l.url.starts_with("chip:") => {
+                    if let Some(sent) = l.url.split_once('|').map(|(_, s)| s) {
+                        out.push(sent.trim_start_matches('@').to_string());
+                    }
+                }
+                Node::Link(l) => {
+                    out.push(l.url.clone());
+                    walk(&l.children, out);
+                }
+                other => {
+                    if let Some(children) = other.children() {
+                        walk(children, out);
+                    }
+                }
+            }
+        }
+    }
+    let Ok(root) = markdown::to_mdast(text, &markdown::ParseOptions::gfm()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    walk(root.children().map(Vec::as_slice).unwrap_or_default(), &mut out);
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    out
+}
+
 /// Where `s` names files or folders in plain text: `src/x.rs`, `src/x.rs:12`,
 /// `./out/a.webm`, `/Users/me/notes`, `~/Downloads/a.png`. Relative paths need
 /// a folder and an extension, so prose like "and/or" stays text.
@@ -684,7 +721,12 @@ fn is_path(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: gpui's own `test` attribute would shadow the built-in one.
-    use super::{Breaks, Inline, Node, Style, path_spans, strip_tags};
+    use super::{Breaks, Inline, Node, Style, mentioned_paths, path_spans, strip_tags};
+    #[test]
+    fn finds_every_mentioned_path() {
+        let text = "Recorded `out/demo.mp4` and ![shot](/tmp/a.png).\n\nSee [the clip](./clips/b.webm), and [x](<chip:file|@shots/c.png>). Twice: out/demo.mp4";
+        assert_eq!(mentioned_paths(text), ["out/demo.mp4", "/tmp/a.png", "./clips/b.webm", "shots/c.png"]);
+    }
     fn flatten(src: &str, breaks: Breaks) -> Inline {
         let Ok(Node::Root(root)) = markdown::to_mdast(src, &markdown::ParseOptions::gfm()) else {
             panic!()
