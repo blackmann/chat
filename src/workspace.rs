@@ -11,6 +11,7 @@ mod md;
 mod media;
 mod mentions;
 mod missions;
+mod new_project;
 mod panes;
 mod retro_mac;
 mod preferences;
@@ -34,7 +35,7 @@ use crate::{
     store,
     menu::{self as popover, Menu},
     model::{Block, Project, Session, Thread, ThreadState, tilde},
-    settings::{ActivityMode, FollowUpMode, Settings, ThreadSort},
+    settings::{ActivityMode, FollowUpMode, ProjectPalette, Settings, ThreadSort},
     theme::{Palette, mono, palette},
 };
 use futures::StreamExt;
@@ -332,6 +333,10 @@ pub struct Workspace {
     clear_commit_message: Option<String>,
     /// An undone commit's message, to put back in an empty commit box.
     restore_commit_message: Option<String>,
+    /// An agent writing a commit message for this folder's changes.
+    commit_writing: Option<(PathBuf, Task<()>)>,
+    /// A message an agent wrote, for the folder it was written for.
+    written_commit_message: Option<(PathBuf, String)>,
     /// Which Git operation is running, so its button can say so.
     git_running: Option<GitRunning>,
     /// The stash a first click on Drop armed; a second click drops it.
@@ -368,6 +373,9 @@ pub struct Workspace {
     /// The project being renamed, and the field its new name is typed in.
     renaming: Option<usize>,
     rename_input: Entity<InputState>,
+    /// The project being added, while its popover is open: the folders picked so far.
+    new_project: Option<Vec<PathBuf>>,
+    new_project_input: Entity<InputState>,
     /// The text fields of questions still waiting, by thread, question set and field.
     ask_inputs: HashMap<(usize, u64, String), Entity<InputState>>,
     /// Why a set of questions couldn't be sent yet, by thread and question set.
@@ -471,6 +479,13 @@ impl Workspace {
             }
         })
         .detach();
+        let new_project_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
+        cx.subscribe_in(&new_project_input, window, |s, _, e: &gpui_component::input::InputEvent, window, cx| {
+            if let gpui_component::input::InputEvent::PressEnter { .. } = e {
+                s.create_new_project(window, cx);
+            }
+        })
+        .detach();
         let settings = Settings::load();
         let commit_message = git_panel::commit_input(settings.commit_box_height.is_some(), window, cx);
         let mut projects = vec![Project::chats()];
@@ -566,6 +581,8 @@ impl Workspace {
             commit_message,
             clear_commit_message: None,
             restore_commit_message: None,
+            commit_writing: None,
+            written_commit_message: None,
             git_running: None,
             stash_drop_armed: None,
             discard_armed: None,
@@ -585,6 +602,8 @@ impl Workspace {
             effort_dragging: false,
             renaming: None,
             rename_input,
+            new_project: None,
+            new_project_input,
             ask_inputs: HashMap::new(),
             ask_errors: HashMap::new(),
             ask_focus: cx.focus_handle(),
@@ -866,44 +885,11 @@ impl Workspace {
         self.start_thread(cx);
         self.composer.update(cx, |s, cx| s.focus(window, cx));
     }
-    fn add_project(&mut self, _: &AddProject, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: true,
-            prompt: Some("Add project".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let Ok(Ok(Some(paths))) = receiver.await else {
-                return;
-            };
-            let _ = this.update(cx, |s, cx| {
-                for path in paths {
-                    match s.projects.iter().position(|p| p.path.as_deref() == Some(&path)) {
-                        Some(existing) => s.select_project(existing, cx),
-                        None => {
-                            let entry = crate::settings::ProjectEntry { path, name: None, folders: Vec::new() };
-                            let mut project = Project::open(entry);
-                            // A folder added back keeps the threads it had.
-                            if let Some(store) = &s.store {
-                                project.threads = store.load(&project, &s.settings.agents, s.settings.agent, &mut s.next_thread);
-                            }
-                            s.projects.push(project);
-                            s.select_project(s.projects.len() - 1, cx);
-                        }
-                    }
-                }
-                s.save_projects();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
     /// Write the rail back to settings: paths, names and folders.
     fn save_projects(&mut self) {
         self.settings.projects = self.projects.iter().filter_map(Project::entry).collect();
         // Picks go with their project.
-        let kept: Vec<PathBuf> = self.projects.iter().map(|p| p.path.clone().unwrap_or_default()).collect();
+        let kept: Vec<PathBuf> = self.projects.iter().map(|p| PathBuf::from(p.key())).collect();
         self.settings.project_picks.retain(|path, _| kept.contains(path));
         let _ = self.settings.save();
     }
@@ -1354,7 +1340,7 @@ impl Workspace {
     }
     /// Where a project's picks are filed in settings.
     fn picks_key(&self, project: usize) -> PathBuf {
-        self.projects[project].path.clone().unwrap_or_default()
+        PathBuf::from(self.projects[project].key())
     }
     /// The model and effort a new thread in `project` starts on: those last
     /// picked there, else what the agent began on before any pick, if it keeps
@@ -2169,6 +2155,11 @@ impl Render for Workspace {
                 self.commit_message.update(cx, |s, cx| s.set_value(message, window, cx));
             }
         }
+        if let Some((folder, message)) = self.written_commit_message.take() {
+            if self.git_tree().as_deref() == Some(folder.as_path()) {
+                self.commit_message.update(cx, |s, cx| s.set_value(message, window, cx));
+            }
+        }
         if let Some(committed) = self.clear_commit_message.take() {
             if self.commit_message.read(cx).value().as_ref() == committed {
                 self.commit_message.update(cx, |s, cx| s.set_value("", window, cx));
@@ -2381,6 +2372,7 @@ impl Render for Workspace {
                     .with_priority(3),
                 )
             })
+            .when_some(self.new_project_view(cx), |root, view| root.child(view))
             .when_some(self.lsp_overlay(cx), |root, overlay| root.child(overlay))
             .when_some(self.mission_overlay(cx), |root, card| root.child(card))
             .when_some(self.popup.clone(), |root, menu| {

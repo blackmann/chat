@@ -55,6 +55,30 @@ fn bar_button(colors: Palette, id: &'static str, glyph: Option<IconName>, text: 
         .when(!enabled, |s| s.opacity(0.5))
 }
 
+/// What the agent is asked, around the changes.
+fn commit_prompt(changes: &str) -> String {
+    format!(
+        "Write a git commit message for the changes below, following Conventional Commits: \
+a `type(scope): summary` subject line (types such as feat, fix, refactor, perf, docs, test, build, ci, chore, style), \
+in the imperative, lowercase, no trailing period, at most 72 characters; the scope only when one area clearly owns the change. \
+Add a body after a blank line only when the subject can't carry the why, wrapped at 72 columns. \
+Answer from the diff alone; don't run tools or read files. Reply with the commit message only: no preamble, \
+no quotes, no code fences.\n\n<changes>\n{changes}\n</changes>"
+    )
+}
+
+/// The reply without fences or a preamble an agent may add anyway.
+fn tidy_commit_message(reply: &str) -> Option<String> {
+    let mut text = reply.trim();
+    if let Some(inner) = text.strip_prefix("```") {
+        // Past the fence's language tag, up to the closing fence.
+        let inner = inner.split_once('\n').map_or("", |(_, rest)| rest);
+        text = inner.rsplit_once("```").map_or(inner, |(body, _)| body).trim();
+    }
+    let text = text.trim_matches('`').trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// A checkbox: on under Staged, off under Unstaged.
 fn tick(colors: Palette, id: impl Into<ElementId>, on: bool, enabled: bool) -> Stateful<Div> {
     row()
@@ -357,6 +381,48 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    /// Have the default agent write a Conventional Commits message for what is
+    /// staged (or every change, when nothing is) and put it in the commit box.
+    /// Asking again while it writes stops it.
+    fn write_commit_message(&mut self, cx: &mut Context<Self>) {
+        if self.commit_writing.take().is_some() {
+            cx.notify();
+            return;
+        }
+        let (Some(root), Some(folder)) = (self.git_snapshot().map(|s| s.root.clone()), self.git_tree()) else {
+            return;
+        };
+        let Some(spec) = self.settings.agents.get(self.settings.agent).cloned() else {
+            return;
+        };
+        self.git_errors.remove(&folder);
+        let task = cx.spawn({
+            let folder = folder.clone();
+            async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let changes = git::changes_for_message(&root, 60_000)?;
+                        let reply = crate::agent::ask_once(spec, root, commit_prompt(&changes)).await?;
+                        tidy_commit_message(&reply).ok_or_else(|| "The agent didn't write a message".to_string())
+                    })
+                    .await;
+                let _ = this.update(cx, |s, cx| {
+                    s.commit_writing = None;
+                    match result {
+                        Ok(message) => s.written_commit_message = Some((folder, message)),
+                        Err(error) => {
+                            s.git_errors.insert(folder, error);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        });
+        self.commit_writing = Some((folder, task));
+        cx.notify();
     }
 
     /// With several folders, which one the Changes page shows.
@@ -1126,7 +1192,49 @@ impl Workspace {
                                 }),
                         )
                     } else {
+                        let writing = self.commit_writing.is_some();
+                        let can_write = writing || (!self.git_busy && !conflicted && !snapshot.entries.is_empty());
+                        let write_tip = if writing {
+                            "Writing a commit message… Click to stop"
+                        } else if staged > 0 {
+                            "Write a commit message for the staged changes"
+                        } else {
+                            "Write a commit message for all changes"
+                        };
                         s.child(
+                            div()
+                                .id("write-commit")
+                                .size(px(24.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.))
+                                .child({
+                                    let glyph = icon(Glyph::Sparkle).size(px(13.)).text_color(rgb(if writing { colors.blue } else { colors.muted }));
+                                    if writing {
+                                        div()
+                                            .child(glyph)
+                                            .with_animation(
+                                                "write-commit-pulse",
+                                                Animation::new(std::time::Duration::from_millis(900)).repeat().with_easing(pulsating_between(0.4, 1.)),
+                                                |s, t| s.opacity(t),
+                                            )
+                                            .into_any_element()
+                                    } else {
+                                        glyph.into_any_element()
+                                    }
+                                })
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(write_tip).build(window, cx))
+                                .when(can_write, |s| {
+                                    s.cursor_pointer()
+                                        .hover(|s| s.bg(rgb(colors.hover)))
+                                        .active(|s| s.bg(rgb(colors.border)))
+                                        .on_click(cx.listener(|s, _, _, cx| s.write_commit_message(cx)))
+                                })
+                                .when(!can_write, |s| s.opacity(0.5)),
+                        )
+                        .child(
                             bar_button(colors, "commit", None, if running == Some(GitRunning::Commit) { "Committing…" } else { "Commit" }, can_commit)
                                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(commit_tip.clone()).build(window, cx))
                                 .when(can_commit, |s| {
@@ -1270,5 +1378,18 @@ impl Workspace {
             )
             .child(div().flex_1().min_h_0().child(body))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tidy_commit_message;
+
+    #[test]
+    fn commit_messages_lose_their_fences() {
+        assert_eq!(tidy_commit_message("  feat: add x\n").as_deref(), Some("feat: add x"));
+        assert_eq!(tidy_commit_message("```text\nfix(git): y\n\nbody\n```").as_deref(), Some("fix(git): y\n\nbody"));
+        assert_eq!(tidy_commit_message("`chore: z`").as_deref(), Some("chore: z"));
+        assert_eq!(tidy_commit_message(" \n"), None);
     }
 }

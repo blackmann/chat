@@ -67,7 +67,7 @@ fn connect(path: &Path) -> rusqlite::Result<Connection> {
 
 /// Where a project's threads are filed.
 fn project_key(project: &Project) -> String {
-    project.path.as_deref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+    project.key()
 }
 
 fn hash(body: &str) -> u64 {

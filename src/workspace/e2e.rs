@@ -1427,3 +1427,114 @@ fn drags_files_into_folders(cx: &mut TestAppContext) {
     assert!(d.read(|s| s.file_drop.is_none()), "taken up by the drop");
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }
+
+/// The rail's plus opens a popover beside it. The first folder picked names
+/// the project; more can be added, and it lands on the rail with them all.
+#[gpui::test]
+fn adds_a_project_from_the_rail(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let plus = d.cx.debug_bounds("add-project").expect("the plus button is drawn");
+    d.cx.simulate_click(plus.center(), Modifiers::none());
+    d.settle();
+    let pop = d.cx.debug_bounds("new-project").expect("a click opens the popover");
+    assert!(pop.left() >= plus.right(), "it opens to the right of the button");
+
+    let base = project.parent().unwrap().to_path_buf();
+    let (one, two) = (base.join("alpha"), base.join("beta"));
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    let ws = d.ws.clone();
+    let pick = |d: &mut Driver, paths: Vec<PathBuf>| {
+        let ws = ws.clone();
+        d.cx.update(|window, cx| ws.update(cx, |s, cx| s.add_new_project_folders(paths, window, cx)));
+        d.settle();
+    };
+    pick(&mut d, vec![one.clone()]);
+    let name = |d: &mut Driver| {
+        let ws = d.ws.clone();
+        d.cx.update(|_, cx| ws.read(cx).new_project_input.read(cx).value().to_string())
+    };
+    assert_eq!(name(&mut d), "alpha", "named after the first folder");
+    pick(&mut d, vec![two.clone(), one.clone()]);
+    assert_eq!(name(&mut d), "alpha", "later folders leave the name be");
+    assert_eq!(d.read(|s| s.new_project.clone()), Some(vec![one.clone(), two.clone()]));
+
+    d.keys("backspace");
+    d.cx.simulate_input("Both");
+    d.keys("enter");
+    d.settle();
+    assert!(d.read(|s| s.new_project.is_none()), "Enter adds it and closes the popover");
+    let (name, path, folders) = d.read(|s| {
+        let p = s.current_project();
+        (p.name.clone(), p.path.clone(), p.folders.clone())
+    });
+    assert_eq!((name.as_str(), path, folders), ("Both", Some(one), vec![two]));
+
+    d.cx.simulate_click(plus.center(), Modifiers::none());
+    d.settle();
+    d.keys("escape");
+    assert!(d.read(|s| s.new_project.is_none()), "Escape closes it");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// A new project whose folders are other projects' main ones leaves those as
+/// they were: it is based in its first folder, with its own threads.
+#[gpui::test]
+fn adding_an_existing_projects_folder_leaves_it_be(cx: &mut TestAppContext) {
+    let _one = E2E.lock().unwrap_or_else(|e| e.into_inner());
+    let (project, config) = fixture();
+    let mut d = boot(cx, &config);
+    d.settle();
+    let before = d.read(|s| s.projects.iter().map(|p| (p.name.clone(), p.path.clone(), p.folders.clone())).collect::<Vec<_>>());
+    let other = project.parent().unwrap().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let ws = d.ws.clone();
+    let (existing, more) = (project.clone(), other.clone());
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| s.add_project(&super::AddProject, window, cx))
+    });
+    d.settle();
+    d.cx.update(|window, cx| {
+        ws.update(cx, |s, cx| s.add_new_project_folders(vec![existing, more], window, cx))
+    });
+    d.settle();
+    d.keys("backspace");
+    d.cx.simulate_input("Both");
+    d.keys("enter");
+    let after = d.read(|s| s.projects.iter().map(|p| (p.name.clone(), p.path.clone(), p.folders.clone())).collect::<Vec<_>>());
+    assert_eq!(&after[..before.len()], &before[..], "the existing project is untouched");
+    assert_eq!(after.len(), before.len() + 1, "a new project is added");
+    assert_eq!(after.last().unwrap(), &("Both".to_string(), Some(project.clone()), vec![other.clone()]));
+    let (old, new) = d.read(|s| (s.projects[before.len() - 1].key(), s.projects.last().unwrap().key()));
+    assert_ne!(old, new, "the two don't share threads");
+    // Both folders already projects' main ones, as with a backend and a mobile app.
+    d.act(|s, _| s.projects.push(crate::model::Project::open(crate::settings::ProjectEntry { path: other.clone(), name: None, folders: vec![], key: None })));
+    let count = d.read(|s| s.projects.len());
+    let (a, b) = (project.clone(), other.clone());
+    d.cx.update(|window, cx| ws.update(cx, |s, cx| s.add_project(&super::AddProject, window, cx)));
+    d.settle();
+    d.cx.update(|window, cx| ws.update(cx, |s, cx| s.add_new_project_folders(vec![b, a], window, cx)));
+    d.settle();
+    d.keys("enter");
+    assert_eq!(d.read(|s| s.projects.len()), count + 1, "it is still added");
+    // The same main folder with the same others, in another order, is that project.
+    let third = project.parent().unwrap().join("third");
+    std::fs::create_dir_all(&third).unwrap();
+    let both = d.read(|s| s.projects.len() - 1);
+    d.act(|s, _| s.projects[both].folders.push(third.clone()));
+    let open = |d: &mut Driver, folders: Vec<PathBuf>| {
+        d.cx.update(|window, cx| ws.update(cx, |s, cx| s.add_project(&super::AddProject, window, cx)));
+        d.settle();
+        d.cx.update(|window, cx| ws.update(cx, |s, cx| s.add_new_project_folders(folders, window, cx)));
+        d.settle();
+        d.keys("enter");
+    };
+    open(&mut d, vec![other.clone(), third.clone(), project.clone()]);
+    assert_eq!(d.read(|s| (s.projects.len(), s.project)), (count + 1, both), "it opens rather than adding again");
+    open(&mut d, vec![third.clone(), other.clone(), project.clone()]);
+    assert_eq!(d.read(|s| s.projects.len()), count + 2, "another main folder is another project");
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}

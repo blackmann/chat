@@ -40,6 +40,32 @@ pub enum ActivityMode {
     Visible,
 }
 
+/// The colours projects take on the rail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectPalette {
+    /// An even spread round the wheel, rich but not loud.
+    #[default]
+    Aurora,
+    /// Punchy neon pinks, violets and blues.
+    Synthwave,
+    /// Soft and dusty.
+    Dusk,
+    /// Leaning cool, teals and blues, with a few warm accents.
+    Reef,
+}
+impl ProjectPalette {
+    pub const ALL: [ProjectPalette; 4] = [Self::Aurora, Self::Synthwave, Self::Dusk, Self::Reef];
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Aurora => "Aurora",
+            Self::Synthwave => "Synthwave",
+            Self::Dusk => "Dusk",
+            Self::Reef => "Reef",
+        }
+    }
+}
+
 /// A project on the rail: its main folder (where agents run and threads are
 /// filed), the name it goes by, and any further folders it spans.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +76,10 @@ pub struct ProjectEntry {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<PathBuf>,
+    /// What its threads and picks are filed under, for a project whose main
+    /// folder is another's too. Without one, that's the main folder's path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Earlier settings listed projects as bare paths.
@@ -63,13 +93,15 @@ enum SavedEntry {
         name: Option<String>,
         #[serde(default)]
         folders: Vec<PathBuf>,
+        #[serde(default)]
+        key: Option<String>,
     },
 }
 impl From<SavedEntry> for ProjectEntry {
     fn from(saved: SavedEntry) -> Self {
         match saved {
-            SavedEntry::Path(path) => Self { path, name: None, folders: Vec::new() },
-            SavedEntry::Full { path, name, folders } => Self { path, name, folders },
+            SavedEntry::Path(path) => Self { path, name: None, folders: Vec::new(), key: None },
+            SavedEntry::Full { path, name, folders, key } => Self { path, name, folders, key },
         }
     }
 }
@@ -94,6 +126,8 @@ pub struct Settings {
     pub activity: ActivityMode,
     /// What orders the thread list.
     pub thread_sort: ThreadSort,
+    /// The colours projects take on the rail.
+    pub project_palette: ProjectPalette,
     /// Whether threads that finish or need an answer out of sight post a
     /// system notification; unset means they do.
     pub notifications: Option<bool>,
@@ -192,7 +226,7 @@ mod tests {
     fn projects_read_bare_paths_and_full_entries() {
         let settings: Settings =
             serde_json::from_str(r#"{"projects": ["/a", {"path": "/b", "name": "Bee", "folders": ["/c"]}]}"#).unwrap();
-        assert_eq!(settings.projects[0], ProjectEntry { path: "/a".into(), name: None, folders: vec![] });
+        assert_eq!(settings.projects[0], ProjectEntry { path: "/a".into(), name: None, folders: vec![], key: None });
         assert_eq!(settings.projects[1].name.as_deref(), Some("Bee"));
         assert_eq!(settings.projects[1].folders, [PathBuf::from("/c")]);
         let again: Settings = serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();

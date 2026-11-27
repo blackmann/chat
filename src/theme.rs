@@ -137,6 +137,37 @@ impl Palette {
     }
 }
 
+/// Colours for projects on the rail, by palette, for light and dark: twelve
+/// each, spaced evenly by perceived hue (OKLCH) with greens rationed, so no
+/// part of the wheel crowds the rest. Initials drawn in one over its own 14%
+/// tint read at about 4.5:1. Compared in `poc/project-palettes.html`.
+pub fn project_colors(palette: crate::settings::ProjectPalette, dark: bool) -> &'static [u32; 12] {
+    use crate::settings::ProjectPalette::*;
+    const AURORA: [[u32; 12]; 2] = [
+        [0xac2f3b, 0xa24102, 0x8a5601, 0x057836, 0x00736a, 0x016f82, 0x0568a4, 0x3d5abd, 0x654db6, 0x843fa0, 0x9b357f, 0xa62f5f],
+        [0xff9595, 0xfc9b6f, 0xeca851, 0x76cf8a, 0x2bd2c2, 0x2ccceb, 0x71bfff, 0x99b5fe, 0xb6aaff, 0xd79df0, 0xee95d1, 0xfb93b4],
+    ];
+    const SYNTHWAVE: [[u32; 12]; 2] = [
+        [0xb20369, 0xba022f, 0x964c04, 0x7a6001, 0x047554, 0x057176, 0x066d90, 0x0058d4, 0x5446d5, 0x7935c6, 0x9425ab, 0xa41591],
+        [0xff81b6, 0xfe898b, 0xff9139, 0xd7ab09, 0x0fd098, 0x0cc9d1, 0x0cc1fd, 0x83b2fe, 0xa2a8fe, 0xbf9bfe, 0xe08af3, 0xf184db],
+    ];
+    const DUSK: [[u32; 12]; 2] = [
+        [0x90464e, 0x8f4b32, 0x875315, 0x6e6105, 0x1b714c, 0x076f6f, 0x036b87, 0x2f6397, 0x505b99, 0x695290, 0x7d4b7f, 0x8a4768],
+        [0xf2a6ab, 0xf1aa92, 0xe6b27f, 0xcbc07b, 0x89d0aa, 0x72d0d0, 0x7acae9, 0x91c3f6, 0xacbaf8, 0xc6b1f0, 0xdcaade, 0xeba6c6],
+    ];
+    const REEF: [[u32; 12]; 2] = [
+        [0xa43c2f, 0x964c04, 0x815b04, 0x2f751d, 0x04755b, 0x02736e, 0x02707e, 0x066d90, 0x2063b0, 0x5656b0, 0x8e4088, 0xa23951],
+        [0xfb9989, 0xf2a26a, 0xe0ae57, 0x8dca80, 0x5ad0ac, 0x3ed0c8, 0x3ecce2, 0x59c5f5, 0x86bafe, 0xa9affe, 0xe39bdc, 0xf996a6],
+    ];
+    let set = match palette {
+        Aurora => &AURORA,
+        Synthwave => &SYNTHWAVE,
+        Dusk => &DUSK,
+        Reef => &REEF,
+    };
+    &set[dark as usize]
+}
+
 pub fn palette(cx: &App) -> Palette {
     *cx.global::<Palette>()
 }

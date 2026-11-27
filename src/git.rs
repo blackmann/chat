@@ -466,6 +466,45 @@ fn blob(root: &Path, spec: &Path, staged_side: &str) -> Option<Vec<u8>> {
     command(root).arg("show").arg(arg).output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
 }
 
+/// The changes a commit message is written for, as a summary and a patch: what
+/// is staged, or everything (untracked files by name) when nothing is. The
+/// patch is cut short past `limit` bytes so a huge change stays a small prompt.
+pub fn changes_for_message(root: &Path, limit: usize) -> Result<String, String> {
+    let text = |args: &[&str]| run(root, args).map(|out| String::from_utf8_lossy(&out).into_owned());
+    let staged = text(&["diff", "--cached", "--no-ext-diff", "--stat"])?;
+    let (stat, patch, untracked) = if staged.trim().is_empty() {
+        let untracked = text(&["ls-files", "--others", "--exclude-standard"])?;
+        let (stat, patch) = if run(root, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+            (text(&["diff", "HEAD", "--no-ext-diff", "--stat"])?, text(&["diff", "HEAD", "--no-ext-diff", "--no-color"])?)
+        } else {
+            Default::default()
+        };
+        (stat, patch, untracked)
+    } else {
+        (staged, text(&["diff", "--cached", "--no-ext-diff", "--no-color"])?, String::new())
+    };
+    if stat.trim().is_empty() && untracked.trim().is_empty() {
+        return Err("No changes to describe".into());
+    }
+    let mut out = stat;
+    if !untracked.trim().is_empty() {
+        out.push_str("\nNew files:\n");
+        out.push_str(&untracked);
+    }
+    out.push('\n');
+    if patch.len() > limit {
+        let mut end = limit;
+        while !patch.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&patch[..end]);
+        out.push_str("\n… (diff cut short)\n");
+    } else {
+        out.push_str(&patch);
+    }
+    Ok(out)
+}
+
 /// One side of a file's change: HEAD → index when `staged`, index → working tree
 /// otherwise, as the two texts.
 pub fn diff(root: &Path, entry: &Entry, staged: bool) -> Result<Diff, String> {
@@ -986,6 +1025,23 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn changes_for_message_prefers_what_is_staged() {
+        let r = Repo::new();
+        assert!(changes_for_message(&r.0, 1000).is_err(), "nothing to describe");
+        r.write("new.txt", "hello\n");
+        assert!(changes_for_message(&r.0, 1000).unwrap().contains("New files:\nnew.txt"));
+        r.stage("new.txt");
+        r.commit();
+        r.write("new.txt", "changed\n");
+        r.write("other.txt", "x\n");
+        let all = changes_for_message(&r.0, 1000).unwrap();
+        assert!(all.contains("+changed") && all.contains("other.txt"));
+        r.stage("new.txt");
+        let staged = changes_for_message(&r.0, 1000).unwrap();
+        assert!(staged.contains("+changed") && !staged.contains("other.txt"));
+        assert!(changes_for_message(&r.0, 10).unwrap().ends_with("(diff cut short)\n"));
     }
     #[test]
     fn partial_staging_and_commit_preserve_worktree() {

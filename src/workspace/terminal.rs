@@ -73,6 +73,10 @@ pub(super) struct TerminalView {
     size: GridSize,
     exited: bool,
     selecting: bool,
+    /// Where the pointer is while selecting, inside the grid or not.
+    drag_at: Point<Pixels>,
+    /// A selection held past the top or bottom edge is scrolling that way.
+    autoscrolling: bool,
     /// The scrollbar's thumb is held, this far below its top.
     bar_drag: Option<f32>,
     /// The pointer is over the scrollbar.
@@ -173,6 +177,8 @@ impl TerminalView {
                 size,
                 exited: false,
                 selecting: false,
+                drag_at: Point::default(),
+                autoscrolling: false,
                 bar_drag: None,
                 bar_hover: false,
                 marked: String::new(),
@@ -437,6 +443,57 @@ fn offset_for(top: f32, track: f32, height: f32, history: usize) -> usize {
 }
 
 impl TerminalView {
+    /// Stretch the selection to the pointer; past the top or bottom edge,
+    /// keep scrolling that way until it comes back or the button is let go.
+    fn drag_select(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.drag_at = position;
+        let point = self.cell(position);
+        if let Some(selection) = &mut self.term.lock().selection {
+            selection.update(point, Direction::Right);
+        }
+        cx.notify();
+        if self.edge_lines().is_some() && !self.autoscrolling {
+            self.autoscrolling = true;
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(Duration::from_millis(40)).await;
+                if !this.update(cx, |s, cx| s.autoscroll(cx)).unwrap_or(false) {
+                    break;
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Lines to scroll per tick with the pointer past an edge (up is positive):
+    /// more the further out it is.
+    fn edge_lines(&self) -> Option<i32> {
+        let y = f32::from(self.drag_at.y);
+        let (top, bottom) = (f32::from(self.bounds.top()), f32::from(self.bounds.bottom()));
+        let lines = |past: f32| (past / HEIGHT).ceil().clamp(1., 10.) as i32;
+        if y < top {
+            Some(lines(top - y))
+        } else if y > bottom {
+            Some(-lines(y - bottom))
+        } else {
+            None
+        }
+    }
+
+    /// One tick of scrolling while selecting past an edge; false once it's over.
+    fn autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(lines) = self.edge_lines().filter(|_| self.selecting) else {
+            self.autoscrolling = false;
+            return false;
+        };
+        self.term.lock().scroll_display(Scroll::Delta(lines));
+        let point = self.cell(self.drag_at);
+        if let Some(selection) = &mut self.term.lock().selection {
+            selection.update(point, Direction::Right);
+        }
+        cx.notify();
+        true
+    }
+
     /// Scroll to `offset` lines up from the bottom.
     fn scroll_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let mut term = self.term.lock();
@@ -601,6 +658,7 @@ impl Render for TerminalView {
                             s.term.lock().selection =
                                 Some(Selection::new(ty, point, Direction::Left));
                             s.selecting = true;
+                            s.drag_at = e.position;
                             cx.notify();
                         }),
                     )
@@ -610,18 +668,7 @@ impl Render for TerminalView {
                     .on_mouse_move(cx.listener(|s, e: &MouseMoveEvent, _, cx| {
                         s.pointer = Some(e.position);
                         s.hover_link(e.modifiers.platform && e.pressed_button.is_none(), cx);
-                        if s.selecting && e.pressed_button == Some(MouseButton::Left) {
-                            let point = s.cell(e.position);
-                            if let Some(selection) = &mut s.term.lock().selection {
-                                selection.update(point, Direction::Right);
-                            }
-                            cx.notify();
-                        }
                     }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|s, _, _, _| s.selecting = false),
-                    )
                     .on_hover(cx.listener(|s, hovered: &bool, _, cx| {
                         if !hovered {
                             s.pointer = None;
@@ -682,6 +729,29 @@ impl Render for TerminalView {
                                     ElementInputHandler::new(bounds, painter.clone()),
                                     cx,
                                 );
+                                // A selection follows the pointer anywhere in the
+                                // window, so it can be dragged past the edges.
+                                let mover = painter.clone();
+                                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                                    if phase != DispatchPhase::Bubble {
+                                        return;
+                                    }
+                                    mover.update(cx, |s, cx| {
+                                        if s.selecting {
+                                            if e.pressed_button == Some(MouseButton::Left) {
+                                                s.drag_select(e.position, cx);
+                                            } else {
+                                                s.selecting = false;
+                                            }
+                                        }
+                                    });
+                                });
+                                let releaser = painter.clone();
+                                window.on_mouse_event(move |e: &MouseUpEvent, _, _, cx| {
+                                    if e.button == MouseButton::Left {
+                                        releaser.update(cx, |s, _| s.selecting = false);
+                                    }
+                                });
                                 painter.update(cx, |s, cx| {
                                     let term = s.term.lock();
                                     let content = term.renderable_content();

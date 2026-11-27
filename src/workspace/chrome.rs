@@ -114,11 +114,10 @@ fn initials(name: &str) -> String {
 /// How long a project goes without activity before its colour greys out.
 const STALE_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// A project's colour, from its parent folder and name, so it stays put when
-/// projects move. FNV-1a, so it doesn't change between Rust releases. Any hue
-/// on the wheel, with a little play in saturation and lightness, kept bright
-/// enough to read on the theme.
-fn project_hue(colors: Palette, path: &Path) -> u32 {
+/// Where in the palette a project's colour search starts, from its parent
+/// folder and name, so it stays put when projects move. FNV-1a, so it doesn't
+/// change between Rust releases.
+fn project_seed(path: &Path) -> u64 {
     let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let key = format!("{}/{}", path.parent().map(name).unwrap_or_default(), name(path));
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -126,12 +125,27 @@ fn project_hue(colors: Palette, path: &Path) -> u32 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
-    let h = (hash % 360) as f32 / 360.;
-    let s = 0.55 + ((hash >> 16) % 30) as f32 / 100.;
-    let l = if colors.dark { 0.62 } else { 0.40 } + ((hash >> 32) % 10) as f32 / 100.;
-    let c = Rgba::from(hsla(h, s, l, 1.));
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u32;
-    byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b)
+    hash
+}
+
+/// Steps taken round a palette of 12 looking for a free colour: 5 shares no
+/// factor with 12, so it reaches every one, and it skips the neighbours that
+/// look most alike.
+const COLOR_STRIDE: usize = 5;
+
+/// Each project's place in a palette of `n` colours, in rail order: its seed
+/// picks a start, then it steps on until it finds a colour no project above
+/// has. Distinct until there are more projects than colours, then shared.
+fn project_slots<'a>(paths: impl Iterator<Item = Option<&'a Path>>, n: usize) -> Vec<Option<usize>> {
+    let mut taken = vec![false; n];
+    paths
+        .map(|path| {
+            let start = (project_seed(path?) % n as u64) as usize;
+            let slot = (0..n).map(|k| (start + k * COLOR_STRIDE) % n).find(|&i| !taken[i]).unwrap_or(start);
+            taken[slot] = true;
+            Some(slot)
+        })
+        .collect()
 }
 
 /// A project's initials on a folder of its colour: a tab over a body, the
@@ -423,14 +437,16 @@ impl Workspace {
     pub(super) fn rail(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = palette(cx);
         let mut list = col().items_center().pt_2().gap(px(2.));
+        let hues = crate::theme::project_colors(self.settings.project_palette, colors.dark);
+        let slots = project_slots(self.projects.iter().map(|p| p.path.as_deref()), hues.len());
         for (i, p) in self.projects.iter().enumerate() {
             let active = self.project == i;
             // Projects untouched for a day fade to grey. One with no times at
             // all, like one just added, keeps its colour.
             let last = p.threads.iter().filter_map(|t| t.last_active()).max();
             let stale = last.is_some_and(|at| crate::model::now_ms() - at > STALE_MS);
-            let hue = match p.path.as_deref() {
-                Some(path) if !stale => project_hue(colors, path),
+            let hue = match slots[i] {
+                Some(slot) if !stale => hues[slot],
                 _ => colors.muted,
             };
             // Where a dragged project would land: a dash above this one (gap `i`),
@@ -577,9 +593,11 @@ impl Workspace {
             }
         }
         list = list.child(
-            row().w(px(RAIL)).h(px(42.)).justify_center().child(
+            row().w(px(RAIL)).h(px(42.)).justify_center().child(self.anchor(
+                super::new_project::ANCHOR,
                 div()
                     .id("add-project")
+                    .debug_selector(|| "add-project".into())
                     .size(px(34.))
                     .flex()
                     .items_center()
@@ -593,8 +611,9 @@ impl Workspace {
                     .hover(|s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
                     .child(icon(IconName::Plus))
                     .tooltip(|w, cx| Tooltip::new("Add project · ⌘ O").build(w, cx))
+                    .when(self.new_project.is_some(), |s| s.bg(rgb(colors.hover)).text_color(rgb(colors.text)))
                     .on_click(cx.listener(|s, _, w, cx| s.add_project(&AddProject, w, cx))),
-            ),
+            )),
         );
         col()
             .w(px(RAIL))
@@ -1271,5 +1290,28 @@ mod thread_order_tests {
             ids(ThreadSort::Created),
             [(Day::Today, 4), (Day::Today, 3), (Day::Yesterday, 2), (Day::Older, 1), (Day::Older, 5)]
         );
+    }
+}
+
+#[cfg(test)]
+mod project_color_tests {
+    use super::project_slots;
+    use std::path::PathBuf;
+
+    #[test]
+    fn projects_get_distinct_colours_that_stay_put() {
+        let paths: Vec<PathBuf> = (0..12).map(|i| PathBuf::from(format!("/code/project-{i}"))).collect();
+        let slots = project_slots(paths.iter().map(|p| Some(p.as_path())), 12);
+        let mut seen: Vec<usize> = slots.iter().map(|s| s.unwrap()).collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 12, "twelve projects, twelve colours");
+        // The same projects get the same colours; a 13th shares one.
+        assert_eq!(project_slots(paths.iter().map(|p| Some(p.as_path())), 12), slots);
+        let mut more = paths.clone();
+        more.push("/code/project-12".into());
+        assert!(project_slots(more.iter().map(|p| Some(p.as_path())), 12)[12].is_some());
+        // Chats, with no folder, takes no colour.
+        assert_eq!(project_slots([None, Some(paths[0].as_path())].into_iter(), 12)[0], None);
     }
 }

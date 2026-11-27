@@ -386,6 +386,46 @@ impl Workspace {
         cx.notify();
     }
 
+    fn set_project_palette(&mut self, palette: ProjectPalette, cx: &mut Context<Self>) {
+        self.settings.project_palette = palette;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    /// A swatch per palette: a few of its colours as it'd look on the rail.
+    fn project_palette_picker(&self, cx: &mut Context<Self>) -> Div {
+        let colors = palette(cx);
+        let current = self.settings.project_palette;
+        row().gap(px(6.)).children(ProjectPalette::ALL.into_iter().map(|choice| {
+            let hues = crate::theme::project_colors(choice, colors.dark);
+            let picked = choice == current;
+            col()
+                .id(SharedString::from(format!("project-palette-{}", choice.name())))
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .grid()
+                        .grid_cols(4)
+                        .gap(px(3.))
+                        .p(px(5.))
+                        .rounded(px(6.))
+                        .border_1()
+                        .border_color(rgb(if picked { colors.blue } else { colors.border }))
+                        .when(picked, |s| s.bg(rgb(colors.blue_tint)))
+                        .children(hues.iter().map(|h| div().size(px(7.)).rounded(px(2.)).bg(rgb(*h)))),
+                )
+                .child(
+                    div()
+                        .text_size(px(crate::theme::scaled_ui(11.)))
+                        .text_color(rgb(if picked { colors.text } else { colors.muted }))
+                        .child(choice.name()),
+                )
+                .on_click(cx.listener(move |s, _, _, cx| s.set_project_palette(choice, cx)))
+        }))
+    }
+
     fn activity_picker(&self, cx: &mut Context<Self>) -> Div {
         let colors = palette(cx);
         let label = ACTIVITY_MODES.iter().find(|(m, _)| *m == self.settings.activity).map_or("", |(_, n)| *n);
@@ -526,6 +566,13 @@ impl Workspace {
             row(Appearance, "Fonts", "Code font", "Code blocks in replies, open files, diffs and paths.", self.font_picker(FontRole::Mono, cx).into_any_element()),
             row(Appearance, "Fonts", "Interface font size", "The base size for chat text, controls, menus, tabs and panels.", self.font_size_picker(FontRole::Ui, cx).into_any_element()),
             row(Appearance, "Fonts", "Code font size", "The base size for code, paths and chip-style inlays.", self.font_size_picker(FontRole::Mono, cx).into_any_element()),
+            row(
+                Appearance,
+                "Projects",
+                "Project colours",
+                "The colours projects take on the rail. Each project keeps its colour, and no two share one until there are more than twelve.",
+                self.project_palette_picker(cx).into_any_element(),
+            ),
             row(Editor, "Code", "Tab width", "How many columns a tab character spans in open files, diffs and code blocks.", self.tab_width_picker(cx).into_any_element()),
             row(Editor, "Code", "Indent guides", "Faint vertical lines at each indent level in open files and diffs.", self.indent_guides_switch(cx).into_any_element()),
             row(

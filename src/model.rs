@@ -901,17 +901,29 @@ pub struct Project {
     pub path: Option<PathBuf>,
     /// Further folders the project spans, beside its main one.
     pub folders: Vec<PathBuf>,
+    /// Set when the main folder is another project's too; see [`Project::key`].
+    pub own_key: Option<String>,
     pub threads: Vec<Thread>,
 }
 impl Project {
     pub fn chats() -> Self {
-        Self { name: "Chats".into(), path: None, folders: Vec::new(), threads: Vec::new() }
+        Self { name: "Chats".into(), path: None, folders: Vec::new(), own_key: None, threads: Vec::new() }
+    }
+    /// What the project's threads and picks are filed under: its main folder's
+    /// path, unless it shares that folder with another project. Empty for chats.
+    pub fn key(&self) -> String {
+        match (&self.own_key, &self.path) {
+            (Some(key), _) => key.clone(),
+            (None, Some(path)) => path.to_string_lossy().into_owned(),
+            (None, None) => String::new(),
+        }
     }
     pub fn open(entry: crate::settings::ProjectEntry) -> Self {
         Self {
             name: entry.name.unwrap_or_else(|| folder_name(&entry.path)),
             path: Some(entry.path),
             folders: entry.folders,
+            own_key: entry.key,
             threads: Vec::new(),
         }
     }
@@ -919,7 +931,7 @@ impl Project {
     pub fn entry(&self) -> Option<crate::settings::ProjectEntry> {
         let path = self.path.clone()?;
         let name = (self.name != folder_name(&path)).then(|| self.name.clone());
-        Some(crate::settings::ProjectEntry { path, name, folders: self.folders.clone() })
+        Some(crate::settings::ProjectEntry { path, name, folders: self.folders.clone(), key: self.own_key.clone() })
     }
     /// Every folder the project spans, the main one first.
     pub fn roots(&self) -> Vec<PathBuf> {

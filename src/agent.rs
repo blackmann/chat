@@ -555,6 +555,51 @@ pub fn connect(
     (command_tx, event_rx, run)
 }
 
+/// Ask an agent one thing in a session of its own and return its reply. It
+/// is given no tools of Chat's and every permission it asks for is refused,
+/// so it can only answer from the prompt. The agent stops once it has replied.
+pub async fn ask_once(spec: AgentSpec, cwd: PathBuf, prompt: String) -> Result<String, String> {
+    let (commands, mut events, run) = connect(spec, cwd, Vec::new(), None, Vec::new(), None);
+    // Commands wait until the session is ready.
+    let _ = commands.unbounded_send(Command::Prompt(prompt));
+    let collect = async move {
+        let mut reply = String::new();
+        while let Some(event) = events.next().await {
+            match event {
+                Event::Text(text) => reply.push_str(&text),
+                Event::Permission { id, .. } => {
+                    let _ = commands.unbounded_send(Command::Answer { id, answer: None });
+                }
+                Event::Ask { id, .. } => {
+                    let _ = commands.unbounded_send(Command::Reply { id, replies: None });
+                }
+                Event::TurnEnded(Ok(Stop::Finished)) => return Ok(reply),
+                Event::TurnEnded(Ok(Stop::Refused)) => return Err("The agent declined".into()),
+                Event::TurnEnded(Ok(Stop::Limit)) => return Err("The agent ran out of tokens".into()),
+                Event::TurnEnded(Ok(Stop::Cancelled)) => return Err("Cancelled".into()),
+                Event::TurnEnded(Err(failure)) | Event::Closed(Some(failure)) => return Err(failure_text(failure)),
+                Event::Closed(None) => break,
+                _ => {}
+            }
+        }
+        Err("The agent stopped before replying".into())
+    };
+    // A reply drops the connection, which stops the agent; a connection that
+    // ends first has queued why, for the collector to read.
+    match futures::future::select(Box::pin(run), Box::pin(collect)).await {
+        futures::future::Either::Left(((), collect)) => collect.await,
+        futures::future::Either::Right((reply, _)) => reply,
+    }
+}
+
+fn failure_text(failure: Failure) -> String {
+    match failure {
+        Failure::SignedOut { agent, command: Some(command) } => format!("{agent} isn't signed in. Run `{command}`"),
+        Failure::SignedOut { agent, command: None } => format!("{agent} isn't signed in"),
+        Failure::Other(message) => message,
+    }
+}
+
 /// Added to the agent's system prompt: in this app a plan belongs in the
 /// Context panel, which is fed by the agent's task-list tools, not in a file.
 const PLANNING_PROMPT: &str = "You are running inside a chat app that shows your task list as the plan in its \
