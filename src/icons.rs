@@ -57,13 +57,15 @@ pub enum Glyph {
     Rows,
     Claude,
     OpenAi,
+    /// Remote devices, on the rail.
+    Smartphone,
 }
 
 const PREFIX: &str = "app-icons/";
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 46] = [
+    pub const ALL: [Glyph; 47] = [
         Self::Message,
         Self::Compose,
         Self::Branch,
@@ -110,6 +112,7 @@ impl Glyph {
         Self::Rows,
         Self::Claude,
         Self::OpenAi,
+        Self::Smartphone,
     ];
     fn file(self) -> &'static str {
         match self {
@@ -159,6 +162,7 @@ impl Glyph {
             Self::Rows => "rows-2.svg",
             Self::Claude => "claude.svg",
             Self::OpenAi => "openai.svg",
+            Self::Smartphone => "smartphone.svg",
         }
     }
 }
@@ -250,6 +254,7 @@ fn svg(file: &str) -> Option<&'static str> {
         "mail.svg" => r#"<rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>"#,
         "flame.svg" => r#"<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>"#,
         "columns-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/>"#,
+        "smartphone.svg" => r#"<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>"#,
         "rows-2.svg" => r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 12h18"/>"#,
         "zap.svg" => {
             r#"<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>"#

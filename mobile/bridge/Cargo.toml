@@ -1,0 +1,24 @@
+[package]
+name = "chat-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "The iPhone app's iroh client: dials the Mac, carries JSON lines, behind a small C ABI"
+publish = false
+
+# Built on its own, apart from the Mac app.
+[workspace]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+iroh = "1.5"
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "z"

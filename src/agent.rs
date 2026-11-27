@@ -600,16 +600,20 @@ fn failure_text(failure: Failure) -> String {
     }
 }
 
-/// Added to the agent's system prompt: in this app a plan belongs in the
-/// Context panel, which is fed by the agent's task-list tools, not in a file.
-const PLANNING_PROMPT: &str = "You are running inside a chat app that shows your task list as the plan in its \
+/// Added to the agent's system prompt: app-specific guidance such as keeping
+/// plans in the Context panel (fed by the task-list tools, not a file),
+/// drawing images inline, and preferring ripgrep for searches.
+const SESSION_PROMPT: &str = "You are running inside a chat app that shows your task list as the plan in its \
 Context panel. When the user asks you to plan, make a plan, or create a plan, record it with your task-list tools \
 (TodoWrite, or TaskCreate and TaskUpdate), one task per step, and keep their status current as you work. Do not \
 write the plan to a Markdown or other file in the project unless the user explicitly asks for a file or document.
 
 The chat draws images inline. To show the user an image file (a screenshot, a chart, a rendered design), write a \
 Markdown image with its absolute path, such as ![chart](/abs/path/chart.png); PNG, JPEG, GIF, WebP, BMP and TIFF \
-are drawn. Do this only when seeing the image helps the user, not for every image you touch.";
+are drawn. Do this only when seeing the image helps the user, not for every image you touch.
+
+When you search files from the shell, prefer ripgrep (`rg`) over `grep`: it respects .gitignore, skips binaries \
+and is faster on large trees. Fall back to `grep` only if `rg` is not installed.";
 
 /// Session `_meta` for the agent. The Claude adapter appends
 /// `systemPrompt.append` to Claude Code's own prompt on new, resumed and
@@ -617,7 +621,7 @@ are drawn. Do this only when seeing the image helps the user, not for every imag
 fn session_meta(spec: &AgentSpec) -> Option<serde_json::Map<String, serde_json::Value>> {
     spec.uses_claude_adapter().then(|| {
         let mut meta = serde_json::Map::new();
-        meta.insert("systemPrompt".into(), serde_json::json!({ "append": PLANNING_PROMPT }));
+        meta.insert("systemPrompt".into(), serde_json::json!({ "append": SESSION_PROMPT }));
         meta
     })
 }
